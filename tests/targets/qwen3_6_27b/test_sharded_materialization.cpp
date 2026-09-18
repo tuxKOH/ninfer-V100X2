@@ -255,7 +255,7 @@ int verify_tp2(const std::filesystem::path& path) {
             fail(name + " was planned as a device tensor but is a resource");
             continue;
         }
-        const ShardMapping mapping = shard_mapping_for(name, 2, config);
+        const ShardMapping mapping = shard_mapping_for(name, 2, config, Package::resolve_weights(reader.identity()));
         FamilyRow& row             = families[family_of(name)];
         const auto slot            = static_cast<std::size_t>(placement.device);
         row.device_bytes[slot] += placement.bytes;
@@ -456,7 +456,7 @@ int verify_tp2(const std::filesystem::path& path) {
             return;
         }
         const auto payload         = reader.payload(object);
-        const ShardMapping mapping = shard_mapping_for(name, 2, config);
+        const ShardMapping mapping = shard_mapping_for(name, 2, config, Package::resolve_weights(reader.identity()));
         for (int device = 0; device < 2; ++device) {
             const auto* placement = found[device];
             expect(placement->device == device,

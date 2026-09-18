@@ -28,12 +28,15 @@ namespace ninfer::ops {
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
  * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
- * Current registered routes require no transient allocation. The Op has no persistent state side
- * effect.
+ * Caller-owned transient storage is sized by q4_q5_attn_input_proj_workspace_capacity_bytes().
+ * The Op has no persistent state side effect.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream);
+                     WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t q4_q5_attn_input_proj_workspace_capacity_bytes(
+    std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Computes the single-parent Q/K/output-gate/V projection.
@@ -53,6 +56,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16_CTRL.
  * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
+ * - GGML_K `ggml-k256-v1` `[14336,5120]`, preserving Q4_K/Q6_K rows and using the direct native
+ *   decoder. The logical row and tensor shapes are the same as BF16_CTRL.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
  * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private resolver to
@@ -124,7 +129,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
 // [3584,5120] tensor (query rows [0,3072), key rows [3072,3584)); its gate_value shard is
 // [3584,5120] the same way (gate rows [0,3072), value rows [3072,3584)).
 //
-// Three formats are registered, per the real ShardPlan/binding profiles (bindings.cpp
+// The registered fused/split formats are the following, per the real ShardPlan/binding profiles (bindings.cpp
 // `bind_nvfp4_text_layers`/`bind_groupwise_text_layers`/`bind_qwen38_nvfp4_text_layers`):
 //   - NVFP4 (fused single-parent): a TRUE split. The decode/small-T/W4A4/TMA kernels
 //     (src/ops/attn_input_proj/nvfp4/*.cu) are templated on Geometry and instantiated at both
@@ -152,6 +157,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
 //     (the kernel's FullTiles boolean masks the BN=64 token-tile boundary for any T, and the
 //     shard's 3072/512 row counts are both multiples of its BM tile sizes), and the split test
 //     sweeps T down to 1.
+//   - GGML_K: the native Qwen3.8 Q4_K_M fused parent is row-sliced directly. Each rank computes
+//     its four head-local sections with the shared GGML decoder and requires no transient arena.
 //
 // BF16_CTRL fused forms and the W8G32_F16S companion form are NOT registered here: BF16_CTRL is a
 // real, dated, explicitly deferred gap (it is bound only by the Qwen36Nvfp4 profile, not by the
@@ -165,16 +172,16 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
 /**
  * Returns the caller-owned transient capacity required by the fused-parent
  * attn_input_proj_column_parallel() for every T in [min_tokens,max_tokens], at the SHARD shape
- * (NVFP4 only). Identical to attn_input_proj_workspace_capacity_bytes(NVFP4, 14336, 5120, ...):
- * the W4A4 activation-quantize workspace is a pure function of (tokens, K=5120), which the shard
- * does not change (only the output row count N halves).
+ * (NVFP4, FP8, GGML_K, or Q4/Q5 split storage, depending on qtype). Quantized activation
+ * workspace is a pure function of tokens and K=5120; GGML_K needs no transient storage, while
+ * the groupwise split-storage form uses a caller-owned projected plane.
  */
 [[nodiscard]] std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(
     QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * @brief Column-parallel (head-aligned, output-split) fused-parent attn_input_proj across two
- * devices. NVFP4 only.
+ * devices. NVFP4, FP8, and GGML_K fused parents are supported.
  *
  * Rank r computes its own head-local q/gate/k/v blocks from its own [7168,5120] weight shard and
  * the (replicated) activation -- see the design note above for the shard's section layout. `w[0].k`
@@ -197,8 +204,8 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                      const ExecutionContext& ec);
 
 /**
- * A16-only column-parallel convenience form. Passes a null workspace per rank (NVFP4's A16 routes
- * need none).
+ * A16-only column-parallel convenience form. Passes a null workspace per rank for routes that do
+ * not need one (including GGML_K and NVFP4 A16).
  */
 void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                      const std::array<Weight, 2>& query_key_gate_value_weight,
@@ -212,9 +219,9 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
  *
  * Rank r computes its own head-local q/k blocks from its own `[3584,5120]` query_key shard (query
  * rows `[0,3072)`, key rows `[3072,3584)`) and its own head-local gate/v blocks from its own
- * `[3584,5120]` gate_value shard (gate rows `[0,3072)`, value rows `[3072,3584)`). No workspace and
- * no caller policy: this form always resolves to the family's grouped-MMA route (see the design
- * note above).
+ * `[3584,5120]` gate_value shard (gate rows `[0,3072)`, value rows `[3072,3584)`). This A16 form
+ * uses Volta MMA with caller-owned transient storage on SM70 and grouped MMA on SM8x. Size each
+ * arena with attn_input_proj_column_parallel_workspace_capacity_bytes(Q4G64_F16S, A16Only, ...).
  *
  * @param[in] x Per-rank replicated BF16 activation `[5120,T]`.
  * @param[in] query_key_weight,gate_value_weight Per-rank RowSplit weight shards `[3584,5120]`.
@@ -226,6 +233,7 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                      const std::array<Weight, 2>& gate_value_weight,
                                      const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
                                      const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+                                     const std::array<WorkspaceArena*, 2>& workspace,
                                      const ExecutionContext& ec);
 
 } // namespace ninfer::ops

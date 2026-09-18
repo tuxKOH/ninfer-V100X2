@@ -40,6 +40,7 @@
 #include "ops/quantized_weight.h"
 
 #include "core/device.h"
+#include "core/arena.h"
 
 #include <algorithm>
 #include <array>
@@ -622,9 +623,13 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         Tensor reference_k(ref_k.data(), DType::BF16, {kKvRows, tokens});
         Tensor reference_v(ref_v.data(), DType::BF16, {kKvRows, tokens});
 
+        DeviceArena reference_workspace(
+            ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens));
+
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         ops::attn_input_proj(reference_x, full_qk_device.weight, full_gv_device.weight, reference_q,
-                             reference_gate, reference_k, reference_v, ec.dev[0]->stream);
+                             reference_gate, reference_k, reference_v, reference_workspace,
+                             ec.dev[0]->stream);
         cuda_check(cudaStreamSynchronize(ec.dev[0]->stream), "cudaStreamSynchronize");
         failures += ref_q.verify_guards(label + " reference q");
         failures += ref_gate.verify_guards(label + " reference gate");
@@ -668,8 +673,20 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         const std::array<Tensor, 2> v_out{Tensor(split_v[0]->data(), DType::BF16, {kShardKvRows, tokens}),
                                           Tensor(split_v[1]->data(), DType::BF16, {kShardKvRows, tokens})};
 
+        std::array<std::optional<DeviceArena>, 2> split_workspace;
+        const std::size_t shard_workspace =
+            ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+                QType::Q4G64_F16S, ops::LinearPolicy::A16Only, tokens, tokens);
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            split_workspace[static_cast<std::size_t>(rank)].emplace(shard_workspace);
+        }
+        const std::array<WorkspaceArena*, 2> workspace{
+            &*split_workspace[0], &*split_workspace[1]};
+
         retire_staging(ec);
-        ops::attn_input_proj_column_parallel(x, qk_weight, gv_weight, q_out, gate_out, k_out, v_out, ec);
+        ops::attn_input_proj_column_parallel(x, qk_weight, gv_weight, q_out, gate_out, k_out,
+                                             v_out, workspace, ec);
         synchronize_both(ec);
 
         std::array<std::vector<double>, 2> observed_q;
@@ -753,8 +770,7 @@ int verify_registry() {
             ++failures;
         }
     }
-    for (const QType qtype :
-        {QType::BF16_CTRL, QType::W8G32_F16S, QType::Q4G64_F16S, QType::Q5G64_F16S}) {
+    for (const QType qtype : {QType::BF16_CTRL, QType::W8G32_F16S}) {
         bool threw = false;
         try {
             (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
@@ -763,6 +779,18 @@ int verify_registry() {
         if (!threw) {
             std::cerr << "registry: qtype " << static_cast<int>(qtype)
                       << " was admitted by the fused column-parallel workspace query but must not be\n";
+            ++failures;
+        }
+    }
+    // GGML_K is the native Qwen3.8 Q4_K_M fused parent used by the V100X2 profile. The
+    // Q4/Q5 entries are the groupwise-int split-storage form used by the Qwen3.6 profile.
+    for (const QType qtype : {QType::GGML_K, QType::Q4G64_F16S, QType::Q5G64_F16S}) {
+        try {
+            (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+                qtype, ops::LinearPolicy::A16Only, 1, 1);
+        } catch (const std::exception& error) {
+            std::cerr << "registry: supported qtype " << static_cast<int>(qtype)
+                      << " was rejected: " << error.what() << '\n';
             ++failures;
         }
     }

@@ -1,6 +1,6 @@
 // Host-only table test for the TP2 weight-sharding map.
 //
-// `plan_for(object, tp, config)` is a pure host computation over TextConfig's compile-time
+// `plan_for(object, tp, config, profile)` is a pure host computation over TextConfig's compile-time
 // dimensions -- no artifact, no device, no kernel. Every case below is derived from the REAL
 // object shapes/order bound in targets/qwen3_6_27b/impl/load/bindings.cpp (verified by reading
 // that file); see bindings.cpp's plan_for() comments for the two places where the bound objects
@@ -21,6 +21,7 @@ using ninfer::targets::qwen3_6_27b::detail::plan_for;
 using ninfer::targets::qwen3_6_27b::detail::Shard;
 using ninfer::targets::qwen3_6_27b::detail::ShardPlan;
 using ninfer::targets::qwen3_6_27b::detail::TextConfig;
+using ninfer::targets::qwen3_6_27b::detail::WeightsProfile;
 
 namespace {
 
@@ -87,6 +88,7 @@ ShardPlan concat(const ShardPlan& a, const ShardPlan& b) {
 
 int main() {
     const TextConfig config{};
+    constexpr auto profile = WeightsProfile::Qwen38Nvfp4;
 
     // --- tp == 1: degenerate to empty (full copy on device 0), for every family, including
     // families that would otherwise throw at tp > 1 for an unrecognized name. ---
@@ -97,7 +99,7 @@ int main() {
           "text/layers/5/mlp/gate_up", "text/layers/5/mlp/down", "text/token_embedding",
           "text/output_head", "text/draft_head", "text/draft_head_token_ids",
           "text/final_norm", "mtp/input_projection", "not/a/real/object"}) {
-        expect_empty(plan_for(object, 1, config), std::string("tp1 ") + std::string(object));
+        expect_empty(plan_for(object, 1, config, profile), std::string("tp1 ") + std::string(object));
     }
 
     // --- attn_input_proj: fused query_key_gate_value, 14336 = Q(6144)|K(1024)|Gate(6144)|V(1024).
@@ -108,24 +110,24 @@ int main() {
         const ShardPlan expected = concat(
             concat(half_block(0, 6144), half_block(6144, 1024)),
             concat(half_block(7168, 6144), half_block(13312, 1024)));
-        expect_plan(plan_for("text/layers/5/attention/query_key_gate_value", 2, config), expected,
+        expect_plan(plan_for("text/layers/5/attention/query_key_gate_value", 2, config, profile), expected,
                    "attn fused query_key_gate_value");
         // Same rule applies verbatim to the MTP attention block (same fused shape, 14336).
-        expect_plan(plan_for("mtp/layer/attention/query_key_gate_value", 2, config), expected,
+        expect_plan(plan_for("mtp/layer/attention/query_key_gate_value", 2, config, profile), expected,
                    "mtp attn fused query_key_gate_value");
     }
     // attn_input_proj: split-storage variant (groupwise-int / early nvfp4 layers).
     {
-        expect_plan(plan_for("text/layers/3/attention/query_key", 2, config),
+        expect_plan(plan_for("text/layers/3/attention/query_key", 2, config, profile),
                    concat(half_block(0, 6144), half_block(6144, 1024)), "attn split query_key");
-        expect_plan(plan_for("text/layers/3/attention/gate_value", 2, config),
+        expect_plan(plan_for("text/layers/3/attention/gate_value", 2, config, profile),
                    concat(half_block(0, 6144), half_block(6144, 1024)), "attn split gate_value");
     }
     // o_proj / linear_add: row-parallel over the 6144-wide (query_size) attention-context input.
     {
         const ShardPlan expected = {Shard{0, 0, 3072}, Shard{1, 3072, 3072}};
-        expect_plan(plan_for("text/layers/5/attention/output", 2, config), expected, "o_proj");
-        expect_plan(plan_for("mtp/layer/attention/output", 2, config), expected, "mtp o_proj");
+        expect_plan(plan_for("text/layers/5/attention/output", 2, config, profile), expected, "o_proj");
+        expect_plan(plan_for("mtp/layer/attention/output", 2, config, profile), expected, "mtp o_proj");
     }
 
     // --- GDN input_projection: fused query_key_value_z, 16384 = Q(2048)|K(2048)|V(6144)|Z(6144).
@@ -136,13 +138,13 @@ int main() {
         const ShardPlan expected =
             concat(concat(half_block(0, 2048), half_block(2048, 2048)),
                   concat(half_block(4096, 6144), half_block(10240, 6144)));
-        expect_plan(plan_for("text/layers/3/gdn/query_key_value_z", 2, config), expected,
+        expect_plan(plan_for("text/layers/3/gdn/query_key_value_z", 2, config, profile), expected,
                    "gdn fused query_key_value_z");
     }
     {
-        expect_plan(plan_for("text/layers/3/gdn/query_key", 2, config),
+        expect_plan(plan_for("text/layers/3/gdn/query_key", 2, config, profile),
                    concat(half_block(0, 2048), half_block(2048, 2048)), "gdn split query_key");
-        expect_plan(plan_for("text/layers/3/gdn/value_z", 2, config),
+        expect_plan(plan_for("text/layers/3/gdn/value_z", 2, config, profile),
                    concat(half_block(0, 6144), half_block(6144, 6144)), "gdn split value_z");
     }
     // GDN out_proj / linear_add: row-parallel over the value_dim (6144)-wide input. An early
@@ -150,7 +152,14 @@ int main() {
     // profiles) is {5120, 6144}, and that is what this case asserts.
     {
         const ShardPlan expected = {Shard{0, 0, 3072}, Shard{1, 3072, 3072}};
-        expect_plan(plan_for("text/layers/3/gdn/output", 2, config), expected, "gdn out_proj");
+        expect_plan(plan_for("text/layers/3/gdn/output", 2, config, profile), expected, "gdn out_proj");
+        expect_plan(plan_for("text/layers/3/gdn/output", 2, config, WeightsProfile::Qwen38GgmlK),
+                    {Shard{0, 0, 1024}, Shard{1, 1024, 1024},
+                     Shard{0, 2048, 1024}, Shard{1, 3072, 1024},
+                     Shard{0, 4096, 1024}, Shard{1, 5120, 1024}},
+                    "GGUF GDN tiled output columns");
+        expect_empty(plan_for("text/layers/3/gdn/output", 1, config, WeightsProfile::Qwen38GgmlK),
+                     "GGUF GDN tp1 retains all original columns");
     }
 
     // --- gdn_gating_proj (a/b) + a_log/dt_bias: 48 rows = 3 rows/alignment-group x 16 groups,
@@ -168,31 +177,31 @@ int main() {
         const ShardPlan expected = {Shard{0, 0, 24}, Shard{1, 24, 24}};
         for (std::string_view leaf :
              {"gdn/a_projection", "gdn/b_projection", "gdn/a_log", "gdn/dt_bias"}) {
-            expect_plan(plan_for(std::string("text/layers/3/") + std::string(leaf), 2, config),
+            expect_plan(plan_for(std::string("text/layers/3/") + std::string(leaf), 2, config, profile),
                        expected, std::string("gdn gating ") + std::string(leaf));
         }
-        expect_plan(plan_for("text/layers/3/gdn/a_b_projection", 2, config),
+        expect_plan(plan_for("text/layers/3/gdn/a_b_projection", 2, config, profile),
                    concat(half_block(0, 48), half_block(48, 48)), "gdn fused a_b_projection");
     }
 
     // --- MLP gate_up: fused, 34816 = Gate(17408)|Up(17408), each split by intermediate/tp. ---
     {
         const ShardPlan expected = concat(half_block(0, 17408), half_block(17408, 17408));
-        expect_plan(plan_for("text/layers/5/mlp/gate_up", 2, config), expected, "mlp gate_up");
-        expect_plan(plan_for("mtp/layer/mlp/gate_up", 2, config), expected, "mtp mlp gate_up");
+        expect_plan(plan_for("text/layers/5/mlp/gate_up", 2, config, profile), expected, "mlp gate_up");
+        expect_plan(plan_for("mtp/layer/mlp/gate_up", 2, config, profile), expected, "mtp mlp gate_up");
     }
     // MLP down: row-parallel over the 17408-wide intermediate input.
     {
         const ShardPlan expected = {Shard{0, 0, 8704}, Shard{1, 8704, 8704}};
-        expect_plan(plan_for("text/layers/5/mlp/down", 2, config), expected, "mlp down");
-        expect_plan(plan_for("mtp/layer/mlp/down", 2, config), expected, "mtp mlp down");
+        expect_plan(plan_for("text/layers/5/mlp/down", 2, config, profile), expected, "mlp down");
+        expect_plan(plan_for("mtp/layer/mlp/down", 2, config, profile), expected, "mtp mlp down");
     }
 
     // --- token_embedding: replicated (NOT row-split, despite sharing output_head's shape). ---
-    expect_empty(plan_for("text/token_embedding", 2, config), "token_embedding");
+    expect_empty(plan_for("text/token_embedding", 2, config, profile), "token_embedding");
 
     // --- output_head / lm_head: row-split by vocab, 248320 -> 124160/GPU. ---
-    expect_plan(plan_for("text/output_head", 2, config),
+    expect_plan(plan_for("text/output_head", 2, config, profile),
                ShardPlan{Shard{0, 0, 124160}, Shard{1, 124160, 124160}}, "output_head");
 
     // --- draft_head: row-split by vocab, 131072 -> 65536/GPU. Its companion id map is NOT split:
@@ -201,8 +210,8 @@ int main() {
     // block below and bindings.h's shard taxonomy. ---
     {
         const ShardPlan expected = {Shard{0, 0, 65536}, Shard{1, 65536, 65536}};
-        expect_plan(plan_for("text/draft_head", 2, config), expected, "draft_head");
-        expect_empty(plan_for("text/draft_head_token_ids", 2, config), "draft_head_token_ids");
+        expect_plan(plan_for("text/draft_head", 2, config, profile), expected, "draft_head");
+        expect_empty(plan_for("text/draft_head_token_ids", 2, config, profile), "draft_head_token_ids");
     }
 
     // --- replicated norms: final/input/post-attention/qk norms, gdn/norm, and the MTP-only
@@ -215,7 +224,7 @@ int main() {
           "text/layers/3/gdn/norm", "mtp/layer/input_norm", "mtp/layer/post_attention_norm",
           "mtp/final_norm", "mtp/layer/attention/query_norm", "mtp/layer/attention/key_norm",
           "mtp/embedding_norm", "mtp/hidden_norm"}) {
-        expect_empty(plan_for(object, 2, config), std::string("replicated ") + std::string(object));
+        expect_empty(plan_for(object, 2, config, profile), std::string("replicated ") + std::string(object));
     }
 
     // --- gdn/convolution: depthwise conv1d weight over the 10240 GDN qkv channels,
@@ -227,7 +236,7 @@ int main() {
     {
         const ShardPlan expected =
             concat(concat(half_block(0, 2048), half_block(2048, 2048)), half_block(4096, 6144));
-        expect_plan(plan_for("text/layers/3/gdn/convolution", 2, config), expected,
+        expect_plan(plan_for("text/layers/3/gdn/convolution", 2, config, profile), expected,
                    "gdn convolution");
         // The three sections' halves must concatenate to exactly the shard-local q|k|v packing
         // gdn_input_proj_column_parallel writes: qkv[5120,T] as Q [0,1024) | K [1024,2048) |
@@ -255,7 +264,7 @@ int main() {
     // `embedding_norm` and [5120,10240) are `hidden_norm` (mtp_pack.h). So 10240 is the contraction
     // dimension, splitting it is row-parallel by definition, and device r's half is exactly one of
     // the two normalized inputs. Full derivation at plan_for's own comment. ---
-    expect_plan(plan_for("mtp/input_projection", 2, config),
+    expect_plan(plan_for("mtp/input_projection", 2, config, profile),
                ShardPlan{Shard{0, 0, 5120}, Shard{1, 5120, 5120}}, "mtp input_projection");
 
     // --- k128 row-split-k128-v1 group boundary (row-parallel objects): standalone validator. ---
@@ -285,7 +294,7 @@ int main() {
     // --- k128 rejection end-to-end (row-parallel): mlp/down at tp=32 divides evenly
     // (17408/32=544) but 544 is not a multiple of 128, so the row-parallel split must be
     // rejected even though the head/divisor check alone would have passed. ---
-    expect_throws([&] { (void)plan_for("text/layers/5/mlp/down", 32, config); },
+    expect_throws([&] { (void)plan_for("text/layers/5/mlp/down", 32, config, profile); },
                  "mlp/down tp=32 (k128 misaligned)");
 
     // --- k128 rejection end-to-end (column-parallel, NVFP4-tile guard): mlp/gate_up at tp=32
@@ -293,20 +302,20 @@ int main() {
     // column-parallel split must be rejected -- exercising check_nvfp4_tile_alignment=true's
     // append_column_block path, distinct from gdn_gating's check_nvfp4_tile_alignment=false path
     // (tested above, tp=2, 24-row chunks that are NOT 128-aligned but must still succeed). ---
-    expect_throws([&] { (void)plan_for("text/layers/5/mlp/gate_up", 32, config); },
+    expect_throws([&] { (void)plan_for("text/layers/5/mlp/gate_up", 32, config, profile); },
                  "mlp/gate_up tp=32 (column-parallel k128 misaligned)");
 
     // --- head-alignment rejection: attn fused at tp=3 -- query_heads(24) is divisible by 3, but
     // kv_heads(4) is not, so the K/V blocks cannot be split without cutting a KV head in half. ---
     expect_throws(
-        [&] { (void)plan_for("text/layers/5/attention/query_key_gate_value", 3, config); },
+        [&] { (void)plan_for("text/layers/5/attention/query_key_gate_value", 3, config, profile); },
         "attn fused tp=3 (kv_heads not divisible)");
 
     // --- tp < 1 is rejected outright. ---
-    expect_throws([&] { (void)plan_for("text/token_embedding", 0, config); }, "tp=0");
+    expect_throws([&] { (void)plan_for("text/token_embedding", 0, config, profile); }, "tp=0");
 
     // --- unrecognized object family is rejected outright (not silently replicated). ---
-    expect_throws([&] { (void)plan_for("vision/merger/fc2", 2, config); }, "unrecognized object");
+    expect_throws([&] { (void)plan_for("vision/merger/fc2", 2, config, profile); }, "unrecognized object");
 
     // --- shard_mapping_for: the axis the loader slices along. plan_for delegates to it, so the
     // two can never disagree about a family's boundaries; this pins the axis half. Rows narrows
@@ -316,7 +325,7 @@ int main() {
         using ninfer::artifact::ShardAxis;
         using ninfer::targets::qwen3_6_27b::detail::shard_mapping_for;
         const auto expect_axis = [&](std::string_view object, ShardAxis expected) {
-            const auto mapping = shard_mapping_for(object, 2, config);
+            const auto mapping = shard_mapping_for(object, 2, config, profile);
             if (mapping.axis != expected) {
                 fail(std::string("axis ") + std::string(object) + ": got " +
                      std::to_string(static_cast<int>(mapping.axis)) + ", expected " +
@@ -348,7 +357,7 @@ int main() {
             expect_axis(object, ShardAxis::Replicated);
         }
         // tp == 1 degenerates the same way plan_for does, before any family check.
-        if (shard_mapping_for("not/a/real/object", 1, config).axis != ShardAxis::Replicated) {
+        if (shard_mapping_for("not/a/real/object", 1, config, profile).axis != ShardAxis::Replicated) {
             fail("axis tp1: unrecognized object must degenerate to replicated");
         }
     }

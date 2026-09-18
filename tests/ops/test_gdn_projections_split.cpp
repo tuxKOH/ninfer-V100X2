@@ -631,10 +631,13 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         Tensor reference_x(full_x.p, DType::BF16, {kInputRows, tokens});
         Tensor reference_qkv(ref_qkv.data(), DType::BF16, {kQkvRows, tokens});
         Tensor reference_z(ref_z.data(), DType::BF16, {kValueRows, tokens});
+        const std::size_t reference_capacity =
+            ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
+        DeviceArena reference_arena(std::max<std::size_t>(reference_capacity, 1));
 
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         ops::gdn_input_proj(reference_x, full_qk_device.weight, full_vz_device.weight, reference_qkv,
-                            reference_z, ec.dev[0]->stream);
+                            reference_z, reference_arena, ec.dev[0]->stream);
         cuda_check(cudaStreamSynchronize(ec.dev[0]->stream), "cudaStreamSynchronize");
         failures += ref_qkv.verify_guards(label + " reference qkv");
         failures += ref_z.verify_guards(label + " reference z");

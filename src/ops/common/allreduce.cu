@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -88,6 +89,145 @@ private:
     int previous_ = 0;
 };
 
+void startup_check(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("peer transport startup: ") + operation + ": " +
+                                 cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+    }
+}
+
+// Linux CUDA PCIe P2P is unsupported behind a translated IOMMU domain. A small
+// allocation can nevertheless pass a copy probe while other mappings silently
+// lose writes, so the domain restriction takes precedence over that probe.
+std::string translated_iommu_domain(const ExecutionContext& ec) {
+    std::string reason;
+#if defined(__linux__)
+    for (int rank = 0; rank < 2; ++rank) {
+        char pci_bus_id[32]{};
+        startup_check(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), ec.dev[rank]->device),
+                      "cudaDeviceGetPCIBusId");
+        // CUDA may emit uppercase hexadecimal; Linux PCI sysfs names are lowercase.
+        for (char& c : pci_bus_id) {
+            if (c >= 'A' && c <= 'F') { c += 'a' - 'A'; }
+        }
+        std::ifstream domain_file(std::string("/sys/bus/pci/devices/") + pci_bus_id +
+                                  "/iommu_group/type");
+        std::string domain;
+        domain_file >> domain;
+        if (domain == "DMA" || domain == "DMA-FQ") {
+            if (!reason.empty()) { reason += "; "; }
+            reason += std::string("PCI ") + pci_bus_id + " uses translated IOMMU domain " + domain;
+        }
+    }
+#else
+    (void)ec;
+#endif
+    return reason;
+}
+
+// Startup-only storage. The exact payload catches drivers that advertise peer access
+// but silently drop DMA writes (observed with V100s behind an IOMMU). Use the same
+// pull API and destination compute stream as the collectives, without GPU peer loads.
+class PeerTransferProbe {
+public:
+    explicit PeerTransferProbe(const ExecutionContext& ec) : ec_(ec) {
+        startup_check(cudaGetDevice(&previous_), "cudaGetDevice");
+    }
+
+    ~PeerTransferProbe() {
+        for (int rank = 0; rank < 2; ++rank) {
+            cleanup(cudaSetDevice(ec_.dev[rank]->device), "cudaSetDevice");
+            if (source_[rank] != nullptr) { cleanup(cudaFree(source_[rank]), "cudaFree source"); }
+            if (destination_[rank] != nullptr) {
+                cleanup(cudaFree(destination_[rank]), "cudaFree destination");
+            }
+        }
+        cleanup(cudaSetDevice(previous_), "restore device");
+    }
+
+    PeerTransferProbe(const PeerTransferProbe&) = delete;
+    PeerTransferProbe& operator=(const PeerTransferProbe&) = delete;
+
+    void set_device(int rank) const {
+        startup_check(cudaSetDevice(ec_.dev[rank]->device), "cudaSetDevice");
+    }
+
+    void initialize() {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(rank);
+            startup_check(cudaMalloc(&source_[rank], kBytes), "cudaMalloc source");
+            startup_check(cudaMalloc(&destination_[rank], kBytes), "cudaMalloc destination");
+            std::array<std::uint32_t, kWords> values{};
+            for (std::size_t i = 0; i < kWords; ++i) { values[i] = pattern(rank, i); }
+            startup_check(cudaMemcpyAsync(source_[rank], values.data(), kBytes,
+                                           cudaMemcpyHostToDevice, ec_.dev[rank]->stream),
+                          "initialize source");
+            startup_check(cudaStreamSynchronize(ec_.dev[rank]->stream), "retire source");
+        }
+    }
+
+    // Empty means both complete copies matched their independent host patterns exactly.
+    std::string qualify() {
+        std::string mismatch;
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(rank);
+            cudaStream_t stream = ec_.dev[rank]->stream;
+            startup_check(cudaMemsetAsync(destination_[rank], 0xcd, kBytes, stream),
+                          "clear destination");
+            startup_check(pull_peer(destination_[rank], source_[1 - rank], kBytes, stream),
+                          "cross-device copy");
+            startup_check(cudaStreamSynchronize(stream), "retire cross-device copy");
+            std::array<std::uint32_t, kWords> actual{};
+            startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
+                                      cudaMemcpyDeviceToHost), "read destination");
+            for (std::size_t i = 0; i < kWords; ++i) {
+                if (actual[i] != pattern(1 - rank, i)) {
+                    if (mismatch.empty()) {
+                        mismatch = "device " + std::to_string(ec_.dev[1 - rank]->device) +
+                                   " -> " + std::to_string(ec_.dev[rank]->device) +
+                                   " data mismatch at word " + std::to_string(i);
+                    }
+                    break;
+                }
+            }
+        }
+        return mismatch;
+    }
+
+    void disable_peer_access() const {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(rank);
+            const cudaError_t status = cudaDeviceDisablePeerAccess(ec_.dev[1 - rank]->device);
+            if (status == cudaErrorPeerAccessNotEnabled) {
+                (void)cudaGetLastError();
+            } else {
+                startup_check(status, "cudaDeviceDisablePeerAccess");
+            }
+        }
+    }
+
+private:
+    static constexpr std::size_t kWords = 4096;
+    static constexpr std::size_t kBytes = kWords * sizeof(std::uint32_t);
+
+    static std::uint32_t pattern(int rank, std::size_t index) {
+        return 0x4f000000U ^ (std::uint32_t(rank) << 20U) ^
+               (static_cast<std::uint32_t>(index) * 65537U);
+    }
+
+    static void cleanup(cudaError_t status, const char* operation) noexcept {
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "CUDA cleanup failed during peer probe %s: %s: %s\n",
+                         operation, cudaGetErrorName(status), cudaGetErrorString(status));
+        }
+    }
+
+    const ExecutionContext& ec_;
+    int previous_ = 0;
+    std::array<void*, 2> source_{};
+    std::array<void*, 2> destination_{};
+};
+
 #ifndef NDEBUG
 // Debug-only residency and aliasing predicates. These cost a driver round trip per pointer, so
 // they are compiled out of the Release build the product ships; a wrong-device or self-overlapping
@@ -114,27 +254,56 @@ bool enable_peer_access(const ExecutionContext& ec) {
     const int pair[2] = {ec.dev[0]->device, ec.dev[1]->device};
     if (pair[0] == pair[1]) { return false; }
 
-    int forward = 0;
-    int reverse = 0;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&forward, pair[0], pair[1]));
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]));
-    // Asymmetric support is not a usable transport for a symmetric collective: fall back to the
-    // staged path rather than enabling one direction only.
-    if (forward == 0 || reverse == 0) { return false; }
-
-    const CurrentDeviceGuard guard;
-    for (int rank = 0; rank < 2; ++rank) {
-        CurrentDeviceGuard::set(pair[rank]);
-        const cudaError_t status = cudaDeviceEnablePeerAccess(pair[1 - rank], 0);
-        if (status == cudaErrorPeerAccessAlreadyEnabled) {
-            // Already enabled by an earlier call; clear the sticky runtime error so the next
-            // cudaGetLastError() in an unrelated launcher does not observe it.
-            cudaGetLastError();
-            continue;
+    PeerTransferProbe probe(ec);
+    try {
+        std::string direct_failure = translated_iommu_domain(ec);
+        int forward = 0;
+        int reverse = 0;
+        if (direct_failure.empty()) {
+            startup_check(cudaDeviceCanAccessPeer(&forward, pair[0], pair[1]),
+                          "cudaDeviceCanAccessPeer forward");
+            startup_check(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]),
+                          "cudaDeviceCanAccessPeer reverse");
         }
-        CUDA_CHECK(status);
+        const bool supported = direct_failure.empty() && forward != 0 && reverse != 0;
+        if (supported) {
+            for (int rank = 0; rank < 2; ++rank) {
+                probe.set_device(rank);
+                const cudaError_t status = cudaDeviceEnablePeerAccess(pair[1 - rank], 0);
+                if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void)cudaGetLastError();
+                } else {
+                    startup_check(status, "cudaDeviceEnablePeerAccess");
+                }
+            }
+        } else {
+            if (direct_failure.empty()) { direct_failure = "peer access unavailable"; }
+            probe.disable_peer_access();
+        }
+        probe.initialize();
+        if (supported) {
+            direct_failure = probe.qualify();
+            if (direct_failure.empty()) { return true; }
+            probe.disable_peer_access();
+        }
+
+        const std::string staged_failure = probe.qualify();
+        if (!staged_failure.empty()) {
+            throw std::runtime_error("peer transport startup: host-staged validation failed: " +
+                                     staged_failure);
+        }
+        std::fprintf(stderr,
+                     "[ninfer] direct P2P disabled (%s); using verified CUDA host-staged copies\n",
+                     direct_failure.c_str());
+        return false;
+    } catch (...) {
+        // Failed startup must not leave a partially enabled pair behind. Clear the
+        // runtime's last error before cleanup; a fatal context error still prevents
+        // further use, and the original startup exception remains authoritative.
+        (void)cudaGetLastError();
+        try { probe.disable_peer_access(); } catch (...) {}
+        throw;
     }
-    return true;
 }
 
 PeerEvents::PeerEvents(const ExecutionContext& ec) {

@@ -37,6 +37,7 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    GGML_K               = 9,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -44,6 +45,8 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    VoltaQpnPrepacked    = 4,
+    GgmlK256            = 5,
 };
 
 struct Weight {

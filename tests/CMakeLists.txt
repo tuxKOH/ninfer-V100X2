@@ -14,7 +14,8 @@ function(ninfer_add_test name)
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/third_party
-    ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+    ${PROJECT_SOURCE_DIR}/third_party/utf8proc
+    ${CUDAToolkit_INCLUDE_DIRS})
   if(arg_LIBRARIES)
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   else()
@@ -44,6 +45,10 @@ function(ninfer_add_linear_test name source)
             ops/linear/linear_test_common.cpp
     LIBRARIES ninfer_ops)
 endfunction()
+
+ninfer_add_op_test(ninfer_ggml_k_test
+  SOURCES ops/test_ggml_k.cpp
+  LIBRARIES ninfer_ops)
 
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}
@@ -155,6 +160,14 @@ ninfer_add_test(ninfer_qwen3_8_27b_mtp_tp2_real_test
   LIBRARIES ninfer_engine ninfer_product_prompt_input)
 target_link_libraries(ninfer_qwen3_8_27b_mtp_tp2_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_mtp_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+# Full-head GGUF Q4_K_M MTP3 and graph/eager state gate. Every engine uses TP2,
+# so it can run on two 16 GiB V100s without loading the whole artifact on one card.
+ninfer_add_test(ninfer_qwen3_8_27b_v100x2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_v100x2_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_v100x2_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # `--rope yarn` past the native 262144-position window, on real weights, at both tp widths.
 # Artifact-gated; the tp2 leg additionally needs two devices.
 ninfer_add_test(ninfer_qwen3_8_27b_yarn_real_test

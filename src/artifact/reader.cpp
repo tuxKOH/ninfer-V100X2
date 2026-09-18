@@ -97,6 +97,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "GGML_K") { return NumericFormat::GGML_K; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -105,6 +106,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "ggml-k256-v1") { return StorageLayout::GgmlK256V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -133,7 +135,7 @@ TensorDescriptor parse_tensor(const Json& value) {
         shape.push_back(require_unsigned(dim, "shape dimension", true));
     }
 
-    const auto expected_size = tensor_encoded_size(layout, format, shape);
+    const auto expected_size = tensor_encoded_size(layout, format, shape, stored_size);
     if (stored_size != expected_size) {
         throw ArtifactError("tensor " + name + " stores " + std::to_string(stored_size) +
                             " bytes; layout requires " + std::to_string(expected_size));
@@ -341,6 +343,11 @@ struct Reader::Impl {
             const auto end = checked_add(offset, bytes, "object payload range");
             if (end > payload_bytes) {
                 throw ArtifactError("object " + std::string(name) + " extends beyond the file");
+            }
+            if (const auto* tensor = std::get_if<TensorDescriptor>(&object);
+                tensor != nullptr && tensor->format == NumericFormat::GGML_K) {
+                validate_ggml_k_payload(tensor->shape,
+                    std::span<const std::byte>(file.data() + payload_start + offset, bytes));
             }
             const auto object_index = entries.size();
             auto [_, inserted]      = index.emplace(std::string(name), object_index);

@@ -202,7 +202,8 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                 throw std::logic_error("uniform case requires equal segments");
             }
         }
-        ops::vision_attention(q_tensor, k_tensor, v_tensor, segment_length, out_tensor, nullptr);
+        ops::vision_attention(q_tensor, k_tensor, v_tensor, segment_length, workspace, out_tensor,
+                              nullptr);
     }
     cuda_synchronize();
 

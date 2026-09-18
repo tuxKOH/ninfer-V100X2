@@ -135,11 +135,12 @@ void Binder::materialize_on_device(ObjectHandle handle) {
         }
         TensorSlice slice;
         if (placement.axis == ShardAxis::Rows) {
-            slice = tensor_row_slice(tensor->layout, tensor->format, tensor->shape, ranges);
+            slice = tensor_row_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
         } else {
-            // Multiple column ranges are legal only where the layout allows it (contiguous-le-v1);
+            // Multiple column ranges are legal only where the layout allows them
+            // (contiguous-le-v1 and whole-block ggml-k256-v1);
             // tensor_column_slice enforces that per layout rather than this call site guessing.
-            slice = tensor_column_slice(tensor->layout, tensor->format, tensor->shape, ranges);
+            slice = tensor_column_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
         }
         std::uint64_t covered = 0;
         for (const PlaneCopy& copy : slice.copies) {
@@ -176,6 +177,7 @@ void Binder::materialize_on_device(ObjectHandle handle) {
             }
         }
         place(handle, device, slice.encoded_bytes, alignment, std::move(slice.copies));
+        materialization_.device_objects.back().prefix = std::move(slice.prefix);
     }
     planned_[handle.index] = true;
 }

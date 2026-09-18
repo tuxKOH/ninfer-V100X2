@@ -2,6 +2,7 @@
 
 #include "ops/common/split_launch.h"
 #include "ops/linear/linear_dispatch.h"
+#include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -13,6 +14,7 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -90,8 +92,11 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
+    case QType::GGML_K:
+        detail::ggml_k_linear(x, w, out, stream);
+        return;
     case QType::Q4G64_F16S:
-        detail::q4_dispatch(x, w, out, policy, stream);
+        detail::q4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q5G64_F16S:
         detail::q5_dispatch(x, w, out, policy, stream);
@@ -127,9 +132,27 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     }
 
     switch (qtype) {
+    case QType::GGML_K:
+        if (output_rows <= 0 || input_rows <= 0 || input_rows % 256 != 0 ||
+            policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear workspace: invalid GGML K profile");
+        }
+        return 0;
     case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
+#ifdef NINFER_VOLTA_BUILD
+        {
+            std::size_t capacity = 0;
+            for (int t = std::max(min_tokens, 9); t <= std::min(max_tokens, 64); ++t) {
+                if (detail::q4_volta_mma_supported(output_rows, input_rows, t)) {
+                    capacity = std::max(capacity,
+                        detail::q4_volta_mma_workspace_bytes(output_rows, input_rows, t));
+                }
+            }
+            return capacity;
+        }
+#endif
         return 0;
     case QType::Q5G64_F16S:
         (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);

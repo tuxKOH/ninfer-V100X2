@@ -42,8 +42,21 @@ tensor-parallel execution across two GPUs and YaRN positional scaling for
                        tests, the YaRN drift guard, and the tp1 golden-token
                        identity gate against upstream feaf4dd
 
-Single-GPU (--tp 1) behaviour is unchanged from feaf4dd; see
-tests/data/tp1-golden/MANIFEST.md for the token-level comparison.
+That upstream TP2 revision preserved single-GPU (--tp 1) behaviour from
+feaf4dd; see tests/data/tp1-golden/MANIFEST.md for its token-level comparison.
+Those measurements do not qualify the later Volta execution paths below.
+
+Volta and V100X2 modifications
+-----------------------------
+This fork incorporates Volta CUDA kernels and build support from
+https://github.com/geoffwatts/ninfer-v100, distributed under the Apache
+License, Version 2.0.
+
+The V100X2 integration at https://github.com/tuxKOH/ninfer-V100X2 combines
+that work with the RTX 3060 TP2 branch. It adds preserved GGUF Q4_K/Q6_K
+artifact conversion and execution, Volta long-context INT8 attention,
+verified two-device transport, and the corresponding validation and tools.
+The integration is distributed under the Apache License, Version 2.0.
 
 Model artifacts
 ---------------

@@ -1,7 +1,8 @@
 # Qwen3.8-27B artifact reference
 
-This reference defines the `qwen3.8-27b/nvfp4` `.ninfer` storage contract: identity, object
-inventory, shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
+This reference defines the registered Qwen3.8-27B `.ninfer` storage contracts: the
+`qwen3.8-27b/nvfp4` and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
+shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
 defined in Section 13.
 
@@ -751,3 +752,68 @@ python3 -m tools.convert.qwen3_8_27b.convert \
 The converter validates the official checkpoint, frontend resources, complete object plan, and
 numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
+
+## 14. Preserved GGUF Q4_K_M artifact
+
+The V100 TP2 Text/MTP route registers `qwen3.8-27b/gguf-q4-k-m`. Its source is the explicitly
+selected `lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`, with the companion
+`mmproj-Qwen3.8-27B-BF16.gguf`. This is a distinct numerical source from `groupwise-int`: its
+439 Q4_K and 67 Q6_K matrices retain their original code and scale bytes.
+
+```bash
+.venv/bin/python -m tools.convert.qwen3_8_27b.convert_gguf \
+  --model /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-27B-BF16.gguf \
+  --out /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
+```
+
+The converter emits 1013 objects: six resources, 673 Text/MTP/proposal tensors, and the 334 original
+Vision tensors. The tensor formats are `GGML_K` (312), `BF16` (374), `FP32` (320), and `I32` (1).
+Vision objects remain unchanged under `vision/gguf/<source-name>` and are validation-only. This
+identity rejects Vision startup because the preserved Vision inventory has no qualified execution
+binding. Text and MTP use the public `.ninfer` Engine route.
+
+`GGML_K` matrices use `ggml-k256-v1`. Fused Text parent boundaries match Section 3.2: attention
+`[query,key,output_gate,value]`, GDN `[query,key,value,z]`, GDN control `[A,B]`, and MLP `[gate,up]`.
+MTP uses the same attention and MLP row orders. Each source query head contains `[query_256,gate_256]`;
+row selection separates those halves without modifying their blocks. GDN `ssm_alpha.weight` and
+`ssm_beta.weight` map to A and B. MTP is source `blk.64`; `nextn.eh_proj`, `enorm`, `hnorm`, and
+`shared_head_norm` supply its input projection, embedding norm, hidden norm, and final norm.
+The proposal head gathers the existing 131072-entry ranking shortlist from the represented Q6_K
+output head and preserves those rows exactly.
+
+The GGUF GDN V-head order is tiled `[repeat=3,key=16,dim=128]`, as produced by llama.cpp's
+`conversion/qwen.py::_LinearAttentionVReorderBase`. The family runtime uses grouped
+`[key=16,repeat=3,dim=128]`. Conversion restores grouped order for the V rows of QKV, all Z rows,
+both control projections, `a_log`, `dt_bias`, and the V channels of convolution; Q and K stay in
+their original order. Quantized row permutations copy complete original rows and embedded scales.
+
+`gdn/output` retains its original tiled GGUF columns: permuting 128-wide heads would split the
+256-value quantization blocks and would require requantization. Its projection Op instead maps
+grouped input activations to those physical columns. TP2 rank `r` takes original column ranges
+`[1024*r,1024*r+1024)`, `[2048+1024*r,3072+1024*r)`, and
+`[4096+1024*r,5120+1024*r)`, concatenated in that order. Each shard consequently contains
+`[repeat=3,key=8,dim=128]` with unchanged Q4_K/Q6_K blocks, while all recurrent state remains
+grouped. Other storage profiles retain their existing contiguous GDN output-column split.
+
+GGUF ordinary RMSNorm gains already include the unit offset. The converter subtracts one and rounds
+to BF16 for the family's explicit norm-parameter boundary; the GDN gated norm does not subtract one.
+GGUF `ssm_a` stores `-exp(A_log)`. The converter reconstructs `A_log = log(-ssm_a)` in FP32; the
+original exponential rounding cannot be inverted exactly. GDN `ssm_dt.bias` remains FP32. The
+source convolution `[10240,4]` restores its V-head order, is transposed to tap-major `[4,10240]`,
+and is rounded to BF16.
+Direct-value transformations require numerical checks; quantized matrix transforms require exact
+raw-block comparison.
+
+The converter reconstructs the 248077-token domain, BPE merges, added-token flags and stop IDs from
+GGUF metadata into the six native frontend resources; padded rows are not tokenizer IDs. It
+preserves the embedded template, whose digest matches the registered Qwen3.8 reasoning-effort
+template. Reported resource hashes identify reconstructed resources and do not claim byte identity
+with official JSON files. Image geometry and normalization come from the companion GGUF; inactive
+image-size/video-sampling values use the existing family defaults. These resources do not enable
+Vision execution for this identity.
+
+The local conversion produced an 18,322,586,368-byte artifact. Exact checks cover representative
+embedding, fused Q/K/gate/V, and MTP source rows. Host tests cover mixed-row tensor materialization
+and TP row/column slicing. Conversion success does not establish decode throughput; performance
+claims require real Engine execution and stated context occupancy.

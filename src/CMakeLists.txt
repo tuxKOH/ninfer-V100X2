@@ -63,6 +63,7 @@ endif()
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
+  ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
@@ -263,7 +264,49 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_ops PRIVATE
+    ops/linear/bf16/bf16_cutlass_sm70.cu
+    ops/attn_input_proj/bf16/bf16_attn_input_cutlass_sm70.cu
+    ops/linear_add/bf16/bf16_linear_add_volta.cu
+    ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
+    ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
+    ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
+    ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
+    ops/linear/fp8/fp8_volta_qpn_gemm.cu
+    ops/linear/fp8/fp8_cutlass_sm70.cu
+    ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+    ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
+    ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
+    ops/linear/nvfp4/nvfp4_prepack_sm70.cu
+    ops/linear/q4/q4_volta_mma_gemm.cu
+    ops/linear/q4/q4_volta_qpn_gemm.cu
+    ops/linear/q5/q5_volta_mma_gemm.cu
+    ops/linear/w8/w8_volta_mma_gemm.cu
+    ops/linear/w8/w8_volta_qpn_gemm.cu
+    ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
+    ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
+    ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.cu
+    ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu
+    ops/linear_swiglu/fp8/fp8_linear_swiglu_qpn_split.cu
+    ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
+    ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
+    ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/vision_attention_volta_flash.cu)
+  target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
+  target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_source_files_properties(
+    ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/vision_attention_volta_flash.cu
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+endif()
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_86 has no FP8 or FP4
@@ -274,7 +317,9 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_fp8\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp ops/fp8_sm86_stubs.cpp)
-  target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+    target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
+  endif()
 endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)

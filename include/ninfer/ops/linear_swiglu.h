@@ -27,8 +27,9 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=16 and
- * AllowA4 for every positive T. Row-scaled FP8 admits A16Only and AllowA8 for every positive T.
+ * Policy-bearing capacity query. Q4/GGML_K/W8 admit A16Only. NVFP4 admits A16Only through its
+ * qualified small-T domain (Volta extends this with the QPN split) and AllowA4 for every positive
+ * T. Row-scaled FP8 admits A16Only and AllowA8 for every positive T.
  * A permissive policy covers whichever qualified route the private resolver selects across the
  * requested interval.
  */
@@ -47,6 +48,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  * Logical shapes / supported domain:
  *   T may be any positive value. The registered profiles are:
  *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
+ *   - GGML_K weight [34816,5120], x [5120,T], out [17408,T];
  *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16S RowScale weight [34816,5120], x [5120,T], out [17408,T].
@@ -68,17 +70,18 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
- *   caller-owned activation storage and may use private projection storage. There is no persistent
+ *   scoped to the call. W8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; GGML_K and the
+ *   Q4 composed split route use a projected BF16 plane, while A4/A8 routes use caller-owned
+ *   activation storage and may use private projection storage. There is no persistent
  *   state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * A16-only convenience form. Q4/W8 and row-scaled FP8 retain their complete positive-T domain.
- * NVFP4 is admitted only through T=16; larger NVFP4 extents require the policy-bearing AllowA4
- * form.
+ * A16-only convenience form. Q4/GGML_K/W8 and row-scaled FP8 retain their complete positive-T
+ * domain. NVFP4's exact A16 domain follows the registered device profile; larger extents require
+ * the policy-bearing form when that profile provides a fallback.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
@@ -110,7 +113,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 // directly the down-projection's rank r input block (linear_add_row_parallel()'s `x[r]`); the two
 // Ops compose end to end without any reshaping between them.
 //
-// Three formats are registered, per the real ShardPlan/binding profiles (bindings.cpp
+// The registered split formats are the following, per the real ShardPlan/binding profiles (bindings.cpp
 // `bind_nvfp4_text_layers`/`bind_groupwise_text_layers`/`bind_qwen38_nvfp4_text_layers`):
 //   - NVFP4: a TRUE split. The fused decode/small-T/W4A4/TMA kernels are templated on Geometry
 //     (src/ops/linear_swiglu/nvfp4/*.cu) and instantiated at BOTH Nvfp4MlpGateUpGeometry (tp1) and
@@ -126,6 +129,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 //     Fp8MlpGateUpGeometry (tp1) and Fp8MlpGateUpTp2ColumnGeometry (the shard,
 //     src/ops/linear/fp8/fp8_config.h). Route selection is inherited unchanged from the tp1
 //     resolve_route (a pure function of (policy, token count)).
+//   - GGML_K (native Qwen3.8 Q4_K_M): each rank owns a row-sliced gate/up parent and uses the
+//     shared direct GGML decoder followed by the standalone SiLU-multiply epilogue.
 //   - Q4G64_F16S (groupwise profile): COMPOSED, not extended. Every one of Q4's own linear_swiglu
 //     kernels (src/ops/linear_swiglu/q4/*.cu) is a compile-time-exact template hardcoded to
 //     [34816,17408,5120] with no runtime-N/K escape hatch, the same shape of limitation BF16's
@@ -152,10 +157,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 /**
  * Returns the caller-owned transient capacity required by linear_swiglu_column_parallel() for
  * every T in [min_tokens,max_tokens], evaluated at the SHARD shape (gate_up_rows=17408,
- * input_rows=5120 for both registered formats). NVFP4 admits A16Only and AllowA4; Q4G64_F16S
- * admits only A16Only, and unlike ops::linear's own Q4 registry always requires a non-null
- * workspace (see the design note above) -- this function still reports the correct nonzero byte
- * count for it. Invalid formats, policies, or intervals throw.
+ * input_rows=5120 for the registered formats). NVFP4 admits A16Only and AllowA4; Q4G64_F16S and
+ * GGML_K admit only A16Only. Q4/GGML_K split routes use a caller-owned projected plane, so this
+ * function reports their nonzero capacity. Invalid formats, policies, or intervals throw.
  */
 [[nodiscard]] std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(
     QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
@@ -173,8 +177,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * @param[out] out Per-rank BF16 activation block `[N_r/2,T]`.
  * @param[in] policy Permitted private activation-compute profiles, applied identically per rank.
  * @param[in,out] workspace Per-rank caller-owned transient arena. NVFP4 may pass null for routes
- * that need none (see linear_swiglu_column_parallel_workspace_capacity_bytes()); Q4G64_F16S always
- * requires a non-null arena.
+ * that need none; Q4G64_F16S and GGML_K require an arena for their projected plane.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
 void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,

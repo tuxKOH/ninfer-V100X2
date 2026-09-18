@@ -12,11 +12,13 @@
 // TRANSPORT. Payloads move with cudaMemcpyAsync(cudaMemcpyDeviceToDevice) over unified virtual
 // addresses, which every 64-bit Linux CUDA context has: a device pointer already names its
 // device, so this one entry point expresses a cross-device transfer as well as a local one. When
-// the driver grants peer access the copy is a direct device-to-device PCIe transfer; when it does
-// not (GeForce-class boards refuse peer access), CUDA transparently stages the same copy through
-// host memory. Both paths are correct and stream-ordered, so no caller and no test needs a
-// peer-access branch; only bandwidth and latency differ. enable_peer_access() below reports which
-// one is active.
+// the driver grants peer access and startup validates it, the copy is a direct device-to-device
+// PCIe transfer. Linux translated IOMMU domains (DMA/DMA-FQ) prohibit direct P2P regardless of
+// advertised support or small-copy results. If either device uses such a domain, peer access is
+// unavailable, or copies fail the exact startup check, both directions are disabled and CUDA
+// stages the same copy through host memory. Startup validates
+// that route too before allowing inference. Both qualified paths are stream-ordered, so callers
+// need no peer-access branch; enable_peer_access() below reports which one is active.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
@@ -83,14 +85,20 @@
 
 namespace ninfer::ops {
 
-// Probes cudaDeviceCanAccessPeer in both directions and enables peer access on both devices only
-// when both directions report support; a device that already had peer access enabled is left
-// alone. Returns true when direct P2P is active for the pair, false when the driver denies it and
-// the collectives below will therefore run over CUDA's host-staged transfer. Never fails on
-// denial: the staged path is a supported transport, not an error.
+// Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
+// devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ select the
+// host-staged route without ever enabling direct P2P, even if a small probe could pass. Otherwise,
+// when both directions advertise peer access, enable them and check two distinct 16 KiB patterns
+// with the collectives' UVA D2D API on
+// their destination compute streams. Returns true only when both copies are exact. A data
+// mismatch or unavailable peer access disables both directions (including previously enabled
+// access), verifies the same copies through CUDA's host-staged route, emits one diagnostic, and
+// returns false. A failed staged check or CUDA API error throws; inference must not continue.
 //
-// Call once during setup. cudaDeviceEnablePeerAccess is a context-level operation, not
-// stream-ordered and not graph-capturable; it must never appear in a hot path.
+// Call once during setup, before graph capture or concurrent inference. This function allocates
+// temporary probe buffers, synchronizes each compute stream, and releases its buffers while
+// restoring the caller's current device. Peer-access changes are context-level operations;
+// none of this setup is graph-capturable or belongs in a hot path. A non-TP2 context returns false.
 bool enable_peer_access(const ExecutionContext& ec);
 
 // The reusable cross-device ordering events: two per device, created on that device with timing

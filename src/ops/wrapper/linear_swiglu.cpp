@@ -41,6 +41,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
+    if (qtype == QType::GGML_K) {
+        (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows, policy,
+                                              min_tokens, max_tokens);
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens}, 256);
+        return layout.peak_bytes(1);
+    }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_swiglu workspace: W8 admits only A16");
@@ -96,6 +103,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
+    }
+
+    if (gate_up_weight.qtype == QType::GGML_K) {
+        auto scope = ws.scope();
+        Tensor projected = ws.alloc(DType::BF16, {gate_up_weight.n, t}, 256);
+        linear(x, gate_up_weight, projected, stream);
+        const int width = gate_up_weight.n / 2;
+        silu_mul(projected.slice(0, 0, width), projected.slice(0, width, width), out, stream);
+        return;
     }
 
     const bool common_row_split =
@@ -179,6 +195,11 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel: x/out must be non-null and 16-byte aligned");
+    }
+
+    if (w.qtype == QType::GGML_K) {
+        (void)linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, t, t);
+        return;
     }
 
     const bool common_row_split =
@@ -297,7 +318,7 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
         // here, the same rule attn_input_proj's and gdn_input_proj's column shards follow.
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (qtype == QType::Q4G64_F16S) {
+    if (qtype == QType::Q4G64_F16S || qtype == QType::GGML_K) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument(
                 "linear_swiglu column-parallel workspace: Q4 admits only A16");

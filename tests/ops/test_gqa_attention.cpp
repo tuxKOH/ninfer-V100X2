@@ -144,6 +144,9 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    // Positive finite poison makes a producer's unwritten partials visible to the oracle:
+    // negative or zero partial_l values would let the reducer silently skip them.
+    workspace_buffer.fill(0x3f);
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
@@ -206,6 +209,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    workspace_buffer.fill(0x3f);
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention_cached(tq, tp, kAttentionScale, cache.view(), envelope, workspace, tout,
@@ -486,6 +490,25 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+int run_int8_split_policy_cases() {
+    // Volta's TP2 INT8 producer must use the same active split policy as its reducer.
+    // The short windows demand more splits than BF16; the loose 6K envelope permits
+    // more launches than the INT8 policy consumes, exposing the opposite mismatch.
+    // A1 and A3 both compare every output directly with the fixture's FP64 oracle.
+    constexpr Geometry geometry{"qwen3_6_27b_tp2", 12, 2};
+    constexpr AttentionCase cases[] = {
+        {5, 252, 257, 601u},
+        {6, 139, 145, 602u},
+        {6, 6138, 8199, 603u},
+    };
+    int failures = 0;
+    for (const AttentionCase& test_case : cases) {
+        failures += run_a1_case(geometry, DType::I8, test_case, MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, DType::I8, test_case, MappingPattern::Fragmented);
+    }
+    return failures;
+}
+
 int verify_workspace_capacity_contract() {
     int failures = 0;
     for (const DType dtype : {DType::BF16, DType::I8}) {
@@ -529,6 +552,7 @@ int main() {
     int failures = 0;
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
+    failures += run_int8_split_policy_cases();
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";

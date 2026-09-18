@@ -42,6 +42,9 @@ std::uint8_t pattern(std::uint64_t a, std::uint64_t b, std::uint64_t c) {
 
 Bytes apply_slice(const Bytes& parent, const TensorSlice& slice) {
     Bytes out(static_cast<std::size_t>(slice.encoded_bytes), 0);
+    for (std::size_t i = 0; i < slice.prefix.size(); ++i) {
+        out[i] = std::to_integer<std::uint8_t>(slice.prefix[i]);
+    }
     for (const auto& copy : slice.copies) {
         if (copy.source_offset + copy.bytes > parent.size() ||
             copy.dest_offset + copy.bytes > out.size()) {
@@ -408,6 +411,82 @@ int main() {
             one(SliceRange{8, 16}));
         expect_equal(apply_slice(parent, column_slice), build_row_scale(kRows, 16, 0, 8),
                      "FP8 column slice");
+    }
+
+    // GGML_K keeps row-dependent Q4_K/Q6_K block bytes, and rebuilds shard row descriptors.
+    {
+        const auto build_blocks = [](std::span<const std::uint64_t> selected,
+                                      std::span<const std::uint64_t> blocks) {
+            const auto prefix = ((selected.size() * 8 + 255) / 256) * 256;
+            Bytes out(prefix, 0);
+            for (std::size_t row = 0; row < selected.size(); ++row) {
+                const auto original = selected[row];
+                const auto tag = original % 2;
+                const auto descriptor = ((out.size() - prefix) << 1) | tag;
+                for (unsigned byte = 0; byte < 8; ++byte) {
+                    out[row * 8 + byte] = static_cast<std::uint8_t>(descriptor >> (8 * byte));
+                }
+                const auto width = tag ? 210 : 144;
+                for (const auto block : blocks) {
+                    for (std::uint64_t byte = 0; byte < width; ++byte) {
+                        out.push_back(pattern(original, block, byte));
+                    }
+                }
+            }
+            return out;
+        };
+        const auto build = [&](std::span<const std::uint64_t> selected, std::uint64_t first_block,
+                                std::uint64_t count) {
+            std::vector<std::uint64_t> blocks;
+            for (auto block = first_block; block < first_block + count; ++block) {
+                blocks.push_back(block);
+            }
+            return build_blocks(selected, blocks);
+        };
+        const std::array<std::uint64_t, 5> selected = {0, 1, 2, 3, 4};
+        const Bytes parent = build(selected, 0, 4);
+        const auto payload = std::as_bytes(std::span(parent));
+        const std::array<std::uint64_t, 2> shape = {5, 1024};
+        const std::array<SliceRange, 2> ranges = {SliceRange{0, 2}, SliceRange{3, 1}};
+        const std::array<std::uint64_t, 3> row_indices = {0, 1, 3};
+        const auto row_slice = ninfer::artifact::tensor_row_slice(
+            StorageLayout::GgmlK256V1, NumericFormat::GGML_K, shape, ranges, payload);
+        expect_equal(apply_slice(parent, row_slice), build(row_indices, 0, 4), "GGML_K mixed rows");
+        const auto column_slice = ninfer::artifact::tensor_column_slice(
+            StorageLayout::GgmlK256V1, NumericFormat::GGML_K, shape,
+            one(SliceRange{256, 512}), payload);
+        expect_equal(apply_slice(parent, column_slice), build(selected, 1, 2), "GGML_K columns");
+        expect_throws([&] {
+            (void)ninfer::artifact::tensor_column_slice(StorageLayout::GgmlK256V1,
+                NumericFormat::GGML_K, shape, one(SliceRange{128, 512}), payload);
+        }, "GGML_K partial block split");
+
+        // The preserved GGUF GDN output has tiled [repeat,key,128] columns.
+        // TP2 takes eight key heads from each of three repeat sections, with
+        // both Q4_K and Q6_K block payloads copied exactly into each shard.
+        const Bytes gdn_parent = build(selected, 0, 24);
+        const std::array<std::uint64_t, 2> gdn_shape = {5, 6144};
+        for (std::uint64_t rank = 0; rank < 2; ++rank) {
+            const std::array<SliceRange, 3> columns = {
+                SliceRange{rank * 1024, 1024}, SliceRange{2048 + rank * 1024, 1024},
+                SliceRange{4096 + rank * 1024, 1024}};
+            const auto slice = ninfer::artifact::tensor_column_slice(
+                StorageLayout::GgmlK256V1, NumericFormat::GGML_K, gdn_shape, columns,
+                std::as_bytes(std::span(gdn_parent)));
+            std::vector<std::uint64_t> blocks;
+            for (std::uint64_t repeat = 0; repeat < 3; ++repeat) {
+                for (std::uint64_t block = 0; block < 4; ++block) {
+                    blocks.push_back(repeat * 8 + rank * 4 + block);
+                }
+            }
+            expect_equal(apply_slice(gdn_parent, slice), build_blocks(selected, blocks),
+                         "GGML_K GDN multi-range columns rank " + std::to_string(rank));
+        }
+        expect_throws([&] {
+            const std::array<SliceRange, 2> columns = {SliceRange{0, 256}, SliceRange{384, 256}};
+            (void)ninfer::artifact::tensor_column_slice(StorageLayout::GgmlK256V1,
+                NumericFormat::GGML_K, shape, columns, payload);
+        }, "GGML_K partial block in later column range");
     }
 
     // --- range validation -------------------------------------------------------------------

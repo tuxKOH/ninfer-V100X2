@@ -739,16 +739,24 @@ int verify_registry() {
         }
     }
 
-    // NVFP4 A16Only must still throw beyond T=16, matching the tp1 profile's own domain.
+    // Volta has a precision-qualified QPN split through T=32; the non-Volta small-T profile
+    // retains the historical T<=16 registration.
     bool threw = false;
     try {
         (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA16, 17,
                                                                           17);
     } catch (const std::exception&) { threw = true; }
+#ifdef NINFER_VOLTA_BUILD
+    if (threw) {
+        std::cerr << "registry: Volta NVFP4 A16Only T=17 was rejected\n";
+        ++failures;
+    }
+#else
     if (!threw) {
         std::cerr << "registry: nvfp4 A16Only T=17 was admitted but must not be\n";
         ++failures;
     }
+#endif
 
     // Q4 rejects any policy beyond A16Only.
     threw = false;

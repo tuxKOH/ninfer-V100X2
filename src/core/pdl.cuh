@@ -20,7 +20,7 @@ struct LaunchConfig {
 template <class... KernelArgs, class... CallArgs>
 [[nodiscard]] inline cudaError_t
 launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_VOLTA_BUILD)
     kernel<<<launch.grid, launch.block, launch.dynamic_smem_bytes, launch.stream>>>(
         std::forward<CallArgs>(args)...);
     return cudaGetLastError();
@@ -43,15 +43,21 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
 
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but
 // does not make producer writes visible to the consumer.
+//
+// PDL is a Hopper+ (sm_90+) scheduling hint. On sm_70 (Volta port) there is no grid-dependency
+// mechanism to trigger or wait on: the launch attribute in launch_dependent() above is simply not
+// honored by the driver for pre-Hopper targets, so producer/consumer ordering there falls back to
+// ordinary stream sequencing. These two calls become no-ops rather than relying on the intrinsics
+// being defined (and inert) for every arch, which is unverified for the sm_70/CUDA 12.8 toolchain.
 __device__ __forceinline__ void trigger_dependents() {
-#if !defined(NINFER_SM8X_COMPAT)
+#if __CUDA_ARCH__ >= 900
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
 // Call on every consumer control path before its first access to producer-dependent data.
 __device__ __forceinline__ void wait_for_dependencies() {
-#if !defined(NINFER_SM8X_COMPAT)
+#if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
 #endif
 }

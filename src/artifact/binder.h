@@ -53,6 +53,7 @@ struct DeviceMaterialization {
     // Contiguous parent-payload ranges that fill this device's copy. Empty means the whole
     // payload lands at `offset` verbatim -- the only case that exists at tp1.
     std::vector<PlaneCopy> copies;
+    std::vector<std::byte> prefix;
 };
 
 struct HostMaterialization {

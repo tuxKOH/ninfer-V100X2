@@ -1,27 +1,32 @@
-# NInfer
+# NInfer V100X2
 
-> Selected checkpoints. Maximum single-GPU inference performance, plus a two-GPU path to a
-> 1,048,576-token context.
+This fork targets Qwen3.8-27B Q4_K_M text inference on two Tesla V100-SXM2 16 GB cards with
+CUDA 12.8 (`sm_70`). The default launcher uses tensor parallelism across both cards, a
+180,000-token context capacity, INT8 group-64 KV cache, CUDA Graphs, and MTP with up to three
+draft tokens and the optimized proposal head. The capacity is an allocation limit; a performance
+result must also state how many prompt tokens were actually filled.
 
-NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The 27B execution package additionally runs tensor-parallel
-across two RTX 5090s and, with YaRN positional scaling, serves contexts up to 1,048,576 tokens --
-see [Dual-GPU (TP2) and YaRN 1M context](#dual-gpu-tp2-and-yarn-1m-context).
+NInfer is a from-scratch C++/CUDA engine descended from
+[Neroued/ninfer](https://github.com/Neroued/ninfer). This checkout combines the dual-GPU path from
+the RTX 3060 fork with Volta work from
+[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Ampere (`sm_86`) and early Ada
+(`sm_89`) builds remain available. The inherited RTX 5090 results and YaRN 1M-context results
+below describe their original hardware and artifacts; they do not establish V100X2 performance.
+See [NOTICE](NOTICE) and the
+[TP2 architecture reference](docs/maintainer/tp2-yarn-1m.md) for upstream attribution and design.
 
-> **This is a fork.** Upstream is [Neroued/ninfer](https://github.com/Neroued/ninfer); this tree
-> branches from its commit `feaf4dd` and adds two things to the 27B execution package. **Dual-GPU
-> tensor parallelism** (`--tp 2 --devices A,B`) halves per-card weight and KV residency and is
-> ~40% faster at long context — one resident model, one process, two devices, no NVLink and no
-> distributed serving. **YaRN ×4 positional scaling** (`--rope yarn`) raises the addressable
-> ceiling from the registered 262,144 tokens to 1,048,576, computed to match vLLM as deployed and
-> guarded by a drift test against the installed vLLM. Everything else is upstream's:
-> `--tp 1` output is byte-identical to `feaf4dd` on the greedy cases in
-> [`tests/data/tp1-golden/`](tests/data/tp1-golden/MANIFEST.md), and single-GPU behaviour,
-> supported identities, artifact format, and protocol surfaces are unchanged. The design
-> decisions, numerical contracts, and qualification evidence behind both features are in
-> [Dual-GPU (TP2) execution and YaRN 1M context](docs/maintainer/tp2-yarn-1m.md).
-> See [NOTICE](NOTICE) for attribution.
+At 85K occupied prompt tokens and 180K capacity, the fixed code-generation workload measured
+**53.41 ± 0.064 committed decode tok/s** across three 512-token decode windows, **18.68% above**
+the user's approximately 45 tok/s baseline. A separate **512-token prompt** code workload at the
+same 180K capacity measured **60.03 ± 0.057 tok/s** across three 256-token decode windows.
+Values are means ± sample standard deviations; all six output windows were EOS/EOG-free.
+
+Both profiles use INT8 KV, optimized MTP3, CUDA Graphs and verified CUDA host-staged TP2. Original
+weight codes/scales are preserved, with independent operator oracles and real-model MTP regression
+checks. These results apply to the measured code workloads. The short-input result exceeds the
+reported 57 tok/s peak, whose unspecified context occupancy prevents a matched comparison;
+the 85K result remains below 57 tok/s. See
+[V100X2 measurement](docs/performance.md#v100x2-measurement-and-acceptance).
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -32,9 +37,11 @@ runtime:
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
 | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
+| Qwen3.8-27B GGUF Q4_K_M (local V100 profile) | `gguf-q4-k-m` | `qwen3_8_27b_q4_k_m.ninfer` | local conversion | local artifact |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-Qwen3.6-27B and Qwen3.8-27B each expose two registered weight profiles. The version-2 artifact
+Qwen3.6-27B exposes two registered weight profiles, and Qwen3.8-27B adds the local GGUF-derived
+profile to its two published profiles. The version-2 artifact
 identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
 `qwen3_8_27b` while sharing the 27B execution package. The Qwen3.6 `nvfp4` profile uses W4A4 Tensor
 Core MMA for prefill and A16 NVFP4 kernels for decode. The Qwen3.8 `nvfp4` profile preserves its
@@ -43,9 +50,18 @@ embedding, attention input/output projections, GDN Q/K/V/Z and output projection
 remaining MLP weights. All four 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
 and serving routes.
 
-## Performance
+The local `gguf-q4-k-m` profile comes from the Qwen3.8 Q4_K_M GGUF in LM Studio's model directory.
+Its original Q4_K/Q6_K codes and embedded scales are preserved without requantization. Control
+tensors and frontend resources are converted to NInfer's representation; those transformations
+require numerical and behavioral checks before making an end-to-end quality claim. See the
+[GGUF artifact contract](docs/maintainer/qwen3.8-27b-artifact.md#14-preserved-gguf-q4_k_m-artifact).
+It supports Text and MTP through the same Engine route; its embedded GGUF Vision objects are
+validation-only and `--vision` is rejected for this identity. The artifact is intentionally kept
+outside the repository because it is an 18 GB generated model file.
 
-The published measurements cover the three Qwen3.6 artifact profiles and the Qwen3.8-27B NVFP4
+## Inherited RTX 5090 performance
+
+The following published measurements cover the three Qwen3.6 artifact profiles and the Qwen3.8-27B NVFP4
 profile. The Qwen3.8-27B `groupwise-int` profile is supported by current NInfer builds but is not
 yet included in a published benchmark campaign.
 
@@ -139,8 +155,10 @@ notes.
 NInfer currently requires:
 
 - 64-bit Linux;
-- one NVIDIA GeForce RTX 5090 (`sm_120a`), or two for `--tp 2`;
-- NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
+- two Tesla V100-SXM2 16 GB cards (`sm_70`) for the V100X2 profile; the retained compatibility
+  builds target Ampere `sm_86` and early Ada `sm_89`;
+- NVIDIA driver support for the selected GPU and CUDA 12.8 for Volta; CUDA 13 no longer compiles
+  Volta;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
@@ -148,63 +166,82 @@ NInfer currently requires:
 - `libcurl >= 7.85`;
 - Ninja, when using the commands below.
 
-The build rejects CUDA architectures other than `120a`. There is no install target or packaged
-binary distribution; NInfer is run from its source build tree.
+The build accepts `70` (default), `86`, or `89` in this checkout. RTX 5090 `120a` remains an upstream
+configuration and is not accepted by this checkout's CMake. There is no install target
+or packaged binary distribution; NInfer is run from its source build tree.
 
 ## Build
 
-Clone this fork, not upstream — upstream has neither `--tp 2` nor `--rope yarn`.
+Clone the V100X2 fork and select the CUDA 12.8 compiler explicitly:
 
 ```bash
-git clone https://github.com/wamansou/ninfer-tp2-1m.git
-cd ninfer-tp2-1m
-
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+git clone https://github.com/tuxKOH/ninfer-V100X2.git
+cd ninfer-V100X2
 ```
 
-The default configuration builds:
+If the host lacks the required FFmpeg or curl development versions, build the private dependencies
+first. The helper installs under `build/_deps/install`:
+
+```bash
+tools/v100/build_dependencies.sh
+```
+
+Configure with that prefix (an absent prefix is harmless when system dependencies already suffice):
+
+```bash
+PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build-v100 -j
+```
+
+The V100X2 launcher selects the local Qwen3.8-27B Q4_K_M artifact and the requested long-context
+profile (`--tp 2`, `--max-context 180000`, INT8 group-64 KV, CUDA Graphs, MTP draft window 3,
+optimized proposal head via `--lm-head-draft`) by default. Accepted draft counts can range from
+zero through three in each round. The target verifier still uses the full vocabulary. Pass the
+normal CLI options, including `--prompt` or `--messages`, after the launcher:
+
+```bash
+tools/v100/ninfer-v100x2.sh \
+  --prompt "Explain prefill and decode in three sentences." \
+  --max-new 128 --greedy --no-thinking
+```
+
+Override the artifact, device pair, context capacity, or draft window with
+`NINFER_V100X2_ARTIFACT`, `NINFER_V100X2_DEVICES`, `NINFER_V100X2_MAX_CONTEXT`, and
+`NINFER_V100X2_DRAFT_TOKENS`. Set `NINFER_V100X2_PROPOSAL_HEAD=full` to use the full proposal
+head; the only accepted values are `full` and `optimized` (the default). The launcher does not
+impose a low host-CPU affinity; the executor blocks when no request is ready, while an external
+cgroup/CPU quota can still cap the process if a host requires it.
+
+The V100 configuration builds:
 
 ```text
-build/apps/ninfer
-build/apps/ninfer-serve
+build-v100/apps/ninfer
+build-v100/apps/ninfer-serve
 ```
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
 
-## Docker
+The inherited `Dockerfile` uses CUDA 13.1 and has not been retargeted for V100. Use the CUDA 12.8
+source build above for this profile.
 
-Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
-driver, Docker, and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+## Convert the local LM Studio model
 
-```bash
-docker build --tag ninfer:local .
-```
-
-Download a model into `models/` as described below, then run the HTTP server:
+Conversion takes the exact Q4_K_M GGUF and its BF16 companion vision file; it writes a native
+`.ninfer` artifact and a conversion report. It does not download a replacement checkpoint. Adjust
+the explicit paths to your installation:
 
 ```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer-serve /models/qwen3_6_27b.ninfer \
-  --host 0.0.0.0
+python3 -m tools.convert.qwen3_8_27b.convert_gguf \
+  --model /home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
+  --mmproj /home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-BF16.gguf \
+  --out /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
-Run the CLI from the same image:
-
-```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer /models/qwen3_6_27b.ninfer \
-  --prompt "Explain prefill and decode in three sentences." \
-  --max-new 256
-```
+Use a Python environment containing NumPy. The runtime accepts the resulting `.ninfer`, not the
+source GGUF. When this artifact already exists, run the launcher directly.
 
 ## Download a model
 
@@ -261,6 +298,10 @@ available only for the 35B-A3B target and is text-only.
 
 ## Run the CLI
 
+For V100X2 use `tools/v100/ninfer-v100x2.sh` as shown above. The direct CLI and server examples
+below describe the inherited published artifacts; substitute the V100 artifact, `build-v100`
+binary, and explicit TP2/INT8/MTP3 options when running this profile.
+
 ```bash
 ./build/apps/ninfer models/qwen3_6_27b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
@@ -316,14 +357,17 @@ state, and function calls) plus Anthropic Messages, token counting, and multimod
 
 ## Dual-GPU (TP2) and YaRN 1M context
 
+This section retains the original RTX 5090 campaign and commands. It is not a V100 capacity or
+performance claim; V100X2 uses the 180,000-token profile described above.
+
 `--tp 2` splits one resident model across two RTX 5090s, and `--rope yarn` raises the addressable
 context ceiling from the registered native 262,144 tokens to 1,048,576. The two features are
 independent -- TP2 halves per-card weight and KV residency at any context, YaRN extends positions
 at either `--tp` width -- but 1,048,576 tokens only fits when both are used together with INT8 KV.
 
-TP2 is a capacity feature, not a scale-out feature: one process, one resident model, two CUDA
-devices, no NVLink and no distributed serving. It is implemented for the 27B execution package
-(`qwen3.6-27b` and `qwen3.8-27b`, either weight profile); `qwen3.6-35b-a3b` has no tensor-parallel
+TP2 runs one process, one resident model and two CUDA devices without distributed serving.
+The RTX 5090 pair in this campaign has no NVLink. TP2 is implemented for the 27B execution package
+(`qwen3.6-27b` and `qwen3.8-27b`); `qwen3.6-35b-a3b` has no tensor-parallel
 path and rejects `--tp 2` at startup. Every measurement below was taken on the Qwen3.8-27B NVFP4
 artifact.
 
@@ -610,7 +654,7 @@ the YaRN constants, and what each correctness gate actually proves -- are in
 
 ## Capabilities
 
-All three registered model IDs support:
+The five published artifact profiles support:
 
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
@@ -628,20 +672,24 @@ All three registered model IDs support:
 The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows
 from one to fifteen.
 
+The local `gguf-q4-k-m` identity supports text and MTP, including the public CLI and HTTP Engine
+route. It rejects Vision. The V100X2 acceptance workload uses one active request, native RoPE,
+180,000-token capacity, and a maximum MTP draft window of three.
+
 ## Current limits
 
-- Only the five `(model_id, weights_id)` artifact identities listed above are accepted product
+- Only the six `(model_id, weights_id)` artifact identities listed above are accepted product
   identities.
-- Execution is specialized for the RTX 5090. One CUDA device is the default; the 27B execution
-  package also runs on exactly two with `--tp 2 --devices A,B`, which is a capacity feature rather
-  than scale-out.
+- This checkout targets Volta, Ampere and early Ada. One CUDA device is the generic CLI default;
+  the V100X2 launcher selects exactly two with `--tp 2 --devices A,B`.
 - One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   CPU/GPU offload, or distributed serving. Multi-GPU execution is exactly the two-device
-  tensor-parallel width described above: one process, one resident model, no NVLink, no more than
-  two devices.
+  tensor-parallel width described above: one process, one resident model, no more than two devices.
+  CUDA peer access is used where available, including suitable V100 NVLink topologies; GeForce
+  pairs without peer access use the host-staged transport.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit, or up to 1,048,576 tokens under `--rope yarn` on the 27B
   targets. `--kv-capacity N` explicitly sizes the shared Main Text KV

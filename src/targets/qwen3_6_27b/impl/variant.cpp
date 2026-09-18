@@ -45,7 +45,7 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
     }
 }
 
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_VOLTA_BUILD)
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::A16Only;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::A16Only;
 #else
@@ -168,7 +168,7 @@ void Variant::attention_projection(const Tensor& hidden,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
-                             stream);
+                             workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
@@ -217,7 +217,7 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+                            workspace, stream);
         return;
     }
     const Weight& fused =
@@ -278,6 +278,10 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
+    if (weight.qtype == QType::GGML_K) {
+        ops::ggml_k_gdn_output(hidden, weight, residual, stream);
+        return;
+    }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -351,6 +355,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GgmlK:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
@@ -366,6 +371,8 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return 0;
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -389,6 +396,8 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return 0;
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
@@ -407,6 +416,11 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                            QType::GGML_K, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
@@ -432,6 +446,11 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                            QType::GGML_K, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
@@ -458,6 +477,8 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return 0;
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -485,6 +506,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
                                                          std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return post_mixer_workspace_bytes(QType::GGML_K, QType::GGML_K,
+                                          ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
@@ -554,14 +578,12 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
     }
 }
 
-// Every MTP object is W8G32_F16S in every weights profile (bind_mtp hard-codes the format; Task
-// 3.9 section 0 item 2 verified it does not vary with WeightsProfile), so the MTP split leaves
-// take the A16-only Op forms, which need no transient workspace. A future MTP format would be
-// rejected by the Op's own registration rather than silently mis-routed.
-void require_w8_mtp_shard(const Weight& a, const Weight& b, const char* label) {
-    if (a.qtype != QType::W8G32_F16S || b.qtype != QType::W8G32_F16S) {
+// Both registered MTP codecs use A16 projections without transient Linear storage.
+void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
+    if (a.qtype != b.qtype ||
+        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K)) {
         throw std::logic_error(std::string(label) +
-                               ": tp2 MTP shards are expected to be W8G32_F16S");
+                               ": unsupported or inconsistent tp2 MTP weight format");
     }
     if (a.k != b.k || a.n != b.n) {
         throw std::logic_error(std::string(label) + ": tp2 MTP shards disagree on shape");
@@ -583,7 +605,8 @@ void Variant::attention_projection(const std::array<Tensor, 2>& hidden,
             w, "attention projection");
         ops::attn_input_proj_column_parallel(
             hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->gate_value, split[1]->gate_value), query, gate, key, value, ec);
+            pair_of(split[0]->gate_value, split[1]->gate_value), query, gate, key, value,
+            workspace, ec);
         return;
     }
     const auto fused =
@@ -666,6 +689,10 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                     const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
                                     const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
+    if (weight[0].qtype == QType::GGML_K) {
+        ops::ggml_k_gdn_output(hidden, weight, residual, staging, ec, ev);
+        return;
+    }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
@@ -762,7 +789,7 @@ void Variant::mtp_attention_projection(
     const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& gate,
     const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
     const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
-    require_w8_mtp_shard(w[0]->packed, w[1]->packed, "MTP attention projection");
+    require_mtp_shard(w[0]->packed, w[1]->packed, "MTP attention projection");
     const std::int32_t columns   = hidden[0].ne[1];
     const std::int32_t attn_rows = w[0]->packed.n;
     if (hidden[1].ne[1] != columns) {
@@ -798,8 +825,8 @@ void Variant::mtp_kv_projection(const std::array<Tensor, 2>& hidden,
                                 const std::array<WorkspaceArena*, 2>&, const ExecutionContext& ec) {
     // The tp1 leaf fuses these two into one `linear_pair`; the shard's key and value row views
     // are separate blocks of the same packed shard, so at tp2 they are two column-parallel calls.
-    require_w8_mtp_shard(w[0]->key, w[1]->key, "MTP key projection");
-    require_w8_mtp_shard(w[0]->value, w[1]->value, "MTP value projection");
+    require_mtp_shard(w[0]->key, w[1]->key, "MTP key projection");
+    require_mtp_shard(w[0]->value, w[1]->value, "MTP value projection");
     ops::linear_column_parallel(hidden, pair_of(w[0]->key, w[1]->key), key, ec);
     ops::linear_column_parallel(hidden, pair_of(w[0]->value, w[1]->value), value, ec);
 }
@@ -810,8 +837,8 @@ void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
                                     const std::array<Tensor, 2>& gate,
                                     const std::array<WorkspaceArena*, 2>&,
                                     const ExecutionContext& ec) {
-    require_w8_mtp_shard(w[0]->query, w[1]->query, "MTP query projection");
-    require_w8_mtp_shard(w[0]->output_gate, w[1]->output_gate, "MTP gate projection");
+    require_mtp_shard(w[0]->query, w[1]->query, "MTP query projection");
+    require_mtp_shard(w[0]->output_gate, w[1]->output_gate, "MTP gate projection");
     ops::linear_column_parallel(hidden, pair_of(w[0]->query, w[1]->query), query, ec);
     ops::linear_column_parallel(hidden, pair_of(w[0]->output_gate, w[1]->output_gate), gate, ec);
 }
@@ -830,8 +857,8 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
     // the same reason. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
     // tp2 -- column-parallel gate_up, a shard-local silu_mul over the shard's own gate/up halves,
     // then row-parallel down plus the all-reduce.
-    require_w8_mtp_shard(w[0]->gate_up, w[1]->gate_up, "MTP post mixer gate/up");
-    require_w8_mtp_shard(w[0]->down, w[1]->down, "MTP post mixer down");
+    require_mtp_shard(w[0]->gate_up, w[1]->gate_up, "MTP post mixer gate/up");
+    require_mtp_shard(w[0]->down, w[1]->down, "MTP post mixer down");
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
     const std::int32_t columns            = hidden[0].ne[1];
     std::array<Tensor, 2> gate_up{};

@@ -28,6 +28,7 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    GGML_K,
 };
 
 enum class StorageLayout {
@@ -35,6 +36,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    GgmlK256V1,
 };
 
 enum class ResourceEncoding {
@@ -48,7 +50,11 @@ std::string_view encoding_name(ResourceEncoding encoding) noexcept;
 std::uint64_t tensor_alignment(StorageLayout layout) noexcept;
 std::uint64_t resource_alignment(ResourceEncoding encoding) noexcept;
 std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
-                                  std::span<const std::uint64_t> shape);
+                                  std::span<const std::uint64_t> shape,
+                                  std::uint64_t stored_bytes = 0);
+std::uint64_t ggml_k_code_offset(std::uint64_t rows);
+void validate_ggml_k_payload(std::span<const std::uint64_t> shape,
+                             std::span<const std::byte> payload);
 
 struct RowSplitGeometry {
     std::uint64_t rows                 = 0;
@@ -119,6 +125,7 @@ struct TensorSlice {
     // The shard's own encoded size, i.e. tensor_encoded_size() of the narrowed logical shape.
     std::uint64_t encoded_bytes = 0;
     std::vector<PlaneCopy> copies;
+    std::vector<std::byte> prefix;
 };
 
 // Row (axis 0) slice. The shard is the concatenation of `rows` in the order given; the ranges
@@ -127,7 +134,8 @@ struct TensorSlice {
 // sub-matrix to each device.
 TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
                              std::span<const std::uint64_t> shape,
-                             std::span<const SliceRange> rows);
+                             std::span<const SliceRange> rows,
+                             std::span<const std::byte> payload = {});
 
 // Column (axis 1) slice, rank two only. The shard is the concatenation of `columns` within every
 // row, in the order given; the ranges must be nonempty, ascending, disjoint, and inside the
@@ -138,7 +146,8 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
 // block per fused section to each device, exactly as `tensor_row_slice` does for fused GEMMs.
 TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                 std::span<const std::uint64_t> shape,
-                                std::span<const SliceRange> columns);
+                                std::span<const SliceRange> columns,
+                                std::span<const std::byte> payload = {});
 
 struct TensorDescriptor {
     std::string name;

@@ -4,6 +4,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "core/device.h"
+#include "core/arena.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
@@ -257,6 +258,9 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
     DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    const std::size_t workspace_bytes =
+        ops::q4_q5_attn_input_proj_workspace_capacity_bytes(1, max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
     for (const std::int32_t tokens : options.tokens) {
         Tensor x(input.p, DType::BF16, {hidden, tokens});
         Tensor tq(q.p, DType::BF16, {q_rows, tokens});
@@ -264,7 +268,9 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
+            workspace.reset();
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, workspace,
+                                 launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
@@ -281,7 +287,7 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
             append_result(
-                results, "q4q5", "a16", tokens, cache, 0, logical, flops,
+                results, "q4q5", "a16", tokens, cache, workspace_bytes, logical, flops,
                 measure_public(launch, cache, flush, stream, options.warmup, options.repeat));
         }
     }

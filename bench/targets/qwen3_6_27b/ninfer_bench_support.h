@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 11;
+inline constexpr int kSchemaVersion                   = 12;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -66,17 +66,27 @@ struct BenchOptions {
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
+    int tp                         = 1;
+    std::vector<int> devices;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
+    bool capture_generation        = false;
     OutputFormat output            = OutputFormat::Table;
     std::string output_file;
     bool help_requested = false;
+};
+
+struct CapturedGeneration {
+    std::vector<TokenId> token_ids;
+    std::string content;
+    std::string reasoning;
 };
 
 struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    std::optional<CapturedGeneration> generation;
 };
 
 struct TestResult {
@@ -97,6 +107,8 @@ struct BenchEnvironment {
     std::string cuda_runtime_version;
     std::string cuda_driver_version;
     int device_id = 0;
+    int tp = 1;
+    std::vector<int> devices{0};
 
     std::string artifact_path;
     std::uint64_t artifact_file_size_bytes = 0;

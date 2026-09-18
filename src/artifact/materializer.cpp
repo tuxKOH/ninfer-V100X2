@@ -207,6 +207,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.objects_.at(placement.object.index).device[slot]       = storage.data;
         out.objects_.at(placement.object.index).device_bytes[slot] = placement.bytes;
         auto* const base                                     = static_cast<std::byte*>(storage.data);
+        if (!placement.prefix.empty()) {
+            if (placement.prefix.size() > placement.bytes) {
+                throw ArtifactError("materialization prefix exceeds its allocation");
+            }
+            CUDA_CHECK(cudaSetDevice(devices[slot]->device));
+            CUDA_CHECK(cudaMemcpyAsync(base, placement.prefix.data(), placement.prefix.size(),
+                                        cudaMemcpyHostToDevice, devices[slot]->load_stream));
+        }
         const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
                                    std::uint64_t bytes) {
             if (source_offset > payload.data.size() ||

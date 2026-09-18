@@ -104,19 +104,32 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 ## Current product contract
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
-a small set of explicitly registered checkpoint artifacts. The supported identities are
+NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
+checkpoint artifacts. This checkout's active target is maximum single-request performance on
+two Tesla V100-SXM2 16 GB cards using CUDA 12.8 and `sm_70`. It combines the RTX 3060 TP2 path
+with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and early Ada `sm_89`
+builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
+measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
-image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
-same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
+`qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.6-35b-a3b/groupwise-int`.
+The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
+directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
+three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
+Its Q4_K/Q6_K codes and scales must remain unchanged. Numerical transformations and inference
+optimizations require evidence against their applicable exact, mathematical, or behavioral oracle;
+preserving packed bytes alone does not prove absence of end-to-end quality loss.
 
-The current workload is one GPU and one resident model instance with a startup-fixed one to eight
-active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
+The five published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
+OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
+The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
+Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
+
+One Engine owns one resident model, with one device or TP2 on the 27B package and a startup-fixed
+one to eight active requests. The V100X2 acceptance workload is one active request on two cards.
+The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
-scheduling, additional checkpoint targets, and retargeting the implementation to another execution
-platform are outside the current product. This is a local, single-owner project. Registered models,
+scheduling, additional checkpoint targets, and additional execution platforms beyond those named
+above are outside the current product. This is a local, single-owner project. Registered models,
 generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
@@ -259,6 +272,13 @@ This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
 
+The requested V100X2 acceptance is above the user's LM Studio baseline without further quality
+loss: about 45 committed decode tok/s at roughly 85000 occupied context tokens, with a reported
+57 tok/s peak whose occupied context was not specified. The estimate of about 40 tok/s at longer context is not a
+measurement. Both sides use 180000 capacity, Q4_K_M weights, Q8/INT8 KV, and a maximum draft
+window of three. Record actual token counts, sampling, acceptance, and committed throughput.
+Short prompts, draft throughput, or inherited RTX 5090 tables cannot establish this acceptance.
+
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
 support an operator-level claim but does not establish an end-to-end improvement.
@@ -299,8 +319,10 @@ run and why.
 
 ## Local environment
 
-Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
-`cmake --build <build-dir> -j`; do not supply a numeric job limit such as `-j2` or `-j32`.
+Keep aggregate host CPU usage below the user's approximately 85% ceiling while leaving sufficient
+headroom for the session. Choose build concurrency or an external process quota accordingly; this
+user constraint supersedes the inherited unrestricted-build rule. Low CPU use during CUDA waits
+does not by itself indicate throttling, and busy waiting is not a performance objective.
 
 These are conventional project resources, not a checklist of resources every task must use:
 
@@ -308,12 +330,14 @@ These are conventional project resources, not a checklist of resources every tas
 |---|---|
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
-| BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
-| conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
-| normal build | `build/` |
+| Q4_K_M source | `/home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
+| companion Vision source | same directory, `mmproj-Qwen3.8-27B-BF16.gguf` |
+| product artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
+| conversion report | product artifact path plus `.conversion.json` |
+| normal build | `build-v100/` |
+| private dependency prefix | `build/_deps/install/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| hardware/toolchain | 2 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
@@ -322,8 +346,8 @@ do not download or regenerate them unless that work is in scope.
 
 ```bash
 PYTHON=python3
-MODEL=/path/to/Qwen3.6-27B
-NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
+MODEL=/home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+NINFER_WEIGHTS=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
 ## Commits

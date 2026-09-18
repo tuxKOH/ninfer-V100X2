@@ -42,6 +42,8 @@ namespace ninfer::ops {
  * with that oracle under the Op's named criterion. All inputs and outputs are non-overlapping.
  * `ws` provides the transient capacity reported above and is scoped to the call; there is no
  * persistent state side effect.
+ * The 27B GGML_K form preserves Q4_K/Q6_K [48,5120] rows and stored scales. It evaluates the
+ * projections into FP32 and applies the same gating formula, using no transient workspace.
  */
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
@@ -52,10 +54,13 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
  *
  * - Qwen3.8-27B: BF16_CTRL `ab_weight [96,5120]`, with A in rows [0,48) and B in [48,96);
  * - Qwen3.6-35B-A3B: BF16_CTRL `ab_weight [64,2048]`, with A in rows [0,32) and B in [32,64).
+ * - Qwen3.8-27B: GGML_K GgmlK256 `ab_weight [96,5120]`, in the same A/B row order.
  *
  * The complete immutable parent is the public weight. Its halves are consumed as zero-copy views
  * and produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. All other effects
  * and non-overlap requirements match the two-weight form.
+ * Its TP2 GGML_K form has 24 heads and [48,5120] parent rows per device, with FP32 projection
+ * and output storage and no additional workspace.
  */
 void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
                      const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
@@ -112,9 +117,8 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 // value heads (device 0: heads [0,24); device 1: heads [24,48)). The GDN core recovers a global
 // value head index by adding `device_rank * 24` to the shard-local row.
 //
-// FORMATS: BF16_CTRL only -- gdn_gating_proj is never quantized in any qwen3_8_27b weights profile
-// (bindings.cpp's own comment above the gdn_gating ShardPlan branch). No allreduce: column-parallel
-// only, matching gdn_input_proj's own contract.
+// FORMATS: BF16_CTRL and GGML_K. The Qwen3.8 GGUF profile uses the latter and preserves the
+// parent rows on each rank; no allreduce is needed because this is column-parallel only.
 
 [[nodiscard]] std::size_t
 gdn_gating_proj_column_parallel_workspace_capacity_bytes(std::int32_t min_tokens,
@@ -129,7 +133,7 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
                                      const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
                                      const ExecutionContext& ec);
 
-/** Fused-parent form: `ab_weight` is BF16_CTRL [96,5120], A in rows [0,48), B in [48,96). */
+/** Fused-parent form: `ab_weight` is BF16_CTRL or GGML_K [96,5120], A in rows [0,48), B in [48,96). */
 void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
                                      const std::array<Weight, 2>& ab_weight,
                                      const std::array<Tensor, 2>& A_log,

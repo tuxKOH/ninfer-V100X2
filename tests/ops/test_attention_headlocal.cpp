@@ -351,6 +351,7 @@ struct HeadLocalCase {
     std::uint32_t envelope_max;
     MappingPattern mapping;
     std::uint32_t seed;
+    bool check_head_mapping = true;
 };
 
 std::string case_label(const HeadLocalCase& test_case, DType dtype) {
@@ -399,12 +400,12 @@ ReductionCriterion scaled(const ReductionCriterion& criterion, double factor) {
 // Compares one device's 12-head output against (a) the FP64 ideal oracle for its heads at the
 // Op's own registered criterion and the granularity that criterion was measured at, (b) the tp1
 // 24-head output sliced to the same global heads at the triangle bound, (c) the same, PER HEAD,
-// so a head-mapping error is localized rather than averaged away; then proves a head permutation
-// could not have passed (c).
+// so a head-mapping error is localized rather than averaged away. Fixtures with distinguishable
+// reference heads additionally prove that a head permutation could not have passed (c).
 int compare_device(const std::string& label, int rank, const std::vector<std::uint16_t>& local_bits,
                    const std::vector<double>& global_reference,
                    const std::vector<double>* oracle, const ReductionCriterion& criterion,
-                   std::int32_t tokens, std::int32_t columns) {
+                   std::int32_t tokens, std::int32_t columns, bool check_head_mapping = true) {
     int failures                          = 0;
     const std::vector<double> local_value = bf16_bits_to_double(local_bits);
     const std::string rank_label          = label + " rank=" + std::to_string(rank);
@@ -429,13 +430,43 @@ int compare_device(const std::string& label, int rank, const std::vector<std::ui
             head_label + " vs tp1",
             observed, head_block(global_reference, kGlobalGeometry, global_head, tokens, columns),
             parity);
-        failures += verify_head_mapping(head_label, observed, global_reference, kGlobalGeometry,
-                                        global_head, criterion, tokens, columns);
+        if (check_head_mapping) {
+            failures += verify_head_mapping(head_label, observed, global_reference, kGlobalGeometry,
+                                            global_head, criterion, tokens, columns);
+        }
     }
     return failures;
 }
 
-int run_case(DType dtype, const HeadLocalCase& test_case) {
+// Full-width prefill runs use the same independent FP64 formula on a bounded set of query
+// columns. Every selected query still attends over ALL of its visible keys, all 256 dimensions,
+// and every head. GPU execution, output parity, and exact cache validation remain full-width.
+// Include both sides of tile/page boundaries and the final tiles, where stream-K fixups differ
+// from the existing T=66 fixture. This keeps the CPU oracle linear in the number of keys rather
+// than evaluating an entire 1024-by-1024 attention matrix.
+std::vector<std::int32_t> prefill_oracle_columns(std::int32_t tokens) {
+    std::vector<std::int32_t> columns{0, 1, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
+                                      tokens / 2 - 1, tokens / 2, tokens - 17, tokens - 16,
+                                      tokens - 2, tokens - 1};
+    std::sort(columns.begin(), columns.end());
+    columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+    return columns;
+}
+
+template <typename Value>
+std::vector<Value> select_query_columns(const std::vector<Value>& source, std::int32_t heads,
+                                         const std::vector<std::int32_t>& columns) {
+    const std::size_t column_elements = static_cast<std::size_t>(kHeadDim) * heads;
+    std::vector<Value> selected;
+    selected.reserve(columns.size() * column_elements);
+    for (const auto column : columns) {
+        const auto begin = source.begin() + static_cast<std::ptrdiff_t>(column * column_elements);
+        selected.insert(selected.end(), begin, begin + static_cast<std::ptrdiff_t>(column_elements));
+    }
+    return selected;
+}
+
+int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_oracle = false) {
     const bool append              = std::string(test_case.entry) == "gqa_attention";
     const std::int32_t tokens      = test_case.tokens;
     const std::int32_t total       = test_case.base + tokens;
@@ -459,7 +490,19 @@ int run_case(DType dtype, const HeadLocalCase& test_case) {
     const HostCache initial = make_cache(kGlobalGeometry, dtype, max_context, test_case.seed + 10u);
     HostCache expected      = initial;
     if (append) { append_cache(expected, k, v, positions); }
-    const std::vector<double> oracle = ideal_attention(q, expected, positions);
+    const auto oracle_columns = sampled_prefill_oracle ? prefill_oracle_columns(tokens)
+                                                        : std::vector<std::int32_t>{};
+    std::vector<std::int32_t> oracle_positions;
+    for (const auto column : oracle_columns) { oracle_positions.push_back(positions[column]); }
+    const std::vector<double> oracle =
+        sampled_prefill_oracle
+            ? ideal_attention(select_query_columns(q, kGlobalGeometry.q_heads, oracle_columns),
+                              expected, oracle_positions)
+            : ideal_attention(q, expected, positions);
+    if (sampled_prefill_oracle) {
+        std::cout << label << ": full-width GPU/cache checks, FP64 oracle on "
+                  << oracle_columns.size() << " query columns x 24 heads\n" << std::flush;
+    }
 
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
@@ -478,7 +521,11 @@ int run_case(DType dtype, const HeadLocalCase& test_case) {
     const std::vector<double> reference_value = bf16_bits_to_double(reference.output);
     // The tp1 leg is itself held to the registered contract, so a reference regression cannot be
     // mistaken for a split defect.
-    failures += verify_attention(label + " tp1 vs oracle", reference_value, oracle, criterion);
+    const auto oracle_reference =
+        sampled_prefill_oracle
+            ? select_query_columns(reference_value, kGlobalGeometry.q_heads, oracle_columns)
+            : reference_value;
+    failures += verify_attention(label + " tp1 vs oracle", oracle_reference, oracle, criterion);
 
     // (2) The two head-local runs, each on its own device, each over its own 2-head pool.
     std::array<HostCache, kRanks> local_initial{slice_cache_heads(initial, 0),
@@ -520,9 +567,20 @@ int run_case(DType dtype, const HeadLocalCase& test_case) {
         // pool is the same head slice of the tp1 expected pool.
         failures += verify_cache(rank_label + " cache", observed.cache_after,
                                  slice_cache_heads(expected, rank));
-        failures +=
-            compare_device(label, rank, observed.output, reference_value, &oracle, criterion,
-                           tokens, 1);
+        if (sampled_prefill_oracle) {
+            failures += verify_attention(
+                rank_label + " full output vs tp1", bf16_bits_to_double(observed.output),
+                slice_output_heads(reference_value, rank, tokens, 1),
+                scaled(criterion, kParityBound));
+            failures += compare_device(
+                label + " sampled query columns", rank,
+                select_query_columns(observed.output, kLocalGeometry.q_heads, oracle_columns),
+                oracle_reference, &oracle, criterion,
+                static_cast<std::int32_t>(oracle_columns.size()), 1, test_case.check_head_mapping);
+        } else {
+            failures += compare_device(label, rank, observed.output, reference_value, &oracle,
+                                       criterion, tokens, 1, test_case.check_head_mapping);
+        }
     }
     return failures;
 }
@@ -779,7 +837,13 @@ int verify_rejections() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool prefill_only = argc == 2 && std::string(argv[1]) == "--prefill-only";
+    const bool long_context_only = argc == 2 && std::string(argv[1]) == "--long-context-only";
+    if (argc != 1 && !prefill_only && !long_context_only) {
+        std::cerr << "usage: " << argv[0] << " [--prefill-only|--long-context-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -792,7 +856,50 @@ int main() {
         return 77;
     }
 
-    int failures = verify_rejections();
+    // Exact envelopes and no valid-column mask reach the VoltaFlash path on sm_70. These are
+    // real prefill widths, not small-T decode calls against a larger cache capacity. The second
+    // chunk fixture additionally verifies that all history survives while 512 new rows append.
+    int failures = 0;
+    const HeadLocalCase prefill_cases[] = {
+        {"gqa_attention", 512, 0, 512, MappingPattern::Identity, 1501u},
+        {"gqa_attention", 1024, 0, 1024, MappingPattern::Identity, 1502u},
+        {"gqa_attention", 512, 512, 1024, MappingPattern::Fragmented, 1503u},
+    };
+    if (!long_context_only) {
+        for (const auto& test_case : prefill_cases) {
+            failures += run_case(DType::I8, test_case, true);
+        }
+    }
+    if (prefill_only) {
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " head-local INT8 prefill (512/1024 columns, independent FP64 oracle)\n";
+        return failures == 0 ? 0 : 1;
+    }
+
+    // Four decode queries at the acceptance workload's occupied context, with the full
+    // 180K capacity envelope. Evaluate every head/key against FP64 without subsampling.
+    // Averaging 85K zero-mean V rows need not separate different heads by the fixture's
+    // anti-permutation margin; the short cases retain that distinct-input requirement.
+    // Oracle, per-head parity, and exact cache checks keep their original criteria here.
+    const HeadLocalCase long_context_case{
+        .entry = "gqa_attention",
+        .tokens = 4,
+        .base = 84996,
+        .envelope_max = 180000,
+        .mapping = MappingPattern::Identity,
+        .seed = 1601u,
+        .check_head_mapping = false,
+    };
+    std::cout << "head-local INT8 85K decode: full FP64 oracle, 4 queries x 24 heads; "
+                 "180K capacity\n" << std::flush;
+    failures += run_case(DType::I8, long_context_case);
+    if (long_context_only) {
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " head-local INT8 85K decode (independent FP64 oracle)\n";
+        return failures == 0 ? 0 : 1;
+    }
+
+    failures += verify_rejections();
 
     // T=1 is the decode edge; T=6 is the split-KV small-T maximum; T=17 and T=66 take the prompt
     // route. Every case's key range crosses at least one 64-key page boundary, and the base=1000

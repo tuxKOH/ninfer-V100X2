@@ -1,18 +1,34 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation supports Ampere sm_86 and early Ada sm_89. Set and validate the
+# The implementation supports Volta sm_70, Ampere sm_86 and early Ada sm_89. Set and validate the
 # architecture before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=86 or 89; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 86 or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
+
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    message(FATAL_ERROR "Volta sm_70 requires CUDA 12.8; CUDA 13 removed Volta compilation")
+  endif()
+  add_compile_definitions(NINFER_VOLTA_BUILD=1)
+  include(FetchContent)
+  set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+  set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Disable CUTLASS tests")
+  set(CUTLASS_ENABLE_EXAMPLES OFF CACHE BOOL "Disable CUTLASS examples")
+  FetchContent_Declare(cutlass
+    GIT_REPOSITORY https://github.com/nvidia/cutlass.git
+    GIT_TAG v4.4.2
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(cutlass)
+endif()
 
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests

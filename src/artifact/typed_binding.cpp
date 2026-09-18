@@ -26,6 +26,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::GGML_K:
+        return StorageLayout::GgmlK256V1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -50,6 +52,8 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::GGML_K:
+        return QType::GGML_K;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -208,6 +212,23 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::int32_t rows, std::int32_t columns,
                            int device) {
+    if (format == NumericFormat::GGML_K) {
+        Weight out{};
+        out.payload = materialized.device_data(handle, device);
+        out.payload_bytes = materialized.device_bytes(handle, device);
+        const std::array<std::uint64_t, 2> shape = {
+            static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)};
+        tensor_encoded_size(StorageLayout::GgmlK256V1, format, shape, out.payload_bytes);
+        out.qtype = QType::GGML_K;
+        out.layout = QuantLayout::GgmlK256;
+        out.qhigh = out.payload;
+        out.qdata = static_cast<const std::byte*>(out.payload) + ggml_k_code_offset(rows);
+        out.group = out.group_size = 256;
+        out.n = out.shape[0] = out.padded_shape[0] = rows;
+        out.k = out.shape[1] = out.padded_shape[1] = columns;
+        out.ndim = 2;
+        return out;
+    }
     if (format == NumericFormat::NVFP4) {
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");

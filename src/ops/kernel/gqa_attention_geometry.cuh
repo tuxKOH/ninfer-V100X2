@@ -16,7 +16,11 @@ struct GqaGeometry {
     static constexpr int KVHeads          = KVHeadsValue;
     static constexpr int GroupSize        = QHeads / KVHeads;
     static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
+#ifdef NINFER_VOLTA_BUILD
+    static constexpr int DecodeSplits     = 560 * DecodeSplitScale;
+#else
     static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
+#endif
 };
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;

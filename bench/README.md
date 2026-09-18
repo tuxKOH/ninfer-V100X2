@@ -46,7 +46,9 @@ ninfer_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
-          [--device <id>] [--no-cuda-graph] [--profile-measured]
+          [--device <id>] [--tp <1|2>] [--devices <id[,id]>]
+          [--no-cuda-graph] [--profile-measured]
+          [--capture-generation]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
 
@@ -63,6 +65,22 @@ Example:
 `bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
+
+`--tp 2 --devices 0,1` selects two-device execution through the same Engine route. The device list
+must contain one distinct ordinal per rank; an explicit `--device` must match its first entry.
+Schema-v12 JSON records the actual Engine `tp` and ordered `devices` in `environment`; table, CSV,
+and matrix summaries also identify the selected devices. The existing memory summary reports the
+primary device, so its byte counts are not the sum across both GPUs.
+
+`--capture-generation --output json` preserves each measured repetition's output token IDs,
+raw text, and reasoning in `reps[].generation`. Capture happens after generation returns and does
+not alter Engine phase timings. The fixed-length request still disables model stops; inspect the
+captured IDs and text for EOS or repeated output before interpreting its rate as useful answer
+throughput. Warmup and graph-prime outputs are not retained.
+`timings.total_seconds - timings.first_token_seconds` measures the request's wall time after its
+first output token, including work between Program rounds. Use `G` divided by this interval when
+comparing with another engine's wall-time decode measurement; `decode_output_tok_s` uses the
+separately accumulated Program decode phase.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

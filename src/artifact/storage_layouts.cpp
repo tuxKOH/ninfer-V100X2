@@ -71,6 +71,46 @@ std::uint64_t direct_word_bytes(NumericFormat format) {
 
 } // namespace
 
+std::uint64_t ggml_k_code_offset(std::uint64_t rows) {
+    return align_up(checked_mul(rows, 8, "GGML row descriptors"), 256, "GGML code offset");
+}
+
+namespace {
+std::uint64_t ggml_row(std::span<const std::byte> payload, std::uint64_t row) {
+    std::uint64_t value = 0;
+    for (unsigned byte = 0; byte < 8; ++byte) {
+        value |= static_cast<std::uint64_t>(std::to_integer<unsigned>(payload[row * 8 + byte])) << (byte * 8);
+    }
+    return value;
+}
+
+void set_ggml_row(std::vector<std::byte>& prefix, std::uint64_t row, std::uint64_t value) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+        prefix[row * 8 + byte] = static_cast<std::byte>((value >> (byte * 8)) & 255);
+    }
+}
+}
+
+void validate_ggml_k_payload(std::span<const std::uint64_t> shape,
+                             std::span<const std::byte> payload) {
+    tensor_encoded_size(StorageLayout::GgmlK256V1, NumericFormat::GGML_K, shape, payload.size());
+    std::uint64_t cursor = 0;
+    for (std::uint64_t row = 0; row < shape[0]; ++row) {
+        const auto descriptor = ggml_row(payload, row);
+        if ((descriptor >> 1) != cursor) {
+            throw ArtifactError("GGML_K row offsets are not canonical contiguous rows");
+        }
+        cursor = checked_add(cursor, (shape[1] / 256) * ((descriptor & 1) ? 210 : 144), "GGML row bytes");
+    }
+    const auto code_offset = ggml_k_code_offset(shape[0]);
+    if (checked_add(code_offset, cursor, "GGML payload bytes") != payload.size()) {
+        throw ArtifactError("GGML_K descriptors disagree with payload byte size");
+    }
+    for (auto offset = shape[0] * 8; offset < code_offset; ++offset) {
+        if (payload[offset] != std::byte{0}) { throw ArtifactError("GGML_K descriptor padding is not zero"); }
+    }
+}
+
 std::string_view format_name(NumericFormat format) noexcept {
     switch (format) {
     case NumericFormat::BF16:
@@ -91,6 +131,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::GGML_K:
+        return "GGML_K";
     }
     return {};
 }
@@ -105,6 +147,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::GgmlK256V1:
+        return "ggml-k256-v1";
     }
     return {};
 }
@@ -122,7 +166,23 @@ std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment
 std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
 std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
-                                  std::span<const std::uint64_t> shape) {
+                                  std::span<const std::uint64_t> shape,
+                                  std::uint64_t stored_bytes) {
+    if (layout == StorageLayout::GgmlK256V1) {
+        if (format != NumericFormat::GGML_K || shape.size() != 2 || shape[0] == 0 ||
+            shape[1] == 0 || shape[1] % 256 != 0) {
+            throw ArtifactError("ggml-k256-v1 requires GGML_K [N,K] with K divisible by 256");
+        }
+        const auto blocks = checked_mul(shape[0], shape[1] / 256, "GGML K blocks");
+        const auto prefix = ggml_k_code_offset(shape[0]);
+        const auto minimum = checked_add(prefix, checked_mul(blocks, 144, "GGML Q4 bytes"), "GGML bytes");
+        const auto maximum = checked_add(prefix, checked_mul(blocks, 210, "GGML Q6 bytes"), "GGML bytes");
+        if (stored_bytes < minimum || stored_bytes > maximum ||
+            (stored_bytes - minimum) % ((shape[1] / 256) * 66) != 0) {
+            throw ArtifactError("ggml-k256-v1 byte size does not describe whole Q4_K/Q6_K rows");
+        }
+        return stored_bytes;
+    }
     if (layout == StorageLayout::ContiguousLeV1) {
         if (shape.size() > 16) {
             throw ArtifactError("contiguous-le-v1 supports rank 0 through 16");
@@ -338,9 +398,31 @@ std::uint64_t validate_column_ranges(std::span<const SliceRange> columns,
 
 TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
                              std::span<const std::uint64_t> shape,
-                             std::span<const SliceRange> rows) {
+                             std::span<const SliceRange> rows,
+                             std::span<const std::byte> payload) {
     require_slice(!shape.empty(), "a row slice needs a tensor of rank one or higher");
     TensorSlice out;
+
+    if (layout == StorageLayout::GgmlK256V1) {
+        validate_ggml_k_payload(shape, payload);
+        const auto total_rows = validate_row_ranges(rows, shape[0], 1);
+        const auto source_base = ggml_k_code_offset(shape[0]);
+        const auto dest_base = ggml_k_code_offset(total_rows);
+        out.prefix.resize(dest_base);
+        std::uint64_t dest_row = 0;
+        std::uint64_t cursor = 0;
+        for (const auto& range : rows) {
+            for (auto row = range.begin; row < range.begin + range.count; ++row) {
+                const auto descriptor = ggml_row(payload, row);
+                const auto bytes = (shape[1] / 256) * ((descriptor & 1) ? 210 : 144);
+                set_ggml_row(out.prefix, dest_row++, (cursor << 1) | (descriptor & 1));
+                out.copies.push_back({source_base + (descriptor >> 1), dest_base + cursor, bytes});
+                cursor += bytes;
+            }
+        }
+        out.encoded_bytes = dest_base + cursor;
+        return out;
+    }
 
     if (layout == StorageLayout::ContiguousLeV1) {
         // Row-major with no internal structure: one contiguous range per row range.
@@ -415,11 +497,36 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
 
 TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                 std::span<const std::uint64_t> shape,
-                                std::span<const SliceRange> column_ranges) {
+                                std::span<const SliceRange> column_ranges,
+                                std::span<const std::byte> payload) {
     require_slice(shape.size() == 2, "a column slice requires a rank-two shape");
     const std::uint64_t rows        = shape[0];
     const std::uint64_t total_count = validate_column_ranges(column_ranges, shape[1]);
     TensorSlice out;
+
+    if (layout == StorageLayout::GgmlK256V1) {
+        validate_ggml_k_payload(shape, payload);
+        for (const auto& columns : column_ranges) {
+            require_slice(columns.begin % 256 == 0 && columns.count % 256 == 0,
+                          "ggml-k256-v1 column boundaries must be multiples of 256");
+        }
+        const auto code_base = ggml_k_code_offset(rows);
+        out.prefix.resize(code_base);
+        std::uint64_t cursor = 0;
+        for (std::uint64_t row = 0; row < rows; ++row) {
+            const auto descriptor = ggml_row(payload, row);
+            const auto block_bytes = (descriptor & 1) ? 210 : 144;
+            set_ggml_row(out.prefix, row, (cursor << 1) | (descriptor & 1));
+            for (const auto& columns : column_ranges) {
+                const auto bytes = (columns.count / 256) * block_bytes;
+                out.copies.push_back({code_base + (descriptor >> 1) + (columns.begin / 256) * block_bytes,
+                                       code_base + cursor, bytes});
+                cursor += bytes;
+            }
+        }
+        out.encoded_bytes = code_base + cursor;
+        return out;
+    }
 
     if (layout == StorageLayout::ContiguousLeV1) {
         // Row-major with no internal structure: every range of every row is one contiguous copy,
@@ -443,7 +550,7 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
     // families are all row-parallel GEMM weights, whose shard genuinely is one contiguous input
     // range, so the restriction costs nothing and is rejected loudly rather than mis-encoded.
     require_slice(column_ranges.size() == 1,
-                  "only contiguous-le-v1 supports a multi-range column slice");
+                  "this storage layout requires one contiguous column range");
     const SliceRange columns = column_ranges.front();
 
     if (layout == StorageLayout::RowSplitK128V1) {

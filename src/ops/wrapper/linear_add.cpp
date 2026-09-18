@@ -5,6 +5,7 @@
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/linear_dispatch.h" // detail-free validate_linear_semantics / dispatch_linear
+#include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
@@ -89,6 +90,10 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
 
+    if (w.qtype == QType::GGML_K) {
+        detail::ggml_k_project_split(x, w, &residual_out, 1, true, stream);
+        return;
+    }
     if (w.qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("BF16 linear_add admits only A16");
@@ -218,6 +223,10 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (qtype == QType::GGML_K) {
+        return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy,
+                                                min_tokens, max_tokens);
     }
     if (qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
@@ -351,7 +360,7 @@ void issue_fused_rank(const Tensor& x, const Weight& w, Tensor& residual, Tensor
         residual_add(scratch, residual, stream);
         return;
     }
-    if (w.qtype == QType::NVFP4 || w.qtype == QType::Q5G64_F16S ||
+    if (w.qtype == QType::GGML_K || w.qtype == QType::NVFP4 || w.qtype == QType::Q5G64_F16S ||
         w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         // FP8 reaches here through the same "shape alone selects the route" widening as NVFP4/Q5:
         // dispatch_linear_add's FP8 branch (above) already admits the tp2 row-shard extents, and
@@ -410,6 +419,23 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                              const PeerEvents& events) {
     linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec,
                             events);
+}
+
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+    detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true);
+}
+
+void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                       const std::array<Tensor, 2>& residual,
+                       const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+                       const PeerEvents& events) {
+    validate_add_split_pair(x, w, ec);
+    validate_add_split_residency(x, w, residual, ec);
+    detail::for_each_rank(ec, [&](int rank) {
+        detail::ggml_k_project_split(x[rank], w[rank], &residual[rank], 1, rank == 0,
+                                     ec.dev[rank]->stream, true);
+    });
+    allreduce_sum(residual, staging, ec, events);
 }
 
 } // namespace ninfer::ops

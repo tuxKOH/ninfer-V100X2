@@ -139,7 +139,8 @@ int run(const Options& options) {
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
 
-    ninfer::DeviceContext device(options.device);
+    ninfer::ExecutionContext execution_context({options.device});
+    ninfer::DeviceContext& device = execution_context.primary();
     ninfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
@@ -156,7 +157,7 @@ int run(const Options& options) {
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
+    auto program = target::Package::create_program(*model, std::move(sequence), execution_context);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);

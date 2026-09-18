@@ -38,7 +38,8 @@ namespace ninfer::ops {
  *   ideal[:,t] = residual[:,t] + Linear(x,w)[:,t].
  *
  * Logical shapes:
- *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q5G64_F16S RowSplit
+ *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are GGML_K `ggml-k256-v1`,
+ *   Q5G64_F16S RowSplit
  *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16S [5120,6144] or [5120,17408], or BF16_CTRL Contiguous [5120,6144]. T may
@@ -54,7 +55,7 @@ namespace ninfer::ops {
  *   rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
+ *   GGML_K, Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
  *   admits A16Only and AllowA8. Its two semantic registrations own independent production plans:
  *   [5120,6144] resolves T<22 to A16 and T>=22 to A8, while [5120,17408] resolves T<25 to A16 and
  *   T>=25 to A8. A permissive policy allows the private resolver to select either qualified
@@ -73,6 +74,18 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
+
+// Exact GDN input permutation fused into a GGML_K projection. The represented input
+// is BF16 [128,3,H,T] (H=16, or H=8 per TP2 rank); the packed weight columns are
+// [128,H,3]. No weight is requantized: ideal is residual + W @ transpose_heads(x).
+// FP64 decodes W's original scales/codes and applies this permutation before the dot.
+// No workspace or persistent state. Split form adds the residual on rank 0 once
+// and all-reduces both partial projections, following linear_add_row_parallel.
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream);
+void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                       const std::array<Tensor, 2>& residual,
+                       const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+                       const PeerEvents& events);
 
 // --- Tensor-parallel split form (tp == 2) -----------------------------------------------------
 //
@@ -112,7 +125,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
 // linear_row_parallel() (per-rank device/stream residency, the legacy-default-stream trap) apply
 // unchanged here too.
 //
-// Registered formats: NVFP4, Q5G64_F16S, and FP8_E4M3FN_ROW_BF16S are all
+// Registered formats: GGML_K, NVFP4, Q5G64_F16S, and FP8_E4M3FN_ROW_BF16S are all
 // TRUE splits -- each has a runtime-K-dimensioned linear_add kernel family, so rank 0 reaches it
 // through dispatch_linear_add exactly as linear_add() itself does, at the halved-K shard geometry.
 // BF16_CTRL is COMPOSED, not extended (see above -- its family has no runtime-K escape hatch).

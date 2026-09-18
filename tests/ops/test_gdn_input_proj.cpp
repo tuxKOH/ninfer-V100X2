@@ -50,7 +50,11 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    const std::size_t capacity =
+        ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 1));
+    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, workspace,
+                        nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);

@@ -55,13 +55,15 @@ inline constexpr std::size_t kGdnLayers           = 48;
 //     the row-parallel families' axis (`ShardAxis::Columns`, `row_begin`/`row_count` index the
 //     stored column dimension) but not their meaning: nothing is reduced across devices, and the
 //     boundary requirement is head alignment, exactly as for the column-parallel families. It is
-//     also the ONLY family whose per-device shard is MORE THAN ONE range on the column axis: the
+//     one of two families whose per-device shard is MORE THAN ONE range on the column axis: the
 //     10240 channels are the GDN input projection's Q(2048) | K(2048) | V(6144) block, each
 //     section split by its own head count, so device r owns three disjoint channel blocks
 //     concatenated in Q|K|V order (see `plan_for`'s `gdn/convolution` branch). `artifact::
-//     tensor_column_slice` admits multiple ranges for `contiguous-le-v1` only -- which this object
-//     always is (BF16) -- and rejects them for every grouped/tiled/swizzled layout, so no
-//     row-parallel GEMM family can accidentally acquire a multi-range shard.
+//     tensor_column_slice` admits these ranges for `contiguous-le-v1`, which this object
+//     always is (BF16). Qwen38GgmlK gdn/output also uses three ranges: its original GGUF
+//     columns are [repeat,key,128], so each rank selects its key heads from each repeat
+//     section. Every range preserves whole K256 blocks. The projection Op maps grouped
+//     activations to the retained tiled column order.
 //   - replicated objects (norms, token_embedding, gdn/norm, draft_head_token_ids): `shards` is
 //     empty, meaning a full copy lives on every device (see `WeightPlan::shards` below).
 //     `gdn/norm` belongs here on its merits, not by default: its bound shape is {128}, the
@@ -159,7 +161,7 @@ struct ShardMapping {
 // Same contract as `plan_for` below, plus the axis. `tp == 1` returns a replicated mapping with no
 // shards before any family check runs, exactly as `plan_for` does.
 [[nodiscard]] ShardMapping shard_mapping_for(std::string_view object, int tp,
-                                             const TextConfig& config);
+                                             const TextConfig& config, WeightsProfile profile);
 
 // Computes the TP2 shard map for one artifact weight object. `object` is matched by suffix
 // against the local binder names used in bindings.cpp (e.g. "attention/query_key_gate_value",
@@ -169,7 +171,8 @@ struct ShardMapping {
 // Throws std::invalid_argument for: `tp < 1`; an object name matching no known family; or a
 // split that would violate head alignment or (for row-parallel objects) the k128 group
 // boundary. `tp == 1` always returns an empty ShardPlan before any of those checks run.
-[[nodiscard]] ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config);
+[[nodiscard]] ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
+                                 WeightsProfile profile);
 
 struct WeightPlan {
     artifact::ObjectHandle object;
@@ -257,6 +260,8 @@ struct MtpPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
+    artifact::NumericFormat mtp_format = artifact::NumericFormat::W8G32_F16S;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;

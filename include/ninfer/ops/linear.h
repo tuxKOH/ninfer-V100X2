@@ -57,7 +57,7 @@ enum class LinearPolicy : std::uint8_t {
  * no bias, activation, residual addition, or transpose mode.
  *
  * @par Supported execution domain
- * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
+ * Registered execution uses GGML_K `ggml-k256-v1`, RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
  * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16S weights, plus
  * registered contiguous BF16_CTRL problems. Each format owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
@@ -81,7 +81,7 @@ enum class LinearPolicy : std::uint8_t {
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
- * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
+ * choice. BF16_CTRL and GGML_K admit only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. The five non-vocabulary FP8 problems admit the
  * same two policies at every positive T. AllowA8 resolves `[14336,5120]` to A16 through T=11 and
  * A8 from T=12; `[16384,5120]` to A16 through T=10 and A8 from T=11; `[34816,5120]` to A8 at T=1,

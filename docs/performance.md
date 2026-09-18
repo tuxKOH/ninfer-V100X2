@@ -1,6 +1,191 @@
 # Serving performance
 
-Tested Git revisions:
+## V100X2 measurement and acceptance
+
+The active port uses two Tesla V100-SXM2 16 GB cards, CUDA 12.8 (`sm_70`), and the local
+`qwen3.8-27b/gguf-q4-k-m` artifact converted from LM Studio's Qwen3.8-27B Q4_K_M GGUF.
+On the fixed code-generation workload below, three valid runs at exactly 85,000 occupied prompt
+tokens measured **53.4075 ± 0.0639 committed decode tok/s** (mean ± sample standard deviation),
+**18.68% above** the user's approximately 45 tok/s baseline. Each run measures 512 decode tokens
+with 180,000-token capacity. This establishes the speed result for this prompt and output window;
+it does not guarantee the same speed on every prompt. The RTX 5090 tables later in this document
+are inherited results for different hardware and weight profiles.
+
+Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
+transfer route with exact byte comparisons in both directions, and rejects startup if verification
+fails. The current `DMA-FQ` host uses CUDA's host-staged copies. This route passes the collective
+suite, including different tensor sizes, guards and 64 consecutive rounds, and the three public
+Engine CUDA Graph measurements below. The INT8 attention test also passes its independent FP64
+oracle at 85K occupied keys for all four queries, all 24 heads and every visible key, with TP1/TP2 comparisons
+and exact cache checks. Real-model MTP/non-MTP teacher forcing and graph/eager regression gates
+pass on their short-prompt fixtures. The source Q4_K/Q6_K codes and scales remain unchanged;
+these numerical and state checks support the tested route without asserting universal quality
+parity for all prompts.
+
+| Setting | V100X2 comparison profile |
+|---|---|
+| GPUs | 2 x Tesla V100-SXM2 16 GB, TP2, devices 0 and 1 |
+| CUDA compile/runtime | 12.8 / 12.8 |
+| Artifact | `qwen3.8-27b/gguf-q4-k-m`; original Q4_K/Q6_K blocks and scales |
+| Request mode | One active request |
+| Context capacity | 180,000 tokens, native RoPE |
+| Primary occupied context | Exactly 85,000 actual prompt tokens |
+| KV cache | INT8 group-64; compared with LM Studio's Q8 KV configuration |
+| CUDA Graph | Enabled |
+| Prefill chunk | 1,024 tokens |
+| NInfer MTP | Fixed draft window of three; optimized proposal head (`--lm-head-draft`) |
+| Measured output window | 512 decode tokens plus the first token from prefill; three repetitions |
+| TP2 transport | Verified CUDA host-staged copies on the current IOMMU host |
+
+NInfer's `--mtp-draft-tokens 3` uses a fixed three-token proposal window, shortened when the remaining
+output or context budget requires it. Verification may accept zero drafts. This is distinct from
+LM Studio's maximum-three/minimum-zero draft configuration: a minimum draft count of zero permits
+its proposal policy to vary how many drafts it attempts, whereas zero accepted drafts describes
+the verification result. The two engines therefore use related, but different, MTP schedules.
+
+| Repetition | Committed decode wall tok/s |
+|---|---:|
+| 1 | 53.3498 |
+| 2 | 53.3966 |
+| 3 | 53.4761 |
+| Mean ± sample standard deviation | **53.4075 ± 0.0639** |
+
+Every repetition produced the same 513 token IDs, with no EOS/EOG token in the captured window,
+and accepted **364 / 444 drafts (81.98%)**. Prefill took **298.132–298.154 s** per repetition and
+is excluded from decode throughput. Host CPU use was approximately one of 32 logical cores;
+observed GPU memory use was **13,768 / 13,454 MiB**, including about 313 MiB of desktop use on GPU 0.
+
+A separate short-input code-chat measurement used 512 prompt tokens, the same 180,000-token
+capacity and execution settings, one warmup, and three 256-token decode windows. Its wall decode
+rates were **59.9644, 60.0509 and 60.0721 tok/s**, or **60.0291 ± 0.0571 tok/s** (mean ± sample
+standard deviation), with **65.89%** draft acceptance. All three 257-token outputs were identical
+and EOS/EOG-free. This exceeds the reported 57 tok/s peak numerically, but the unspecified
+occupancy of that peak prevents a matched comparison; it is not the 85K acceptance result.
+
+The user-reported LM Studio baseline is approximately **45 committed decode tok/s at 85K occupied
+context**, with a reported **57 tok/s peak** whose context occupancy was not specified. The
+approximately 40 tok/s figure at longer context is an estimate. These observations are the
+acceptance reference; the 18.68% gain is relative to the reported 45 tok/s value, rather than the
+matched-engine measurement below. The 57 tok/s peak has not been exceeded by this 85K result and lacks
+the context occupancy needed for a like-for-like comparison.
+
+A matched diagnostic run of LM Studio's CUDA backend **2.33.0** used its automatic two-GPU split,
+the same source GGUF and exact 85,000 prompt IDs, Q8 KV, a requested 180,000-token capacity
+(rounded by the backend to 180,224), and maximum-three/minimum-zero MTP. Both engines used greedy
+sampling and generated 513 output tokens: one from prefill and 512 in the measured decode interval.
+
+| Engine | Decode tok/s | Prefill seconds | Accepted / drafted |
+|---|---:|---:|---:|
+| NInfer V100X2, mean of three runs | **53.4075** | 298.144 | 364 / 444 per run (81.98%) |
+| LM Studio CUDA 2.33.0, one run | **35.4977** | 185.374 | 365 / 440 (82.95%) |
+
+The LM run decoded for **14.42347 s**, evaluated all 85,000 prompt tokens without cache reuse,
+and stopped at the output limit without any EOS/EOG token. NInfer's decode rate is **50.45% higher**
+in this comparison, with similar MTP acceptance. Its prefill is **1.61 times as long**, so this is
+a decode improvement, not a reduction in cold-request completion latency. The single LM run is
+a diagnostic, not a stable average, and does not replace the user's approximately 45 tok/s
+acceptance baseline.
+
+Measure committed output tokens per decode second, excluding the first token produced by prefill.
+Rejected draft tokens do not count as output. Report repeated measurements and context occupancy;
+a short-prompt result at `--max-context 180000` cannot establish performance at 85K occupied tokens.
+Use the same prompt content and sampling for the final LM Studio comparison. Record GPU memory,
+power and aggregate CPU use; keep CPU below the user's approximately 85% ceiling.
+
+The public Engine benchmark provides a reproducible greedy diagnostic. The code-chat corpus below
+uses the artifact's embedded tokenizer and chat template with thinking disabled, distinct repository
+source excerpts, and a final bounded blocking task-queue implementation request. The tool trims the
+source excerpt body to make the complete prompt exactly 85,000 tokens, preserving the task and
+assistant prefix; it does not repeat excerpts to fill the context. Feed the saved token IDs directly
+to both engines, without applying another template or decoding and retokenizing them. Keep the
+corpus command's `--output-tokens 1024`: this is part of the fixed prompt's wording, independent of
+the measured 512-token decode window. The bundled 65,536-token benchmark corpus is too short for
+this case:
+
+```bash
+cmake -S . -B build-v100 -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-v100 --target ninfer_bench ninfer_v100_corpus -j
+
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100/bench/ninfer_v100_corpus \
+  /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer \
+  /tmp/v100-code-85000.ids --code-chat 85000 --output-tokens 1024 \
+  src/core/host_worker_pool.h \
+  src/core/host_worker_pool.cpp \
+  src/runtime/engine/concurrent_executor.h \
+  src/targets/qwen3_6/impl/runtime/program_impl.h \
+  src/targets/qwen3_6/impl/runtime/text_context_impl.h \
+  src/targets/qwen3_6/impl/runtime/layouts_impl.h \
+  src/targets/qwen3_6/impl/runtime/mtp_impl.h \
+  src/ops/kernel/gqa_attention_decode_i8.cuh \
+  src/ops/kernel/gqa_attention_decode_i8_tc_volta.cuh
+
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100/bench/ninfer_bench \
+  --weights /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer \
+  --tp 2 --devices 0,1 --max-ctx 180000 --kv-dtype int8 \
+  --prefill-chunk 1024 --mtp-draft-tokens 3 --lm-head-draft \
+  --corpus /tmp/v100-code-85000.ids \
+  -pg 85000,512 --warmup 0 -r 3 --capture-generation -o json \
+  --output-file /tmp/ninfer-v100x2-85000.json
+```
+
+`-pg 85000,512` fixes the output window at 513 tokens: one from prefill and 512 from decode.
+Each measured decode follows the full 85K-token prefill, and the Engine primes its CUDA Graphs
+before use; `--warmup 0` omits an additional benchmark warmup generation. For a cross-engine
+wall-time decode comparison, compute each repetition's rate as
+`512 / (timings.total_seconds - timings.first_token_seconds)`. Both timestamps include the same
+prompt preparation and submission origin, so subtraction leaves the interval from first-token
+commit to request completion, including work between decode rounds. The separately reported
+`decode_output_tok_s` uses accumulated Program decode-phase time and excludes some Engine work
+between rounds.
+
+`--capture-generation` retains each measured repetition's raw text and token IDs under
+`reps[].generation`. NInfer's fixed-budget benchmark disables model-default stopping but can emit
+EOS tokens. An accepted repetition must contain no EOS within its entire 513-token output window;
+also inspect the captured text for repetition before counting its rate as useful answer throughput.
+The matched 512-token LM comparison uses `compare_llama.py` with `ignore_eos=false`, without
+EOG-token logit biases. It requires `tokens_predicted=513` and a non-EOS ending; otherwise it saves
+the returned output and rejects the repetition instead of calculating a complete-window rate.
+
+The comparison used this local LM Studio backend command, leaving GPU splitting automatic:
+
+```bash
+LD_LIBRARY_PATH=/home/z/.lmstudio/extensions/backends/vendor/linux-llama-cuda-vendor-v1 \
+/home/z/.lmstudio/extensions/backends/llama.cpp-linux-x86_64-nvidia-cuda-avx2-2.33.0/llama-server \
+  --model /Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
+  --ctx-size 180000 --parallel 1 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 0 \
+  --threads 16 --threads-batch 24 \
+  --host 127.0.0.1 --port 18081 --no-webui
+```
+
+With that backend ready, run the matched single-round diagnostic using Python 3.11:
+
+```bash
+.venv/bin/python3 tools/v100/compare_llama.py \
+  --url http://127.0.0.1:18081 \
+  --corpus /tmp/v100-code-85000.ids \
+  --prompt-tokens 85000 --decode-tokens 512 --repetitions 1 \
+  --output /tmp/llama-v100x2-85000.json
+```
+
+This one-round LM Studio diagnostic does not establish a stable average. The NInfer comparison
+against the user's 45 tok/s baseline uses the three measured repetitions above.
+
+These are fixed-window code-generation throughput measurements, not evaluations of whether the
+generated code correctly solves the requested programming task.
+
+Quality checks are separate from timing. Preserving the source quantization blocks is an exact
+conversion claim; control-tensor transformations and floating-point operators require numerical
+oracles. Real-model MTP/non-MTP teacher forcing, graph/eager comparisons and cross-device state
+checks qualify the execution path. A plausible answer or a faster kernel alone is insufficient to
+claim unchanged model quality or an end-to-end speedup.
+
+## Inherited RTX 5090 campaigns
+
+Tested Git revisions for the inherited campaigns:
 
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:
   `f08597d6eaafce5b875934aaa85854fcd5426df8`;
@@ -29,7 +214,7 @@ speculative-decode corpus at C=1, 2, 4, and 8; its C=1 point also supplies the s
 results below. The registered Qwen3.8-27B `groupwise-int` profile remains outside the published
 benchmark campaign.
 
-Every campaign above and below is single-GPU except **Dual-GPU (TP2) and YaRN 1M context**, which
+Every inherited campaign is single-GPU except **Dual-GPU (TP2) and YaRN 1M context**, which
 is measured across two RTX 5090s and under a power limit the single-GPU campaigns were not; the two
 sets are not comparable to each other.
 
@@ -167,7 +352,7 @@ failure. At C=8, available device memory after startup was 2.66 GiB for 27B grou
 
 ## Dual-GPU (TP2) and YaRN 1M context
 
-This section is the only dual-GPU campaign in this document. It was measured on the Qwen3.8-27B
+This inherited campaign was measured on the Qwen3.8-27B
 NVFP4 artifact across two RTX 5090s with `--tp 2 --devices 0,1`, INT8 group-64 KV, CUDA Graphs
 enabled, and greedy decoding. The extended-context rows additionally use
 `--rope yarn --yarn-factor 4.0 --yarn-origin 262144`.

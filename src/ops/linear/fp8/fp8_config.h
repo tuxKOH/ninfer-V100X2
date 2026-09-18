@@ -390,6 +390,20 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry>
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> =
     kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
+#ifdef NINFER_VOLTA_BUILD
+// Upstream serves the vocabulary head only through the A16 MMA kernel, which is ldmatrix-based
+// (sm_75+) and has no SIMT sibling, so on Volta the head has no route at all. Register it on the
+// SIMT decode/small-T families instead. The schedules are the ones every other geometry measured
+// on the reference card: a starting point for this port, not a Volta measurement -- see
+// the V100 implementation before treating these numbers as tuned.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8VocabularyGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyGeometry> = kFp8LastSmallT;
+#endif // NINFER_VOLTA_BUILD
 
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
@@ -403,7 +417,11 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
     case Fp8Problem::Vocabulary:
     case Fp8Problem::VocabularyTp2Column:
+#ifdef NINFER_VOLTA_BUILD
+        return kFp8LinearSmallTMax<Fp8VocabularyGeometry>;
+#else
         break;
+#endif
     case Fp8Problem::Residual6144:
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:

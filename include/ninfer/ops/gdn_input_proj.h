@@ -39,10 +39,13 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   Caller-owned transient storage is sized by q4_q5_gdn_input_proj_workspace_capacity_bytes().
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream);
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t q4_q5_gdn_input_proj_workspace_capacity_bytes(
+    std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Single-parent GDN projection. Registered parent forms are:
@@ -51,6 +54,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], with stored row counts
  *   [2048,2048,6144,6144].
+ * - GGML_K GgmlK256 [16384,5120], preserving Q4_K/Q6_K rows and embedded scales in the same
+ *   [2048,2048,6144,6144] order. This route admits A16Only with no projection workspace.
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
  * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 permits private activation
@@ -96,6 +101,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
  * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
  * projection mechanism plus any projected BF16 plane selected by the complete-Op plan.
+ * GGML_K [16384,5120] admits A16Only and always requires one BF16 [10240,B*W] projected plane.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -154,6 +160,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * non-overlapping, except that the read-only initial_state_slots and snapshot_base_slots selectors
  * may alias each other; same-row state-slot overlap remains governed by the snapshot state
  * contract.
+ * GGML_K [16384,5120] uses the same shapes and state contract with A16Only. Its composed route
+ * projects all physical columns into BF16 before applying the convolution and state update.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -188,6 +196,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * record-producing profile. Fused and materialized A16 routes require no storage. AllowA4/AllowA8
  * returns only the activation-quantization workspace selected by this complete-Op route;
  * conv_record is caller-owned.
+ * GGML_K [16384,5120] admits A16Only, projects directly into conv_record and requires no scratch.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,

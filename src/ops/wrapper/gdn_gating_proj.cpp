@@ -1,8 +1,11 @@
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/rmsnorm.h"
 
 #include "ops/common/split_launch.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
+#include "ops/launcher/gdn_gating.h"
+#include "ops/linear/ggml_k/ggml_k.h"
 
 #include <cmath>
 #include <cstdint>
@@ -16,8 +19,15 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void require_bf16_weight(const Weight& w, std::int32_t rows, std::int32_t input_rows,
+void require_control_weight(const Weight& w, std::int32_t rows, std::int32_t input_rows,
                          const char* name) {
+    if (w.qtype == QType::GGML_K) {
+        if (w.layout != QuantLayout::GgmlK256 || w.n != rows || w.k != input_rows ||
+            w.ndim != 2 || w.qdata == nullptr || !aligned_to(w.qhigh, 8)) {
+            throw std::invalid_argument(std::string("gdn_gating_proj: invalid ") + name);
+        }
+        return;
+    }
     const std::uint64_t payload_bytes = static_cast<std::uint64_t>(rows) *
                                         static_cast<std::uint64_t>(input_rows) *
                                         sizeof(std::uint16_t);
@@ -30,7 +40,16 @@ void require_bf16_weight(const Weight& w, std::int32_t rows, std::int32_t input_
     }
 }
 
-Weight bf16_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+Weight control_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+    if (parent.qtype == QType::GGML_K) {
+        Weight view = parent;
+        view.qhigh = static_cast<const std::uint64_t*>(parent.qhigh) + row_begin;
+        view.high_plane_bytes = static_cast<std::uint64_t>(rows) * sizeof(std::uint64_t);
+        view.shape[0] = rows;
+        view.padded_shape[0] = rows;
+        view.n = rows;
+        return view;
+    }
     const std::size_t row_bytes = static_cast<std::size_t>(parent.k) * sizeof(std::uint16_t);
     const auto* data            = static_cast<const std::uint8_t*>(parent.qdata) +
                        static_cast<std::size_t>(row_begin) * row_bytes;
@@ -49,13 +68,13 @@ struct GdnControlParentGeometry {
     std::int32_t heads;
 };
 
-GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
+GdnControlParentGeometry require_control_parent(const Weight& parent) {
     if (parent.n == 96 && parent.k == 5120) {
-        require_bf16_weight(parent, 96, 5120, "ab_weight");
+        require_control_weight(parent, 96, 5120, "ab_weight");
         return {.input_rows = 5120, .heads = 48};
     }
     if (parent.n == 64 && parent.k == 2048) {
-        require_bf16_weight(parent, 64, 2048, "ab_weight");
+        require_control_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};
     }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
@@ -75,6 +94,15 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
         !t.is_contiguous() || !aligned_to(t.data, dtype == DType::FP32 ? 4 : 16)) {
         throw std::invalid_argument(std::string(op) + ": invalid " + name);
     }
+}
+
+void project_ggml_k_control(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                            const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                            cudaStream_t stream) {
+    // Each epilogue element reads its two projections before replacing them in place.
+    detail::ggml_k_project_split(x, a_weight, &g, 1, false, stream);
+    detail::ggml_k_project_split(x, b_weight, &beta, 1, false, stream);
+    detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
 }
 
 } // namespace
@@ -104,8 +132,16 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    require_control_weight(a_weight, 48, 5120, "a_weight");
+    require_control_weight(b_weight, 48, 5120, "b_weight");
+    if (a_weight.qtype != b_weight.qtype) {
+        throw std::invalid_argument("gdn_gating_proj: control formats disagree");
+    }
+
+    if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
+        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+        return;
+    }
 
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
@@ -115,15 +151,21 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
                      cudaStream_t stream) {
     constexpr const char* op                = "gdn_gating_proj";
     const std::int32_t tokens               = x.ne[1];
-    const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
+    const GdnControlParentGeometry geometry = require_control_parent(ab_weight);
     require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
     require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
     require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
 
-    const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
-    const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
+    if (ab_weight.qtype == QType::GGML_K) {
+        const Tensor outputs[]{g, beta};
+        detail::ggml_k_project_split(x, ab_weight, outputs, 2, false, stream);
+        detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
+        return;
+    }
+    const Weight a_weight = control_row_view(ab_weight, 0, geometry.heads);
+    const Weight b_weight = control_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
@@ -143,8 +185,17 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    require_control_weight(a_weight, 48, 5120, "a_weight");
+    require_control_weight(b_weight, 48, 5120, "b_weight");
+    if (a_weight.qtype != b_weight.qtype) {
+        throw std::invalid_argument("gdn_norm_gating_proj: control formats disagree");
+    }
+
+    if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+        project_ggml_k_control(h, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+        return;
+    }
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, stream);
@@ -159,7 +210,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
-    const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
+    const GdnControlParentGeometry geometry = require_control_parent(ab_weight);
     require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
     require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
@@ -168,8 +219,15 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
 
-    const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
-    const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
+    if (ab_weight.qtype == QType::GGML_K) {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+        const Tensor outputs[]{g, beta};
+        detail::ggml_k_project_split(h, ab_weight, outputs, 2, false, stream);
+        detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
+        return;
+    }
+    const Weight a_weight = control_row_view(ab_weight, 0, geometry.heads);
+    const Weight b_weight = control_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, stream);
 }
@@ -193,8 +251,11 @@ void validate_column_rank_semantics(const Tensor& x, const Weight& a_weight,
     require_vector_tensor(dt_bias, DType::FP32, kShardHeads, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, kShardHeads, tokens, op, "g");
     require_sequence_tensor(beta, DType::FP32, kShardHeads, tokens, op, "beta");
-    require_bf16_weight(a_weight, kShardHeads, kShardHidden, "a_weight shard");
-    require_bf16_weight(b_weight, kShardHeads, kShardHidden, "b_weight shard");
+    require_control_weight(a_weight, kShardHeads, kShardHidden, "a_weight shard");
+    require_control_weight(b_weight, kShardHeads, kShardHidden, "b_weight shard");
+    if (a_weight.qtype != b_weight.qtype) {
+        throw std::invalid_argument("gdn_gating_proj column-parallel: control formats disagree");
+    }
 }
 
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
@@ -226,6 +287,12 @@ void dispatch_shard_with_workspace(const Tensor& x, const Weight& a_weight,
 void dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                     const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena* ws,
                     const Tensor& g, const Tensor& beta, cudaStream_t stream) {
+    if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
+        Tensor g_mut(g);
+        Tensor beta_mut(beta);
+        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g_mut, beta_mut, stream);
+        return;
+    }
     const std::int32_t tokens        = x.ne[1];
     const std::size_t required_bytes = detail::bf16_gdn_gating_shard_workspace_bytes(tokens);
     if (required_bytes == 0) {
@@ -299,9 +366,9 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
             throw std::invalid_argument(
                 "gdn_gating_proj column-parallel: unsupported ab_weight shard geometry");
         }
-        require_bf16_weight(parent, 2 * kShardHeads, kShardHidden, "ab_weight shard");
-        a_weight[slot] = bf16_row_view(parent, 0, kShardHeads);
-        b_weight[slot] = bf16_row_view(parent, kShardHeads, kShardHeads);
+        require_control_weight(parent, 2 * kShardHeads, kShardHidden, "ab_weight shard");
+        a_weight[slot] = control_row_view(parent, 0, kShardHeads);
+        b_weight[slot] = control_row_view(parent, kShardHeads, kShardHeads);
         validate_column_rank_semantics(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                        dt_bias[slot], g[slot], beta[slot]);
     }
@@ -314,6 +381,16 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
     }
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
+        if (ab_weight[slot].qtype == QType::GGML_K) {
+            Tensor g_mut(g[slot]);
+            Tensor beta_mut(beta[slot]);
+            const Tensor outputs[]{g_mut, beta_mut};
+            detail::ggml_k_project_split(x[slot], ab_weight[slot], outputs, 2, false,
+                                        ec.dev[slot]->stream);
+            detail::gdn_gating_launch(g_mut, beta_mut, A_log[slot], dt_bias[slot], g_mut, beta_mut,
+                                     ec.dev[slot]->stream);
+            return;
+        }
         dispatch_shard(x[slot], a_weight[slot], b_weight[slot], A_log[slot], dt_bias[slot],
                        ws[slot], g[slot], beta[slot], ec.dev[slot]->stream);
     });
