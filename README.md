@@ -59,6 +59,35 @@ It supports Text and MTP through the same Engine route; its embedded GGUF Vision
 validation-only and `--vision` is rejected for this identity. The artifact is intentionally kept
 outside the repository because it is an 18 GB generated model file.
 
+## V100X2 maximum-context comparison
+
+Only the **maximum context capacity** changes in this sweep. Each request uses the same
+**512-token code prompt** and a **256-token decode window**, with one warmup and three measured
+runs per engine and capacity. Both use the same source Q4_K_M weights, greedy sampling, Q8/INT8 KV
+and MTP3. NInfer uses TP2 with its optimized proposal head; LM Studio's CUDA backend 2.33.0 uses
+automatic GPU splitting and maximum-three/minimum-zero drafts. Prompt-cache reuse is disabled.
+
+| Maximum context | NInfer decode tok/s | LM Studio decode tok/s |
+|---:|---:|---:|
+| 1,024 | 60.06 ± 0.02 | 62.67 ± 0.24 |
+| 2,048 | 60.12 ± 0.02 | 62.78 ± 0.05 |
+| 4,096 | 60.11 ± 0.03 | 62.69 ± 0.10 |
+| 8,192 | 60.13 ± 0.06 | 62.78 ± 0.07 |
+| 16,384 | 60.14 ± 0.04 | 62.63 ± 0.06 |
+| 32,768 | 60.16 ± 0.05 | 62.58 ± 0.004 |
+| 65,536 | 60.06 ± 0.05 | 62.49 ± 0.16 |
+
+Values are means ± sample standard deviations, excluding loading, prefill and the first generated
+token. Both engines honored all seven requested capacities. All measured output windows were
+EOS/EOG-free, and each engine repeated its token sequence exactly. This is a capacity-setting
+comparison, not a filled-context benchmark or a programming-correctness evaluation.
+
+Neither engine slows materially as capacity increases with this fixed short input. LM Studio is
+about 4% faster here; its MTP acceptance is 80.80%, compared with NInfer's 65.89%. In this sweep,
+the 512-token prefill takes 1.775–1.777 s in NInfer and 0.755–0.759 s in
+LM Studio. These short-input results are separate from the 85K occupied-context result above.
+See the [method and reproduction commands](docs/performance.md#v100x2-maximum-context-capacity-sweep).
+
 ## Inherited RTX 5090 performance
 
 The following published measurements cover the three Qwen3.6 artifact profiles and the Qwen3.8-27B NVFP4

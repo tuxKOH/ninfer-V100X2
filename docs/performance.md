@@ -183,6 +183,40 @@ oracles. Real-model MTP/non-MTP teacher forcing, graph/eager comparisons and cro
 checks qualify the execution path. A plausible answer or a faster kernel alone is insufficient to
 claim unchanged model quality or an end-to-end speedup.
 
+## V100X2 maximum-context capacity sweep
+
+The capacity comparison in the README varies only the requested maximum context from 1,024
+through 65,536 tokens, doubling at each step. Every request uses the same 512-token code-chat
+prompt and generates 257 tokens: one from prefill and 256 in the measured decode interval.
+It measures the effect of the capacity setting, not inference with that many occupied tokens.
+
+Each engine starts with a fresh resident model at each capacity, discards one complete warmup
+request, and measures three complete requests with prompt-cache reuse disabled. Both consume
+the exact saved prompt IDs, use greedy sampling, and retain their configured MTP3 policies.
+NInfer uses TP2, INT8 group-64 KV, CUDA Graphs and the optimized proposal head; LM Studio uses
+backend 2.33.0, automatic GPU splitting, Q8 KV and maximum-three/minimum-zero MTP as above.
+Rates exclude the first token and loading time. The tool rejects EOS/EOG, incomplete windows,
+truncated input and unexpected LM prompt-cache reuse. Reported deviations are sample standard
+deviations across three repetitions.
+
+Reproduce the prompt and comparison using the existing artifact and Python 3.11 environment:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100/bench/ninfer_v100_corpus \
+  /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer \
+  /tmp/v100-code-512.ids --code-chat 512 --output-tokens 1024 \
+  src/core/host_worker_pool.h
+
+.venv/bin/python3 tools/v100/bench_capacity.py \
+  --corpus /tmp/v100-code-512.ids --output-dir /tmp/v100-capacity
+```
+
+The runner executes the engines sequentially and stops only its own temporary LM server.
+Its output directory contains raw JSON responses, engine logs, requested and actual capacities,
+per-repetition timings, MTP counts, and `summary.json` / `summary.md`. The `--engine ninfer`
+and `--engine llama` options allow running the two sides separately in that same directory.
+
 ## Inherited RTX 5090 campaigns
 
 Tested Git revisions for the inherited campaigns:
