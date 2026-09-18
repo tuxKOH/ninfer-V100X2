@@ -727,6 +727,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
+            if (peer) {
+                const ScopedDevice scope(peer->device.device);
+                peer->decoder->linear_attention.copy_slot(
+                    LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    peer->device.stream);
+            }
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
         } else {
@@ -745,6 +752,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            set_peer_i32(peer->io.rope_delta, sequence.rope_delta);
+        }
 
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {

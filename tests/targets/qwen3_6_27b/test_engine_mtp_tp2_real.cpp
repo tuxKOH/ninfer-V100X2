@@ -164,9 +164,8 @@ ninfer::RequestOptions greedy_options(std::uint32_t tokens) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = tokens;
     options.execution.sampling.temperature    = 0.0F;
-    // Prefix reuse is deliberately off in every leg: it is downgraded to a full reset at tp2 with
-    // MTP (the bridge needs a retained target hidden that only rank 0 holds), so leaving it on
-    // would make the tp1 and tp2 sides of a comparison take different prefill paths.
+    // Start every comparison from a full prefill so both widths use the same prompt partition.
+    // The separate prefix gates exercise retained-state and checkpoint continuation.
     options.execution.allow_prefix_reuse = false;
     options.stop.include_model_defaults   = false;
     return options;

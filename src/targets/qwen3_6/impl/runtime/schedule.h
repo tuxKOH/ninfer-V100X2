@@ -246,6 +246,9 @@ struct MtpBridgeInput {
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
+// Retained hidden is authoritative on rank 0, including partial MTP commit corrections. Copy it
+// into rank 1's prefill scratch only on resume; both streams protect its producer/read lifetime.
+[[nodiscard]] std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden);
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,

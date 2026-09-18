@@ -144,10 +144,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
-           "       Prefix reuse is unavailable at --tp 2 with --spec mtp: the MTP bridge\n"
-           "       resumes from a retained target hidden that only the primary device\n"
-           "       holds, so such requests are prefilled again instead of resumed. The\n"
-           "       answer is unchanged; only the saving is lost.\n"
+           "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
+           "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
+           "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"

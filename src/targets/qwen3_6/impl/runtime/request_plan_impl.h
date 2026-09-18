@@ -224,40 +224,6 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    // Zero-suffix reuse has no tensor-parallel implementation. When the reusable prefix already
-    // covers the whole prompt there is nothing to prefill, so the bonus token would be sampled
-    // from a restored hidden state through the output head -- and that head is vocabulary-SPLIT at
-    // tp2, so it needs both ranks' logits and a gather that this path has no place to run.
-    //
-    // Downgrade to a full reset rather than rejecting the request. The answer is identical (the
-    // prompt is simply prefilled again instead of resumed); only the reuse saving is lost. The
-    // alternative -- throwing from inside prefill execution -- is much worse than it sounds: an
-    // exception there does not merely fail one request, it takes the executor down and leaves the
-    // whole engine unusable, so a single client turn with prefix reuse enabled would brick a
-    // served process. Deciding it HERE, while planning, keeps the failure mode out of execution
-    // entirely. `sample_from_hidden`'s own tp2 throw stays as an unreachable backstop.
-    if (tp != 1 && plan->reuse != ReusePath::FullReset &&
-        plan->reuse_base >= plan->summary.prompt_tokens) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
-    }
-
-    // MTP prefix reuse has no tensor-parallel implementation, for a reason narrower than the
-    // forward path: resuming a prefix runs the MTP BRIDGE, which drives the MTP head from the
-    // retained target hidden of the reused frontier. That hidden is a rank-0-only store
-    // (`tail_hidden_store` / `rewrite_checkpoint_hidden_store` live once, with all the other
-    // bookkeeping), and rank 1's MTP stem needs its own copy of it -- the stem's row-parallel fc
-    // contracts the normalized-HIDDEN half on device 1. Mirroring those two stores per lane is a
-    // separable change; until it lands, a tp2 MTP request that would resume instead re-prefills.
-    // The answer is identical, only the reuse saving is lost -- the same trade the zero-suffix
-    // downgrade above makes, and decided HERE for the same reason: a throw from inside prefill
-    // execution takes the whole executor down rather than failing one request.
-    if (tp != 1 && speculative_backend == SpeculativeBackend::Mtp &&
-        plan->reuse != ReusePath::FullReset) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
-    }
-
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
         (!dflash || !sequence.kv || !sequence.kv->backend ||

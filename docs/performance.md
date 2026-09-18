@@ -217,6 +217,51 @@ Its output directory contains raw JSON responses, engine logs, requested and act
 per-repetition timings, MTP counts, and `summary.json` / `summary.md`. The `--engine ninfer`
 and `--engine llama` options allow running the two sides separately in that same directory.
 
+## V100X2 prefix cache
+
+The same two V100-SXM2 16 GB cards and GGUF-derived Qwen3.8-27B Q4_K_M artifact support
+retained-prefix reuse with TP2 and optimized MTP3. The real-model gate uses INT8 group-64 KV,
+4,096-token capacity, 256-token prefill chunks, greedy sampling and 32 output tokens. A rendered
+code prompt contains 3,274 tokens; `preserve_thinking=true` saves its complete response boundary.
+
+Three warmed cold/cache pairs measured median Engine time to first token of **11.9119 s cold**
+and **0.0173602 s cached** (686×). Model loading, prompt rendering and HTTP transport are excluded.
+Diagnostic logit/peer copies are disabled for these pairs. Cached requests report 3,274 reused
+tokens and zero computed prefill tokens. Two exact-history follow-up turns each prefill only 30
+tokens, with roughly 0.20 s time to first token. These are prompt-work savings, not a decode-rate
+increase or a cache-enabled comparison against LM Studio.
+
+The gate covers response-checkpoint replay, repeated append, zero-suffix sampling, changed-prefix
+reset, rewritten response suffixes and stopping inside an accepted MTP round before continuing.
+Repeated checkpoint execution, direct continuation versus checkpoint restore with identical
+prefill partitions, and CUDA Graph versus eager execution must agree exactly in generated tokens,
+captured logits and MTP acceptance. Both ranks' speculative egress must agree.
+
+Cold re-prefill uses a different BF16 GEMM/GDN partition from retained decode and suffix state.
+Two cold comparisons first diverged after 26 and 25 identical output tokens respectively; at each
+shared history, a fresh single-output target evaluation assigned the cached choice exactly the
+same logit as its selected winner (deficit 0). The test checks this first divergence against the
+existing TP2 0.5-logit near-tie bound; it does not claim bit-identical free-running output across
+different prefill partitions. Other cold output comparisons remain exact.
+
+Reproduce the Engine gate and the actual HTTP turn/response-checkpoint smoke with the existing
+artifact:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer \
+  build-v100/tests/ninfer_qwen3_8_27b_v100x2_prefix_real_test
+
+.venv/bin/python3 tools/smoke/serve_thinking_preservation.py \
+  --artifact /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer \
+  --server-bin build-v100/apps/ninfer-serve --backend mtp \
+  --tp 2 --devices 0,1 --kv-dtype int8
+```
+
+The HTTP smoke uses a temporary local server with a 1,024-token capacity and 128-token chunks.
+The cache remains process-local and can resume only the current frontier or its saved complete
+turn/response checkpoint; see [serving cache behavior](serving.md#execution-behavior).
+
 ## Inherited RTX 5090 campaigns
 
 Tested Git revisions for the inherited campaigns:

@@ -148,24 +148,46 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
-void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose) {
+std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
-        throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
+        throw std::invalid_argument("prefix resume requires BF16 [hidden,1]");
     }
-    if (state.execution.peer != nullptr) {
-        // UNREACHABLE BACKSTOP. The output head is vocabulary-split at tp2, so this bonus-token
-        // path cannot run rank 0's whole-head GEMM. It is reached only by a zero-suffix reuse
-        // plan, and `plan_request_for_lane` downgrades those to a full reset at tp2 precisely so
-        // this cannot happen during execution -- an exception here would take the executor down
-        // with it. Kept so a future planner change cannot reintroduce the case silently.
-        throw std::logic_error(
-            "tensor-parallel prefix reuse cannot sample from a restored hidden state yet");
-    }
+    std::array<Tensor, 2> result{hidden, {}};
+    if (execution.peer == nullptr) { return result; }
+    const auto& peer = *execution.peer;
+    result[1] = peer.prefill_hidden->slice(1, 0, 1);
+    const CurrentDevice restore;
+    CUDA_CHECK(cudaSetDevice(execution.device.device));
+    CUDA_CHECK(cudaEventRecord(peer.events->inputs_ready(0), execution.device.stream));
+    CUDA_CHECK(cudaSetDevice(peer.device->device));
+    CUDA_CHECK(cudaStreamWaitEvent(peer.device->stream, peer.events->inputs_ready(0), 0));
+    CUDA_CHECK(cudaMemcpyAsync(result[1].data, hidden.data, hidden.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.device->stream));
+    CUDA_CHECK(cudaEventRecord(peer.events->pull_done(1), peer.device->stream));
+    CUDA_CHECK(cudaSetDevice(execution.device.device));
+    CUDA_CHECK(cudaStreamWaitEvent(execution.device.stream, peer.events->pull_done(1), 0));
+    return result;
+}
+
+void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
+                        std::int32_t purpose) {
+    const auto restored = resume_hidden(state.execution, hidden);
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    ops::linear(hidden, state.execution.model.output_head, logits, state.execution.device.stream);
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) {
+        tp->work->reset();
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                         state.execution.rope_frequency, state.text_kv,
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk,
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
+        card.target_logits(restored, {logits, tp->io->logits.slice(1, 0, 1)});
+    } else {
+        ops::linear(hidden, state.execution.model.output_head, logits,
+                     state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -173,6 +195,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     state.execution.work.reset();
+    if (tp) { tp->work->reset(); }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

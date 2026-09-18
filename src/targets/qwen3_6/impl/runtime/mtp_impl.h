@@ -111,6 +111,75 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
     };
 }
 
+void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
+                     const Tensor& previous_hidden, std::int32_t position,
+                     std::span<const std::int32_t> rope_position, bool build_proposal) {
+    auto tp = tp_execution(state.execution);
+    tp->mtp_kv = state.mtp_kv_peer;
+    if (!tp->mtp_kv.valid() || !tp->io->mtp) {
+        throw std::logic_error("tensor-parallel MTP bridge requires both KV windows");
+    }
+    state.execution.work.reset();
+    tp->work->reset();
+    const auto restored = resume_hidden(state.execution, previous_hidden);
+    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                     state.execution.rope_frequency, state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+
+    const std::array<WorkspaceArena*, 2> work{&state.execution.work, tp->work};
+    const std::array<qwen3_6::RoundState*, 2> io{&state.execution.io, tp->io};
+    std::array<Tensor, 2> positions, rope, ar_hidden, logits, ar_positions;
+    for_each_rank(*tp->execution, [&](int rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        const auto stream = tp->execution->dev[r]->stream;
+        positions[r] = io[r]->mtp->target_positions.slice(0, 0, 1);
+        ops::set_i32_scalar(positions[r], position, stream);
+        rope[r] = work[r]->alloc(DType::I32, {1, 3});
+        CUDA_CHECK(cudaMemcpyAsync(rope[r].data, rope_position.data(), rope_position.size_bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        ar_hidden[r] = io[r]->mtp->ar_hidden;
+        logits[r] = io[r]->logits.slice(1, 0, 1);
+        ar_positions[r] = io[r]->mtp->position.slice(0, 0, 1);
+    });
+    Tensor draft0 = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
+    const auto visible = static_cast<std::uint32_t>(position + 1);
+    card.mtp_forward_batch(next_token, restored, positions, rope, {visible, visible}, ar_hidden,
+                           build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
+                           build_proposal ? &draft0 : nullptr);
+    if (build_proposal) {
+        for_each_rank(*tp->execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::set_i32_scalar(ar_positions[r], position + 1, tp->execution->dev[r]->stream);
+        });
+        for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
+            Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
+            Tensor next_draft = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
+            const std::array<Tensor, 2> next_hidden{
+                state.execution.prefill_hidden.slice(1, i, 1), tp->prefill_hidden->slice(1, i, 1)};
+            const auto ar_visible = static_cast<std::uint32_t>(position + i + 1);
+            card.mtp_forward_ar_step(previous_token, ar_hidden, ar_positions,
+                                     {ar_visible, ar_visible}, next_hidden, logits, next_draft);
+            for_each_rank(*tp->execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                const auto stream = tp->execution->dev[r]->stream;
+                CUDA_CHECK(cudaMemcpyAsync(ar_hidden[r].data, next_hidden[r].data,
+                                           ar_hidden[r].bytes(), cudaMemcpyDeviceToDevice, stream));
+                ops::increment_i32_scalar(ar_positions[r], stream);
+            });
+        }
+    }
+    // The following suffix prefill resets both arenas and may replace the staging hidden. Retire
+    // both bridge streams here, including a bridge with no proposal or cross-rank logit gather.
+    state.execution.device.synchronize();
+    tp->device->synchronize();
+    state.execution.work.reset();
+    tp->work->reset();
+}
+
 } // namespace
 
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
@@ -120,16 +189,21 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     if (!state.mtp_kv.valid() || !state.execution.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
-    if (state.execution.peer != nullptr) {
-        // Unreachable backstop, and deliberately kept as one. The bridge resumes the MTP head
-        // from a RETAINED target hidden, which lives only in rank 0's tail/checkpoint stores; the
-        // planner therefore downgrades every tp2 MTP prefix reuse to a full reset before a bridge
-        // can be staged (request_plan_impl.h). Throwing from inside prefill execution would take
-        // the executor down rather than fail one request, which is why the decision is made there.
-        throw std::logic_error("MTP bridge has no tensor-parallel path in this build");
-    }
     if (rope_position.size() != 3) {
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
+    }
+    if (build_proposal &&
+        (state.mtp_proposal_extent == 0 ||
+         state.mtp_proposal_extent >
+             static_cast<std::uint32_t>(state.execution.io.mtp->draft_tokens.ne[0]))) {
+        throw std::logic_error("MTP bridge proposal extent is outside the configured window");
+    }
+    if (state.execution.peer != nullptr) {
+        if (next_embedding != nullptr) {
+            throw std::logic_error("tensor-parallel MTP bridge supports text inputs only");
+        }
+        mtp_bridge_tp2(state, next_token, previous_hidden, position, rope_position, build_proposal);
+        return;
     }
     state.execution.work.reset();
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
@@ -155,12 +229,6 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
     if (!build_proposal) { return; }
-
-    if (state.mtp_proposal_extent == 0 ||
-        state.mtp_proposal_extent >
-            static_cast<std::uint32_t>(state.execution.io.mtp->draft_tokens.ne[0])) {
-        throw std::logic_error("MTP bridge proposal extent is outside the configured window");
-    }
 
     Tensor ar_position = state.execution.io.mtp->position.slice(0, 0, 1);
     ops::set_i32_scalar(ar_position, position + 1, state.execution.device.stream);

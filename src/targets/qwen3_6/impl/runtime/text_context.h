@@ -307,6 +307,10 @@ public:
     // `ids` and the draft-token outputs stay single tensors: they belong to rank 0 alone, because
     // rank 1's MTP stem contracts the normalized-hidden half of the fc input and never embeds a
     // token, and the proposal leaves through rank 0's egress.
+    // Computes the full target vocabulary on both ranks from replicated final-normalized hidden.
+    // The caller owns the hidden replicas, output storage, and subsequent sampling.
+    void target_logits(const std::array<Tensor, 2>& hidden,
+                        const std::array<Tensor, 2>& logits);
     void target_verify_batch(const std::array<Tensor, 2>& ids,
                              const std::array<Tensor, 2>& cache_positions,
                              const std::array<Tensor, 2>& rope_positions,
@@ -326,6 +330,12 @@ public:
                                   const std::array<Tensor, 2>& mtp_hidden);
     void mtp_propose_batch(const std::array<Tensor, 2>& hidden,
                            const std::array<Tensor, 2>& logits, Tensor& draft_tokens);
+    void mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
+                           const std::array<Tensor, 2>& positions,
+                           const std::array<Tensor, 2>& rope_positions,
+                           ops::GqaExecutionEnvelope envelope,
+                           const std::array<Tensor, 2>& mtp_hidden, int logits_column,
+                           const std::array<Tensor, 2>* logits, Tensor* draft_token);
     void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
                              const std::array<Tensor, 2>& position,
                              ops::GqaExecutionEnvelope envelope,

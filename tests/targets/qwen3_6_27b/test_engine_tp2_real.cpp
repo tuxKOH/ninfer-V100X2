@@ -303,8 +303,7 @@ int exercise_concurrent_decode(const char* artifact, const std::vector<ninfer::T
 // `allow_prefix_reuse` defaults to TRUE, so a served conversation re-submits a growing prompt and
 // prefills only the suffix. At tp2 that means a prefill chunk with `text_kv_base_ > 0`: absolute
 // positions, no GDN state reset, and both devices continuing from KV pages they already hold. This
-// leg drives the nonzero-suffix case and then pins the behaviour of the one case that is NOT
-// implemented, so the hole is tested rather than merely documented.
+// leg drives both suffix prefill and exact-frontier sampling through the vocabulary-split head.
 int exercise_prefix_reuse(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& prompt) {
     constexpr std::uint32_t kBaselineTokens = 6;
     const ninfer::GenerationResult baseline =
@@ -344,45 +343,36 @@ int exercise_prefix_reuse(ninfer::Engine& engine, const std::vector<ninfer::Toke
         return 1;
     }
 
-        // (b) ZERO SUFFIX: re-submitting the frontier that the request just above left resident
-    // leaves nothing to prefill. At tp1 that is the "sample the bonus token from the retained tail
-    // hidden" path; at tp2 the output head is vocabulary-split and that path has nowhere to run
-    // the gather, so the planner downgrades the request to a full reset instead.
-    //
-    // What is asserted is the DOWNGRADE, not a rejection. An earlier revision of this work threw
-    // from inside prefill execution instead, and the test caught what that really costs: the
-    // exception takes the executor down, so the engine reports "inference engine is unavailable"
-    // for every later request. One client turn with prefix reuse on -- the default -- would brick
-    // a served process. So the requirements are: the request SUCCEEDS, it reports no reuse (it
-    // really did reset), and the engine keeps serving afterwards.
-    //
-    // This must be probed against the IMMEDIATELY preceding request's frontier: any request in
-    // between moves the resident ledger and the submission stops being a zero-suffix hit at all.
+    // (b) ZERO SUFFIX: sample directly from the immediately preceding retained hidden.
+    // Both rank-local output heads must run and gather before the bonus token is sampled.
     std::vector<ninfer::TokenId> exact_frontier = continuation;
     exact_frontier.insert(exact_frontier.end(), reused.generated_token_ids.begin(),
                           reused.generated_token_ids.end() - 1);
+    const auto before_exact = engine.runtime_stats().computed_prefill_tokens;
     const ninfer::GenerationResult zero_suffix =
         engine.generate(engine.prepare_tokens(exact_frontier), greedy_options(2, true));
     if (zero_suffix.generated_token_ids.size() != 2) {
         std::cerr << "tp2 zero-suffix reuse did not generate its tokens\n";
         return 1;
     }
-    if (zero_suffix.reused_prompt_tokens != 0) {
+    if (zero_suffix.reused_prompt_tokens != exact_frontier.size() ||
+        zero_suffix.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+        engine.runtime_stats().computed_prefill_tokens != before_exact ||
+        zero_suffix.generated_token_ids.front() != reused.generated_token_ids.back()) {
         std::cerr << "tp2 zero-suffix reuse reported " << zero_suffix.reused_prompt_tokens
-                  << " reused tokens; the planner should have downgraded it to a full reset\n";
+                  << " reused tokens; expected exact retained-frontier sampling\n";
         return 1;
     }
 
     // The engine is still alive: a following request must still work.
-    const std::vector<ninfer::TokenId> after_downgrade =
+    const std::vector<ninfer::TokenId> after_exact =
         generate_greedy(engine, quadratic_prompt(kShortPromptTokens), 4, false);
-    if (after_downgrade.size() != 4) {
-        std::cerr << "the engine stopped serving after the zero-suffix downgrade\n";
+    if (after_exact.size() != 4) {
+        std::cerr << "the engine stopped serving after zero-suffix reuse\n";
         return 1;
     }
     std::cout << "tp2 prefix reuse: " << expected_reuse << " tokens reused, " << computed
-              << " prefilled; zero-suffix hit downgraded to a full reset and the engine kept "
-                 "serving\n";
+              << " prefilled; zero-suffix hit sampled the retained hidden without prefill\n";
     return 0;
 }
 

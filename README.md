@@ -357,12 +357,9 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ## Run the HTTP server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
-  --max-context 16384 \
-  --kv-capacity auto \
-  --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+NINFER_V100X2_EXECUTABLE="$PWD/build-v100/apps/ninfer-serve" \
+tools/v100/ninfer-v100x2.sh \
+  --host 127.0.0.1 --port 8080 --max-concurrency 1
 ```
 
 The public model ID defaults to the artifact's `identity.model_id`; use `--model-id` only to
@@ -374,11 +371,28 @@ Then send an OpenAI-style request:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Reply with one short sentence."}],
     "max_tokens": 64
   }'
 ```
+
+Prefix caching is enabled by default, including the V100X2 TP2 + MTP3 configuration. Send the
+conversation history normally: compatible follow-up requests reuse the retained prefix and prefill
+only the new suffix. An exact retained-frontier or saved-checkpoint hit can generate without
+re-prefilling prompt tokens. The completion log reports `cache=` and `reuse=`; use
+`--no-prefix-reuse` to disable caching for a cold comparison.
+
+Reuse requires a complete saved model state at the resident frontier or a typed turn/response
+checkpoint. Editing earlier history may require a full prefill; an arbitrary matching token prefix
+is insufficient. The cache belongs to the running Engine and is lost on restart. With one active
+slot, an unrelated request can replace the retained conversation.
+
+On the two V100s, a 3,274-token code prompt with a saved response checkpoint measured
+**11.912 s cold versus 17.36 ms cached median time to first token** across three warmed pairs
+(4,096 capacity, INT8 KV, optimized MTP3, CUDA Graphs). The hit reused all 3,274 prompt tokens;
+two subsequent exact-history turns each computed only 30 suffix tokens. This saves prompt work,
+not decode time. See [cache validation and reproduction](docs/performance.md#v100x2-prefix-cache).
 
 The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
 state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
@@ -631,10 +645,6 @@ when the resource is not present.
   token costs 128 reduces plus one logit all-gather; a 10 KiB reduce measures about 16 us, and
   under CUDA Graphs the whole collective set costs roughly 0.2 ms per token (both at the 400 W
   per-GPU cap).
-- **MTP prefix reuse resets at `--tp 2`.** Resuming a prefix drives the MTP head from a retained
-  target hidden state that only the primary device holds, so `--tp 2 --spec mtp` downgrades every
-  reuse to a full prefill. The answer is unchanged and no request fails; the saving is lost, which
-  matters for multi-turn conversation at long context.
 - **MTP is output-equivalent up to near-tie argmax flips, not bit-identical.** A verify round
   evaluates the target model over `K+1` columns at once and an ordinary round over one, which
   selects different GEMM shapes; greedy MTP-on and MTP-off streams can therefore diverge on a

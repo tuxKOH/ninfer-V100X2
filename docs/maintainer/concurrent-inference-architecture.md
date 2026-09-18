@@ -721,6 +721,13 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
+27B TP2 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
+和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到 rank 1 已有的
+prefill buffer，不为每个 lane 增加第二份 hidden ledger。两个 rank 分别捕获、恢复自身的 GDN shard。
+Exact hit 经两卡 vocabulary-sharded output head 和 logit gather 完成采样；MTP bridge 再按两卡 MTP
+schedule 恢复 draft continuation。后续 prefill 覆盖 staging buffer 前须完成两卡 bridge，decode hot path
+不增加每轮 hidden 镜像。
+
 Checkpoint kind 不是 reuse compatibility bit。Planner 总是先按 token、position、media identity 和完整
 continuation state 尝试 current frontier，再尝试已有 rewrite checkpoint；即使本次
 `preserve_thinking` 选择了另一种 desired kind，匹配的旧快照仍可恢复，`prefix_reuse_path` 报告实际恢复的

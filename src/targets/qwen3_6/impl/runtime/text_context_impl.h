@@ -1899,6 +1899,22 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
     }
 }
 
+void TextContext::target_logits(const std::array<Tensor, 2>& hidden,
+                                const std::array<Tensor, 2>& logits) {
+    if (!tp2()) { throw std::logic_error("tensor-parallel target logits require a peer"); }
+    const std::int32_t columns = hidden[0].ne[1];
+    if (columns <= 0) {
+        throw std::invalid_argument("target logits require at least one hidden column");
+    }
+    for (std::size_t r = 0; r < 2; ++r) {
+        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, columns},
+                             "target logits hidden");
+    }
+    Tensor root_logits = logits[0];
+    Tensor peer_logits = logits[1];
+    logits_tp2(hidden, root_logits, peer_logits);
+}
+
 void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
                              Tensor& peer_logits) {
     const ExecutionContext& execution       = ec();
@@ -2678,6 +2694,51 @@ void TextContext::mtp_propose_batch(const std::array<Tensor, 2>& hidden,
     auto scope_0 = work_.scope();
     auto scope_1 = tp_->work->scope();
     proposal_argmax_tp2(hidden, logits, draft_tokens);
+}
+
+void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
+                                    const std::array<Tensor, 2>& positions,
+                                    const std::array<Tensor, 2>& rope_positions,
+                                    ops::GqaExecutionEnvelope envelope,
+                                    const std::array<Tensor, 2>& mtp_hidden, int logits_column,
+                                    const std::array<Tensor, 2>* logits, Tensor* draft_token) {
+    if (!tp2()) { throw std::logic_error("tensor-parallel MTP batch requires a peer"); }
+    if (batch_mtp_kv_ == nullptr || tp_->batch_mtp_kv == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
+    const int T = ids.ne[0];
+    if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
+        throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
+    }
+    require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
+    for (std::size_t r = 0; r < 2; ++r) {
+        require_tensor_shape(positions[r], DType::I32, {T}, "MTP positions");
+        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP hidden");
+        require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
+        const Tensor& rope = rope_positions[r];
+        if (rope.dtype != DType::I32 || rope.ne[0] != T ||
+            (rope.ne[1] != 1 && rope.ne[1] != 3) || rope.ne[2] != 1 || rope.ne[3] != 1 ||
+            !rope.is_contiguous() || rope.data == nullptr) {
+            throw std::invalid_argument("MTP explicit rope positions must be [T] or [T,3]");
+        }
+    }
+    if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
+    if (logits_column >= 0) {
+        if (logits == nullptr || draft_token == nullptr) {
+            throw std::invalid_argument("MTP logits and draft_token outputs are required");
+        }
+        for (const Tensor& destination : *logits) {
+            require_tensor_shape(destination, DType::BF16, {kCfg.vocab, 1}, "MTP logits");
+        }
+        require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
+    }
+
+    mtp_forward_core_tp2(ids, hidden, positions, rope_positions, envelope, mtp_hidden);
+    if (logits_column >= 0) {
+        const std::array<Tensor, 2> columns{mtp_hidden[0].slice(1, logits_column, 1),
+                                            mtp_hidden[1].slice(1, logits_column, 1)};
+        proposal_argmax_tp2(columns, *logits, *draft_token);
+    }
 }
 
 void TextContext::mtp_forward_ar_step(const Tensor& token,

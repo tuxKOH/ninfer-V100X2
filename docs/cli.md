@@ -208,9 +208,9 @@ device used at the default `--tp 1`; when both are given they must agree on the 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
 `--tp 2` at startup, as do `--spec dflash` and `--vision`. `--spec mtp` is supported at `--tp 2`,
-with one behavioral difference: compatible-prefix reuse is downgraded to a full prefill, because
-the MTP head resumes from a retained target hidden state that only the primary device holds. The
-answer is unchanged; only the reuse saving is lost.
+including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
+sampling restore the complete state on both devices. The HTTP server enables reuse by default;
+separate CLI processes do not share a cache.
 
 The load summary reports weights, KV pool, GDN state, sequence, workspace, CUDA Graph and reserved
 bytes per device, plus a free/total row for each. `--no-cuda-graph` runs decode eagerly; at `--tp 2`

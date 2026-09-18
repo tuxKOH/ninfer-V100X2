@@ -30,6 +30,15 @@ Rank 0 is the primary device. It owns tokenization, sampling, the retained MTP t
 and the request-visible state; rank 1 executes its half of every sharded Op and holds no
 request-visible state of its own.
 
+Prefix reuse supports suffix prefill and exact hits, including MTP. Rank 0 remains the authority
+for retained target hidden and checkpoint hidden; resume stages the selected hidden into rank 1's
+existing prefill buffer with stream ordering before either rank consumes it. Each rank captures
+and restores its own sharded GDN checkpoint. Exact hits run the two vocabulary shards and gather
+the target logits; the MTP bridge then uses the same two-rank MTP schedule as ordinary prefill.
+This does not add a second persistent hidden ledger or change the decode hot path. Reusable
+positions remain the resident frontier and complete typed checkpoints, as specified in
+[prefix reuse](concurrent-inference-architecture.md#64-prefix-reuse).
+
 ---
 
 ## 2. Transport: no peer-to-peer on these cards
@@ -489,13 +498,6 @@ capture and transport probes all live in `tools/tp2/`. The 1M needle, soak and p
   rejected together with `--vision`, because the encoder ropes 2-D image-grid positions.
 - **DFlash is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and that target has no
   tensor-parallel path at all.
-- **MTP prefix reuse resets at `--tp 2`.** Resuming a prefix drives the MTP head from a retained
-  target hidden state that only rank 0 holds, so `--tp 2 --spec mtp` downgrades every reuse to a
-  full prefill. The answer is unchanged and no request fails; the saving is lost. The fix is
-  separable.
-- **A resubmission whose reusable prefix covers the whole prompt is recomputed at `--tp 2`** — the
-  planner's zero-suffix path. It releases the lane cleanly; an earlier form threw and bricked the
-  engine.
 - **`--tp 2` requires an explicit `--devices A,B`** naming two distinct devices of the same compute
   capability.
 - **1,048,576 tokens is a one-slot configuration**, by arithmetic rather than policy: the per-slot

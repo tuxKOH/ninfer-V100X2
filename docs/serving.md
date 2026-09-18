@@ -43,6 +43,12 @@ distinct device per rank. It supports `--spec mtp` (with `--draft-tokens` and `-
 it does not support `--spec dflash` or `--vision`, and both are rejected at startup with a message
 naming the unsupported feature.
 
+Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
+It applies transparently to the HTTP APIs: submit the normal conversation history. A matching
+resident frontier or saved turn/response checkpoint reuses its complete model state, prefilling only
+the suffix; an exact hit requires no prompt-token prefill. See the cache behavior below for matching
+and retention rules. `--no-prefix-reuse` forces cold requests for comparison.
+
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --tp 2 --devices 0,1 \
@@ -84,14 +90,6 @@ device without a speculative backend and 17.69 GiB with `--spec mtp --draft-toke
 `--max-concurrency` must be `1` and a second slot cannot be allocated on a 32 GiB card. Concurrency
 at extended context requires a smaller `--max-context` (roughly 500,000 tokens for two slots at
 INT8 KV). `--kv-dtype int8` is mandatory at that window.
-
-One caveat applies to that combination: **prefix reuse is unavailable at `--tp 2` with
-`--spec mtp`**. Resuming a prefix drives the MTP head from a retained target hidden state that
-only the primary device holds, so such a request is prefilled again from the start instead of
-resumed. The answer is unchanged and no request fails -- only the reuse saving is lost, which
-matters for multi-turn conversations at long context. `--tp 2` without `--spec mtp` reuses
-prefixes normally except for a submission whose reusable prefix already covers the whole prompt,
-which is likewise downgraded to a full prefill.
 
 ## Endpoints
 
@@ -665,6 +663,11 @@ positions, encoded-media digest, grid, and consumer spans; changing an earlier i
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
+
+The prefix cache is process-local retained Engine state. Restarting the server clears it. With one
+active slot, serving an unrelated conversation can replace the retained entry; it is not a persistent
+cache of every conversation. Only the current resident frontier and a saved complete turn/response
+checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
