@@ -321,6 +321,17 @@ public:
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
                              const std::array<Tensor, 2>& target_tokens);
+    void target_verify_batch(const std::array<Tensor, 2>& ids,
+                             const std::array<Tensor, 2>& cache_positions,
+                             const std::array<Tensor, 2>& rope_positions,
+                             const std::array<Tensor, 2>& valid_columns,
+                             const std::array<Tensor, 2>& kv_table_rows,
+                             const std::array<Tensor, 2>& linear_state_slots,
+                             ops::GqaExecutionEnvelope envelope,
+                             const std::array<Tensor, 2>& hidden,
+                             const std::array<Tensor, 2>& logits,
+                             const std::array<Tensor, 2>& target_tokens,
+                             DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                   const std::array<Tensor, 2>& cache_positions,
                                   const std::array<Tensor, 2>& rope_positions,
@@ -391,7 +402,8 @@ private:
                       const MlpW& m1, std::array<Tensor, 2>& x, Phase phase,
                       const std::array<Tensor, 2>& staging);
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
-                        const std::array<Tensor, 2>& staging);
+                        const std::array<Tensor, 2>& staging,
+                        DFlashFeatureSink* dflash_sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -488,8 +500,9 @@ private:
     // The tp2 text prefill. Declared here rather than beside its siblings above because it names
     // TextPrefill, which is declared just above this line.
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
-                                                      const TextPrefill& text_prefill,
-                                                      bool finalize_at_end);
+                                                 const TextPrefill& text_prefill,
+                                                 bool finalize_at_end,
+                                                 DFlashFeatureSink* dflash_sink = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

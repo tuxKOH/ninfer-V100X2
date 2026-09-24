@@ -38,6 +38,10 @@ struct DeviceContext {
 struct ExecutionContext {
     std::array<std::optional<DeviceContext>, 2> dev;
     int tp = 1;
+    // Transport selected once during two-device startup.  This is mutable because the public
+    // startup probe intentionally accepts a const execution context shared by the test and
+    // runtime construction paths.
+    mutable bool direct_peer_access = false;
 
     // device_ids.size() must be 1 or 2 and becomes tp. Every id is validated to exist by
     // DeviceContext's own constructor; when two ids are given they must additionally share the

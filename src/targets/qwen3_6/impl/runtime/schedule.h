@@ -77,6 +77,7 @@ struct TpPeerCore {
     // in sampling mode, and a pointer into the other device's arena is an illegal access without
     // peer mapping and a silent double-increment with it.
     const qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
     // never reads it.
     const DecodeGraphPeerBridge* graph_bridge = nullptr;

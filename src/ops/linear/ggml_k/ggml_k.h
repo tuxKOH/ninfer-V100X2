@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/tensor.h"
+#include "core/arena.h"
 
 #include <cuda_runtime.h>
 
@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 void ggml_k_linear(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void ggml_k_project_split(const Tensor& x, const Weight& weight, const Tensor* outputs,
                           int count, bool add, cudaStream_t stream,
-                          bool tiled_gdn_input = false);
+                          bool tiled_gdn_input = false, WorkspaceArena* workspace = nullptr);
 void ggml_k_embedding(const Tensor& ids, const Weight& weight, Tensor& out,
                       cudaStream_t stream);
 

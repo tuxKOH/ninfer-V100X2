@@ -381,6 +381,12 @@ ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
 ninfer_add_op_test(ninfer_swa_test
   SOURCES ops/test_swa.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash_conv_test
+  SOURCES ops/test_dflash_conv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash_selector_test
+  SOURCES ops/test_dflash_selector.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)

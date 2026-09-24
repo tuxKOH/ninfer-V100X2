@@ -224,6 +224,7 @@ struct PeerRuntime {
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::optional<DFlashPersistentState> dflash;
     // Rank 1's own GDN replay records: the speculative verify round records this device's own
     // head/channel shard and folds it here, so the two devices commit the same accepted prefix
     // from records neither ever exchanges.
@@ -394,6 +395,8 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash_peer_host;
+    qwen3_6::DFlashDecodeIngress* dflash_peer_host_ingress = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
 
@@ -434,6 +437,7 @@ private:
     // Mirrors `mtp_host_ingress` into `mtp_peer_host_ingress`, swapping every row's counter
     // pointer for rank 1's. No-op at tp1 or without MTP.
     void publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes);
+    void publish_peer_dflash_ingress(std::span<const std::uint32_t> lanes);
     // Mirrors `ordinary_host_ingress` into `ordinary_peer_host_ingress` with every row's counter
     // pointer nulled. No-op at tp1 or without an ordinary frame.
     void publish_peer_ordinary_ingress();

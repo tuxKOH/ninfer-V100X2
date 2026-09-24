@@ -11,6 +11,7 @@ executable=${NINFER_V100X2_EXECUTABLE:-"${repo_dir}/build-v100/apps/ninfer"}
 artifact=${NINFER_V100X2_ARTIFACT:-/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer}
 devices=${NINFER_V100X2_DEVICES:-0,1}
 max_context=${NINFER_V100X2_MAX_CONTEXT:-180000}
+prefill_chunk=${NINFER_V100X2_PREFILL_CHUNK:-4096}
 kv_dtype=${NINFER_V100X2_KV_DTYPE:-int8}
 draft_tokens=${NINFER_V100X2_DRAFT_TOKENS:-3}
 proposal_head=${NINFER_V100X2_PROPOSAL_HEAD-optimized}
@@ -32,11 +33,13 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 usage: ${BASH_SOURCE[0]} (--prompt TEXT | --messages FILE) [ninfer options]
 
 Defaults: artifact=${artifact}
-          devices=${devices} max-context=${max_context} kv-dtype=${kv_dtype}
+          devices=${devices} max-context=${max_context} prefill-chunk=${prefill_chunk}
+          kv-dtype=${kv_dtype}
           spec=mtp draft-tokens=${draft_tokens} proposal-head=${proposal_head}
 
 Environment overrides: NINFER_V100X2_EXECUTABLE, NINFER_V100X2_ARTIFACT,
-NINFER_V100X2_DEVICES, NINFER_V100X2_MAX_CONTEXT, NINFER_V100X2_KV_DTYPE,
+NINFER_V100X2_DEVICES, NINFER_V100X2_MAX_CONTEXT, NINFER_V100X2_PREFILL_CHUNK,
+NINFER_V100X2_KV_DTYPE,
 NINFER_V100X2_DRAFT_TOKENS, NINFER_V100X2_PROPOSAL_HEAD (full|optimized),
 NINFER_V100X2_RUNTIME_LIBDIR, NINFER_V100X2_CUDA_LIBDIR.
 EOF
@@ -82,6 +85,7 @@ fi
 exec "${executable}" "${artifact}" \
     --tp 2 --devices "${devices}" \
     --max-context "${max_context}" \
+    --prefill-chunk "${prefill_chunk}" \
     --kv-dtype "${kv_dtype}" \
     --spec mtp --draft-tokens "${draft_tokens}" \
     "${proposal_args[@]}" \

@@ -3,6 +3,9 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/linear_dispatch.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#endif
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -78,7 +81,11 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: weight n/k must be positive");
     }
     if (x.ne[0] != w.k || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
-        throw std::invalid_argument("linear: expected [K,T] x [N,K] -> [N,T]");
+        throw std::invalid_argument("linear: expected [K,T] x [N,K] -> [N,T], got x=" +
+                                    std::to_string(x.ne[0]) + "x" + std::to_string(x.ne[1]) +
+                                    " w=" + std::to_string(w.n) + "x" + std::to_string(w.k) +
+                                    " out=" + std::to_string(out.ne[0]) + "x" +
+                                    std::to_string(out.ne[1]));
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("linear: x/out must be contiguous");
@@ -93,6 +100,12 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::GGML_K:
+#ifdef NINFER_VOLTA_BUILD
+        if (workspace != nullptr && x.ne[1] >= 128) {
+            detail::ggml_k_cutlass_sm70_launch(x, w, out, *workspace, stream);
+            return;
+        }
+#endif
         detail::ggml_k_linear(x, w, out, stream);
         return;
     case QType::Q4G64_F16S:
@@ -137,6 +150,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
             policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear workspace: invalid GGML K profile");
         }
+#ifdef NINFER_VOLTA_BUILD
+        if (max_tokens >= 128) {
+            return detail::ggml_k_cutlass_sm70_workspace_bytes(output_rows, input_rows,
+                                                                 max_tokens);
+        }
+#endif
         return 0;
     case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);

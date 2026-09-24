@@ -69,6 +69,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
+  ops/launcher/dflash_conv.cu
+  ops/launcher/dflash_selector.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
@@ -232,6 +234,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/dflash_conv.cpp
+  ops/wrapper/dflash_selector.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
@@ -266,6 +270,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/vision_pos_embed.cpp)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_sources(ninfer_ops PRIVATE
+    ops/linear/ggml_k/ggml_k_cutlass_sm70.cu
     ops/linear/bf16/bf16_cutlass_sm70.cu
     ops/attn_input_proj/bf16/bf16_attn_input_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu

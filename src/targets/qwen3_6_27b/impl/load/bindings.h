@@ -257,6 +257,31 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlashLayerPlan {
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle query_key_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    artifact::ObjectHandle attention_output;
+    artifact::ObjectHandle post_attention_norm;
+    artifact::ObjectHandle gate_up;
+    artifact::ObjectHandle down;
+    artifact::ObjectHandle attention_conv_base_kernel;
+    artifact::ObjectHandle attention_conv_kernel_projection;
+    artifact::ObjectHandle mlp_conv_base_kernel;
+    artifact::ObjectHandle mlp_conv_kernel_projection;
+};
+
+struct DFlashPlan {
+    artifact::ObjectHandle feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlashLayerPlan, 5> layers;
+    artifact::ObjectHandle final_norm;
+    artifact::ObjectHandle selector_hidden_projection;
+    artifact::ObjectHandle selector_predecessor_codebook;
+    artifact::ObjectHandle selector_successor_codebook;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -270,6 +295,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    DFlashPlan dflash;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -348,7 +374,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<5>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;

@@ -16,7 +16,6 @@ namespace {
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::int32_t kWindow  = 4096;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
@@ -37,7 +36,8 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        (context.capacity != 2048 && context.capacity != 4096) ||
+        context.padded_capacity != context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }

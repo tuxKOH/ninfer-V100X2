@@ -90,7 +90,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     validate_policy(policy);
     if (weight.qtype == QType::GGML_K) {
         const Tensor outputs[]{q, k, gate, v};
-        detail::ggml_k_project_split(x, weight, outputs, 4, false, stream);
+        detail::ggml_k_project_split(x, weight, outputs, 4, false, stream, false, workspace);
         return;
     }
     if (weight.qtype == QType::BF16_CTRL) {
@@ -445,7 +445,8 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
         const Weight& w  = query_key_gate_value_weight[slot];
         if (w.qtype == QType::GGML_K) {
             const Tensor outputs[]{q_dst[slot], k_dst[slot], gate_dst[slot], v_dst[slot]};
-            detail::ggml_k_project_split(x[slot], w, outputs, 4, false, ec.dev[slot]->stream);
+            detail::ggml_k_project_split(x[slot], w, outputs, 4, false,
+                                         ec.dev[slot]->stream, false, workspace[slot]);
         } else if (w.qtype == QType::NVFP4) {
             detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
                                                     k_dst[slot], v_dst[slot], policy,

@@ -330,7 +330,7 @@ These are conventional project resources, not a checklist of resources every tas
 |---|---|
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
-| Q4_K_M source | `/home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
+| Q4_K_M source | `/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
 | companion Vision source | same directory, `mmproj-Qwen3.8-27B-BF16.gguf` |
 | product artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
 | conversion report | product artifact path plus `.conversion.json` |
@@ -346,7 +346,7 @@ do not download or regenerate them unless that work is in scope.
 
 ```bash
 PYTHON=python3
-MODEL=/home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+MODEL=/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 NINFER_WEIGHTS=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 

@@ -1,5 +1,8 @@
 #include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/ggml_k/ggml_k_codec.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#endif
 
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -352,7 +355,7 @@ void ggml_k_linear(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
 
 template <bool TiledGdn>
 void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
-             int count, bool add, cudaStream_t stream) {
+             int count, bool add, cudaStream_t stream, WorkspaceArena* workspace) {
     validate_weight(weight);
     if (count < 1 || count > 4 || x.dtype != DType::BF16 || !x.is_contiguous() ||
         x.ne[0] != weight.k || x.ne[1] <= 0 || x.ne[2] != 1 || x.ne[3] != 1) {
@@ -378,6 +381,39 @@ void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
     if (total_rows != weight.n) {
         throw std::invalid_argument("GGML K projection: output sections do not cover rows");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // The public GGML_K wrappers historically used the SIMT decoder directly, bypassing the
+    // SM70 CUTLASS route selected by `linear()`.  For prefill-sized BF16 projections, route each
+    // contiguous output section through the validated dequant+Tensor-Core implementation.  The
+    // descriptor plane remains shared and row offsets are applied only to descriptor lookup, so
+    // Q4_K/Q6_K payload bytes and mixed-row semantics are unchanged. Residual addition uses the
+    // FP32 CUTLASS epilogue's beta=1 path; GDN input permutes exactly during the BF16->FP16 cast.
+    if (workspace != nullptr && x.ne[1] >= 128) {
+        bool eligible = true;
+        std::size_t need = 0;
+        for (int i = 0; i < count; ++i) {
+            if ((outputs[i].dtype != DType::BF16 && outputs[i].dtype != DType::FP32) ||
+                !outputs[i].is_contiguous()) {
+                eligible = false;
+                break;
+            }
+            need = std::max(need, ggml_k_cutlass_sm70_workspace_bytes(
+                                     outputs[i].ne[0], weight.k, x.ne[1]));
+        }
+        if (eligible && workspace->capacity() >= workspace->used() &&
+            workspace->capacity() - workspace->used() >= need) {
+            int row_offset = 0;
+            for (int i = 0; i < count; ++i) {
+                ggml_k_cutlass_sm70_launch(x, weight, outputs[i], *workspace, stream, row_offset,
+                                           add, TiledGdn);
+                row_offset += outputs[i].ne[0];
+            }
+            return;
+        }
+    }
+#else
+    (void)workspace;
+#endif
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     const auto* rows = static_cast<const unsigned char*>(weight.qdata);
     const auto* descriptors = static_cast<const std::uint64_t*>(weight.qhigh);
@@ -404,14 +440,15 @@ void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
 }
 
 void ggml_k_project_split(const Tensor& x, const Weight& weight, const Tensor* outputs,
-                          int count, bool add, cudaStream_t stream, bool tiled_gdn_input) {
+                          int count, bool add, cudaStream_t stream, bool tiled_gdn_input,
+                          WorkspaceArena* workspace) {
     if (tiled_gdn_input) {
         if (weight.k != 6144 && weight.k != 3072) {
             throw std::invalid_argument("GGML K GDN output requires K=6144 or TP2 K=3072");
         }
-        project<true>(x, weight, outputs, count, add, stream);
+        project<true>(x, weight, outputs, count, add, stream, workspace);
     } else {
-        project<false>(x, weight, outputs, count, add, stream);
+        project<false>(x, weight, outputs, count, add, stream, workspace);
     }
 }
 

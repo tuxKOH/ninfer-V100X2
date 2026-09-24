@@ -16,7 +16,6 @@ inline constexpr int kBidirectionalGqaQHeads   = 32;
 inline constexpr int kBidirectionalGqaKVHeads  = 8;
 inline constexpr int kBidirectionalGqaGroup    = 4;
 inline constexpr int kBidirectionalGqaMaxSplit = 85;
-inline constexpr int kSwaWindow                = 4096;
 
 __device__ __forceinline__ int bidirectional_gqa_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -91,7 +90,7 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
         const int safe_row = live ? row : 0;
         std::int64_t src_index;
         if constexpr (CyclicSwa) {
-            const int context_position = (live ? key0 + row : 0) & (kSwaWindow - 1);
+            const int context_position = (live ? key0 + row : 0) & (context_stride - 1);
             src_index = query_tile ? bidirectional_gqa_query_kv_index(kv_head, d, safe_row)
                                    : bidirectional_gqa_cyclic_context_index(
                                          kv_head, d, context_position, context_stride);
@@ -173,7 +172,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, context_stride - 1) : length;
     const int context_start = length - context_count;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
@@ -555,6 +554,7 @@ noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                           const std::int32_t* __restrict__ context_state,
                           const std::int32_t* __restrict__ valid_columns, int max_context,
+                          int cyclic_window,
                           int split_capacity, __nv_bfloat16* __restrict__ out) {
     const int q_head = static_cast<int>(blockIdx.x);
     const int token  = static_cast<int>(blockIdx.y);
@@ -582,7 +582,7 @@ noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, cyclic_window - 1) : length;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     __shared__ float reduce[128];
@@ -638,7 +638,7 @@ __launch_bounds__(128, 2) __global__
                                          int max_context, int split_capacity,
                                          __nv_bfloat16* __restrict__ out) {
     noncausal_gqa_reduce_body<false, Tokens, KeyBlock>(partial_acc, partial_m, partial_l,
-                                                       context_length, valid_columns, max_context,
+                                                       context_length, valid_columns, max_context, 0,
                                                        split_capacity, out);
 }
 
@@ -648,6 +648,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
                            const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                            const std::int32_t* __restrict__ positions,
                            const std::int32_t* __restrict__ valid_columns, int max_context,
+                           int cyclic_window,
                            int split_capacity, __nv_bfloat16* __restrict__ out) {
     static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
     constexpr int MaxSplits = 128;
@@ -681,7 +682,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
         }
         return;
     }
-    const int context_count = min(length, kSwaWindow - 1);
+    const int context_count = min(length, cyclic_window - 1);
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
 

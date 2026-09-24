@@ -302,8 +302,8 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                     ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                          std::int32_t last) {
+std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
+    WeightsProfile, std::int32_t first, std::int32_t last) {
     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
                                                               TextConfig::hidden, first, last);
 }

@@ -80,7 +80,7 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, context_stride - 1) : length;
     const int context_start = length - context_count;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
@@ -131,9 +131,9 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
 
     for (int key = key_begin; key < key_end; ++key) {
         if constexpr (CyclicSwa) {
-            if (key < q_position - (kSwaWindow - 1)) { continue; }
+            if (key < q_position - (context_stride - 1)) { continue; }
             const auto index = bidirectional_gqa_cyclic_context_index(
-                kv_head, d, key & (kSwaWindow - 1), context_stride);
+                kv_head, d, key & (context_stride - 1), context_stride);
             consume(__bfloat162float(context_k[index]), __bfloat162float(context_v[index]));
         } else {
             const int logical_page  = key >> 6;

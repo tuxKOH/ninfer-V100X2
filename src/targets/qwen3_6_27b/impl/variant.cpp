@@ -157,9 +157,19 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
                                                                   std::uint32_t) {
-    return {};
+    if (capacity == 0 || draft_window == 0) { return {}; }
+    std::vector<std::uint32_t> ends;
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8192U, 16384U, 32768U}) {
+        if (visible_end > draft_window + 1U) {
+            ends.push_back(visible_end - draft_window - 1U);
+        }
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(capacity - 1U, ends);
 }
 
 void Variant::attention_projection(const Tensor& hidden,
@@ -279,7 +289,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     if (weight.qtype == QType::GGML_K) {
-        ops::ggml_k_gdn_output(hidden, weight, residual, stream);
+        ops::ggml_k_gdn_output(hidden, weight, residual, workspace, stream);
         return;
     }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
@@ -355,8 +365,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-    case WeightsProfile::Qwen38GgmlK:
         return 0;
+    case WeightsProfile::Qwen38GgmlK:
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::GGML_K, 14336, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -372,7 +384,9 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
-        return 0;
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
+            ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -397,7 +411,8 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
-        return 0;
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::GGML_K, 16384, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
@@ -478,7 +493,9 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
-        return 0;
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
+            ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -495,8 +512,14 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     throw std::logic_error("invalid 27B weights profile");
 }
 
-std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                          std::int32_t last) {
+std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
+    WeightsProfile weights_profile, std::int32_t first, std::int32_t last) {
+    validate_token_interval(first, last);
+    if (weights_profile == WeightsProfile::Qwen38GgmlK) {
+        return ops::linear_workspace_capacity_bytes(
+            QType::GGML_K, TextConfig::gdn_value_heads, TextConfig::hidden,
+            ops::LinearPolicy::A16Only, first, last);
+    }
     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
                                                               TextConfig::hidden, first, last);
 }
@@ -690,7 +713,7 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                     const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
     if (weight[0].qtype == QType::GGML_K) {
-        ops::ggml_k_gdn_output(hidden, weight, residual, staging, ec, ev);
+        ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
         return;
     }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),

@@ -55,12 +55,6 @@ void require_supported_tp_features(const EngineOptions& options) {
     // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
     // verify round records and folds per device. DFlash is not: its weights are sharded by the
     // load plan but nothing in its forward path is.
-    if (options.speculative.backend == SpeculativeBackend::DFlash) {
-        throw std::invalid_argument(
-            "--tp 2 does not support the DFlash speculative backend in this build: the DFlash "
-            "weights are sharded by the load plan but the DFlash forward path is not split-aware "
-            "yet; use --tp 1, --spec mtp or --spec none");
-    }
     // The Vision encoder runs entirely on the primary device against replicated weights and has no
     // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
     if (options.enable_vision) {

@@ -43,19 +43,30 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (frame.replay_records == nullptr || peer.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
-    if (frame.feature_sink != nullptr || peer.feature_sink != nullptr) {
-        // DFlash is the only feature-sink user and it is rejected at tp2 before reaching here.
-        throw std::logic_error("tensor-parallel target verify has no feature-sink path");
-    }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
-    card.target_verify_batch({frame.ids, peer.ids},
-                             {frame.cache_positions, peer.cache_positions},
-                             {frame.rope_positions, peer.rope_positions},
-                             {frame.valid_columns, peer.valid_columns},
-                             {frame.kv_table_rows, peer.kv_table_rows}, {frame.lanes, peer.lanes},
-                             envelope, {frame.target_hidden, peer.target_hidden},
-                             {frame.target_logits, peer.target_logits},
-                             {frame.target_tokens, peer.target_tokens});
+    if (peer.feature_sink != nullptr) {
+        throw std::logic_error("tensor-parallel DFlash peer feature sink is unexpected");
+    }
+    if (frame.feature_sink != nullptr) {
+        card.target_verify_batch({frame.ids, peer.ids},
+                                 {frame.cache_positions, peer.cache_positions},
+                                 {frame.rope_positions, peer.rope_positions},
+                                 {frame.valid_columns, peer.valid_columns},
+                                 {frame.kv_table_rows, peer.kv_table_rows},
+                                 {frame.lanes, peer.lanes}, envelope,
+                                 {frame.target_hidden, peer.target_hidden},
+                                 {frame.target_logits, peer.target_logits},
+                                 {frame.target_tokens, peer.target_tokens}, *frame.feature_sink);
+    } else {
+        card.target_verify_batch({frame.ids, peer.ids},
+                                 {frame.cache_positions, peer.cache_positions},
+                                 {frame.rope_positions, peer.rope_positions},
+                                 {frame.valid_columns, peer.valid_columns},
+                                 {frame.kv_table_rows, peer.kv_table_rows}, {frame.lanes, peer.lanes},
+                                 envelope, {frame.target_hidden, peer.target_hidden},
+                                 {frame.target_logits, peer.target_logits},
+                                 {frame.target_tokens, peer.target_tokens});
+    }
     const ExecutionContext& ec      = *execution.peer->execution;
     WorkspaceArena* work[2]         = {&execution.work, execution.peer->work};
     TargetVerifyFrameView* views[2] = {&frame, &peer};

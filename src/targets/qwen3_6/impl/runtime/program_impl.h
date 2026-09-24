@@ -229,6 +229,7 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}) {
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
@@ -423,6 +424,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             sizeof(qwen3_6::DFlashDecodeIngress));
         *dflash_host_ingress = {};
         *dflash_host_egress  = {};
+        if (peer) {
+            dflash_peer_host.emplace(sizeof(qwen3_6::DFlashDecodeIngress));
+            dflash_peer_host_ingress =
+                static_cast<qwen3_6::DFlashDecodeIngress*>(dflash_peer_host->data());
+            *dflash_peer_host_ingress = {};
+        }
     }
     if (io.dflash_prefill) {
         CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
@@ -464,6 +471,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                                                        ? &*peer->replay_records
                                                                        : nullptr,
                                                .mtp_host_ingress = mtp_peer_host_ingress,
+                                               .dflash_host_ingress = dflash_peer_host_ingress,
                                                .graph_bridge = graph_bridge ? &*graph_bridge
                                                                             : nullptr});
         if (peer->replay_records.has_value() != replay_records.has_value()) {
@@ -1156,8 +1164,11 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         std::size_t peer_count     = 0;
         peer_reservations[peer_count++] =
             PagedKVReservation{.pool = &peer->decoder->text_kv.pool(), .page_entitlement = text_pages};
-        if (qwen3_6::PagedKVCache* peer_backend = peer->decoder->mtp_cache();
-            peer_backend != nullptr) {
+        qwen3_6::PagedKVCache* peer_backend =
+            speculative_backend == SpeculativeBackend::Mtp
+                ? peer->decoder->mtp_cache()
+                : (peer->dflash ? &peer->dflash->full : nullptr);
+        if (peer_backend != nullptr) {
             peer_reservations[peer_count++] =
                 PagedKVReservation{.pool = &peer_backend->pool(), .page_entitlement = backend_pages};
         }
@@ -1359,12 +1370,6 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
-    if (tp == 2 && speculative_backend == SpeculativeBackend::DFlash) {
-        // MTP is split-aware and captures as one cross-device graph like the ordinary round.
-        // DFlash is not; capturing it would silently capture the tp1 schedule against half-width
-        // weights. The option validation rejects it before here.
-        throw std::logic_error("tensor-parallel graph capture has no DFlash path");
-    }
     SequenceState& sequence = sequences[0];
 
     // Every helper below has to run the SAME operation on both devices at tp2, in the same order,
@@ -1580,6 +1585,9 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
                 dflash_host_ingress->sampling[row]             = {};
+            }
+            if (dflash_peer_host_ingress != nullptr) {
+                *dflash_peer_host_ingress = *dflash_host_ingress;
             }
         }
         if (io.mtp_decode) {
@@ -1924,6 +1932,17 @@ void ProgramImplCore::publish_peer_mtp_ingress(std::span<const std::uint32_t> la
     *mtp_peer_host_ingress = *mtp_host_ingress;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         ops::SamplingConfig& sampling = mtp_peer_host_ingress->sampling[row];
+        if (sampling.token_counts == nullptr) { continue; }
+        sampling.token_counts =
+            static_cast<std::int32_t*>(token_counts_lane(peer->token_counts, lanes[row]).data);
+    }
+}
+
+void ProgramImplCore::publish_peer_dflash_ingress(std::span<const std::uint32_t> lanes) {
+    if (dflash_peer_host_ingress == nullptr || dflash_host_ingress == nullptr) { return; }
+    *dflash_peer_host_ingress = *dflash_host_ingress;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        ops::SamplingConfig& sampling = dflash_peer_host_ingress->sampling[row];
         if (sampling.token_counts == nullptr) { continue; }
         sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_lane(peer->token_counts, lanes[row]).data);
@@ -2714,10 +2733,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
+        publish_peer_dflash_ingress(lanes);
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, rope_frequency},
+                                                     proposal_head, rope_frequency,
+                                                     peer_core ? &*peer_core : nullptr},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

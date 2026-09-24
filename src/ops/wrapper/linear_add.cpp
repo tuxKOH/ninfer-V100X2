@@ -91,7 +91,7 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
     }
 
     if (w.qtype == QType::GGML_K) {
-        detail::ggml_k_project_split(x, w, &residual_out, 1, true, stream);
+        detail::ggml_k_project_split(x, w, &residual_out, 1, true, stream, false, ws);
         return;
     }
     if (w.qtype == QType::BF16_CTRL) {
@@ -421,19 +421,22 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                             events);
 }
 
-void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
-    detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true);
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
+                       WorkspaceArena& workspace, cudaStream_t stream) {
+    detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true, &workspace);
 }
 
 void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                        const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+                       const std::array<Tensor, 2>& staging,
+                       const std::array<WorkspaceArena*, 2>& workspace,
+                       const ExecutionContext& ec,
                        const PeerEvents& events) {
     validate_add_split_pair(x, w, ec);
     validate_add_split_residency(x, w, residual, ec);
     detail::for_each_rank(ec, [&](int rank) {
         detail::ggml_k_project_split(x[rank], w[rank], &residual[rank], 1, rank == 0,
-                                     ec.dev[rank]->stream, true);
+                                     ec.dev[rank]->stream, true, workspace[rank]);
     });
     allreduce_sum(residual, staging, ec, events);
 }

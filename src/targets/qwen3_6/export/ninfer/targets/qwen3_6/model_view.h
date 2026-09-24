@@ -68,6 +68,13 @@ struct DFlashLayerWeights {
     Tensor post_attention_norm;
     Weight gate_up;
     Weight down;
+    // DFlash2 dynamic grouped-convolution payloads.  The family runtime keeps these as
+    // first-class model data even when a target selects the inexpensive static-convolution
+    // execution profile; this lets the target leaf evolve without changing the artifact ABI.
+    Tensor attention_conv_base_kernel;
+    Weight attention_conv_kernel_projection;
+    Tensor mlp_conv_base_kernel;
+    Weight mlp_conv_kernel_projection;
 };
 
 template <std::size_t Layers>
@@ -76,6 +83,9 @@ struct DFlashWeights {
     Tensor context_norm;
     std::array<DFlashLayerWeights, Layers> layers;
     Tensor final_norm;
+    Weight selector_hidden_projection;
+    Tensor selector_predecessor_codebook;
+    Tensor selector_successor_codebook;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

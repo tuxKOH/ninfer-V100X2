@@ -385,8 +385,7 @@ int main() {
     const bool peer_access = ops::enable_peer_access(ec);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (CUDA stages the device-to-device copies through "
-                                "host memory)")
+                              : "unavailable (explicit pinned host staging)")
               << '\n';
     const ops::PeerEvents events(ec);
 

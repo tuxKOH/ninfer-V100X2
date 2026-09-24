@@ -98,10 +98,10 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
 
 void project_ggml_k_control(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
-                            cudaStream_t stream) {
+                            WorkspaceArena* workspace, cudaStream_t stream) {
     // Each epilogue element reads its two projections before replacing them in place.
-    detail::ggml_k_project_split(x, a_weight, &g, 1, false, stream);
-    detail::ggml_k_project_split(x, b_weight, &beta, 1, false, stream);
+    detail::ggml_k_project_split(x, a_weight, &g, 1, false, stream, false, workspace);
+    detail::ggml_k_project_split(x, b_weight, &beta, 1, false, stream, false, workspace);
     detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
 }
 
@@ -139,7 +139,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     }
 
     if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
-        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g, beta, &ws, stream);
         return;
     }
 
@@ -160,7 +160,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
 
     if (ab_weight.qtype == QType::GGML_K) {
         const Tensor outputs[]{g, beta};
-        detail::ggml_k_project_split(x, ab_weight, outputs, 2, false, stream);
+        detail::ggml_k_project_split(x, ab_weight, outputs, 2, false, stream, false, &ws);
         detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
         return;
     }
@@ -193,7 +193,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 
     if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
         rmsnorm(x, norm_weight, eps, true, h, stream);
-        project_ggml_k_control(h, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+        project_ggml_k_control(h, a_weight, b_weight, A_log, dt_bias, g, beta, &ws, stream);
         return;
     }
 
@@ -222,7 +222,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     if (ab_weight.qtype == QType::GGML_K) {
         rmsnorm(x, norm_weight, eps, true, h, stream);
         const Tensor outputs[]{g, beta};
-        detail::ggml_k_project_split(h, ab_weight, outputs, 2, false, stream);
+        detail::ggml_k_project_split(h, ab_weight, outputs, 2, false, stream, false, &ws);
         detail::gdn_gating_launch(g, beta, A_log, dt_bias, g, beta, stream);
         return;
     }
@@ -290,7 +290,8 @@ void dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_wei
     if (a_weight.qtype == QType::GGML_K && b_weight.qtype == QType::GGML_K) {
         Tensor g_mut(g);
         Tensor beta_mut(beta);
-        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g_mut, beta_mut, stream);
+        project_ggml_k_control(x, a_weight, b_weight, A_log, dt_bias, g_mut, beta_mut, ws,
+                               stream);
         return;
     }
     const std::int32_t tokens        = x.ne[1];
@@ -386,7 +387,7 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
             Tensor beta_mut(beta[slot]);
             const Tensor outputs[]{g_mut, beta_mut};
             detail::ggml_k_project_split(x[slot], ab_weight[slot], outputs, 2, false,
-                                        ec.dev[slot]->stream);
+                                         ec.dev[slot]->stream, false, ws[slot]);
             detail::gdn_gating_launch(g_mut, beta_mut, A_log[slot], dt_bias[slot], g_mut, beta_mut,
                                      ec.dev[slot]->stream);
             return;

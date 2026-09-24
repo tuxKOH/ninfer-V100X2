@@ -12,7 +12,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::uint32_t kWindow = 4096;
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* name) {
@@ -95,7 +94,8 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity == 0 ||
+        (cache.capacity & (cache.capacity - 1U)) != 0 ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||

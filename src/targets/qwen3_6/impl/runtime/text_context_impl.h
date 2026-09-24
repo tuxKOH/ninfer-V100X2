@@ -773,7 +773,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                            Tensor& logits, Tensor& target_tokens, Tap& tap) {
     if (tp2()) {
-        throw std::logic_error("speculative verify has no tensor-parallel path in this build");
+        throw std::logic_error("use tensor-parallel target_verify_batch overload");
     }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -1418,7 +1418,9 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     if (tp2()) {
-        throw std::logic_error("DFlash prefill has no tensor-parallel path in this build");
+        const TextPrefill text_prefill{full_ids, begin};
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill,
+                                finalize_at_end, &sink);
     }
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
@@ -1846,7 +1848,9 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
 }
 
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
-                                 const std::array<Tensor, 2>& staging) {
+                                 const std::array<Tensor, 2>& staging,
+                                 DFlashFeatureSink* dflash_sink) {
+    if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
@@ -1896,6 +1900,12 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
             }
         }
+        if (dflash_sink != nullptr) {
+            dflash_sink->capture_layer(layer, x[0], stream_for(0));
+        }
+    }
+    if (dflash_sink != nullptr) {
+        dflash_sink->capture_positions(rank_cache_positions(0), stream_for(0));
     }
 }
 
@@ -1958,7 +1968,8 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
 
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
-                                                 bool finalize_at_end) {
+                                                 bool finalize_at_end,
+                                                 DFlashFeatureSink* dflash_sink) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -2037,7 +2048,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging);
+        run_layers_tp2(x, Phase::Prefill, staging, dflash_sink);
 
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2176,6 +2187,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
 
     prefill_rewrite_checkpoint_frontier_ = -1;
     synchronize_all();
+    if (dflash_sink != nullptr) {
+        dflash_sink->consume_prefill_chunk(len, checkpoint_rel > 0 && len == checkpoint_rel);
+        synchronize_all();
+    }
     work_.reset();
     tp_->work->reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
@@ -2630,6 +2645,98 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
         for_each_rank(execution, [&](int rank) {
             const auto r       = static_cast<std::size_t>(rank);
             Tensor flat_tokens = target_tokens[r].view({columns});
+            ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
+        });
+    }
+    work_.reset();
+    tp_->work->reset();
+}
+
+void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
+                                      const std::array<Tensor, 2>& cache_positions,
+                                      const std::array<Tensor, 2>& rope_positions,
+                                      const std::array<Tensor, 2>& valid_columns,
+                                      const std::array<Tensor, 2>& kv_table_rows,
+                                      const std::array<Tensor, 2>& linear_state_slots,
+                                      ops::GqaExecutionEnvelope envelope,
+                                      const std::array<Tensor, 2>& hidden,
+                                      const std::array<Tensor, 2>& logits,
+                                      const std::array<Tensor, 2>& target_tokens,
+                                      DFlashFeatureSink& sink) {
+    if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
+    const ExecutionContext& execution = ec();
+    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const std::int32_t width = ids[0].ne[0];
+    const std::int32_t batch = ids[0].ne[1];
+    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
+        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("tensor-parallel DFlash target verify shape is invalid");
+    }
+    for (std::size_t r = 0; r < 2; ++r) {
+        require_tensor_shape(ids[r], DType::I32, {width, batch}, "DFlash target verify ids");
+        require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
+                             "DFlash target verify cache positions");
+        require_tensor_shape(rope_positions[r], DType::I32, {width, batch},
+                             "DFlash target verify rope positions");
+        require_tensor_shape(valid_columns[r], DType::I32, {batch},
+                             "DFlash target verify valid columns");
+        require_tensor_shape(kv_table_rows[r], DType::I32, {batch},
+                             "DFlash target verify KV rows");
+        require_tensor_shape(linear_state_slots[r], DType::I32, {batch},
+                             "DFlash target verify state slots");
+        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
+                             "DFlash target verify hidden");
+        require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, width, batch},
+                             "DFlash target verify logits");
+        require_tensor_shape(target_tokens[r], DType::I32, {width, batch},
+                             "DFlash target verify tokens");
+    }
+    work_.reset();
+    tp_->work->reset();
+    {
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions[0]);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions[0]);
+        ScopedEnvelope envelope_binding(active_gqa_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows[0]);
+        ScopedValue<const Tensor*> state_binding(active_linear_state_slots_, &linear_state_slots[0]);
+        ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns[0]);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+        ScopedValue<const Tensor*> peer_cache_binding(peer_cache_positions_, &cache_positions[1]);
+        ScopedValue<const Tensor*> peer_rope_binding(peer_rope_positions_, &rope_positions[1]);
+        ScopedValue<const Tensor*> peer_rows_binding(peer_kv_table_rows_, &kv_table_rows[1]);
+        ScopedValue<const Tensor*> peer_slots_binding(peer_linear_state_slots_, &linear_state_slots[1]);
+        ScopedValue<const Tensor*> peer_valid_binding(peer_valid_columns_, &valid_columns[1]);
+        auto scope_0 = work_.scope();
+        auto scope_1 = tp_->work->scope();
+        std::array<Tensor, 2> x;
+        std::array<Tensor, 2> staging;
+        for (std::size_t r = 0; r < 2; ++r) {
+            x[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
+            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
+        }
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::embedding(ids[r].view({width * batch}), rank == 0 ? *embed_ : *embed_peer_,
+                           x[r], stream_for(rank));
+        });
+        run_layers_tp2(x, Phase::Verify, staging, &sink);
+        std::array<Tensor, 2> flat_hidden;
+        std::array<Tensor, 2> flat_logits;
+        for (std::size_t r = 0; r < 2; ++r) {
+            flat_hidden[r] = hidden[r].view({kCfg.hidden, width * batch});
+            flat_logits[r] = logits[r].view({kCfg.vocab, width * batch});
+            for_each_rank(execution, [&](int rank) {
+                if (static_cast<std::size_t>(rank) == r) {
+                    ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps,
+                                 true, flat_hidden[r], stream_for(rank));
+                }
+            });
+        }
+        logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            Tensor flat_tokens = target_tokens[r].view({width * batch});
             ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
         });
     }

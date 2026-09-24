@@ -17,6 +17,12 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     // tuned kernel set. See q5_dispatch.cpp for the rules every family follows here.
     const bool tp2_shard = (n == 7168 && k == 5120) || (n == 5120 && k == 3072);
     if ((!supported_problem && !tp2_shard) || t <= 0) {
+#ifdef NINFER_VOLTA_BUILD
+        // DFlash2 carries BF16 projections at draft-only geometries (6144x5120,
+        // 34816x5120, 5120x17408, ...).  Volta's CUTLASS SIMT route is the
+        // qualified general BF16 fallback for these contiguous matrices.
+        if (n > 0 && k > 0 && t > 0) { return launch_bf16_cutlass_sm70; }
+#endif
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
     if (tp2_shard) { return launch_bf16_mma; }

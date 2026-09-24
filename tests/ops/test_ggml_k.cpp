@@ -1,6 +1,9 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -112,6 +115,14 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
     weight.qdata = codes.p;
     weight.qhigh = table.p;
     Tensor xt(x.p, DType::BF16, {k, tokens}), yt(y.p, DType::BF16, {n, tokens});
+#ifdef NINFER_VOLTA_BUILD
+    if (tokens >= 512) {
+        WorkspaceArena workspace(std::max<std::size_t>(
+            1, ops::detail::ggml_k_cutlass_sm70_workspace_bytes(n, k, tokens)));
+        ops::detail::ggml_k_project_split(xt, weight, &yt, 1, add, nullptr, tiled_gdn,
+                                          &workspace);
+    } else
+#endif
     ops::detail::ggml_k_project_split(xt, weight, &yt, 1, add, nullptr, tiled_gdn);
     CUDA_CHECK(cudaDeviceSynchronize());
     y.copy_to_host(result.data(), y.bytes);
@@ -201,7 +212,109 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
             }
         }
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (n == 48 && k == 5120 && tokens == 512 && !tiled_gdn && !add) {
+        DeviceBuffer first(std::size_t(n / 2) * tokens * sizeof(__nv_bfloat16));
+        DeviceBuffer second(std::size_t(n / 2) * tokens * sizeof(__nv_bfloat16));
+        const Tensor sections[]{Tensor(first.p, DType::BF16, {n / 2, tokens}),
+                                Tensor(second.p, DType::BF16, {n / 2, tokens})};
+        WorkspaceArena workspace(ops::detail::ggml_k_cutlass_sm70_workspace_bytes(
+            n / 2, k, tokens));
+        ops::detail::ggml_k_project_split(xt, weight, sections, 2, false, nullptr, false,
+                                          &workspace);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<__nv_bfloat16> halves(result.size());
+        first.copy_to_host(halves.data(), first.bytes);
+        second.copy_to_host(halves.data() + std::size_t(n / 2) * tokens, second.bytes);
+        for (int t = 0; t < tokens; ++t) {
+            for (int row = 0; row < n; ++row) {
+                const auto got = halves[std::size_t(row >= n / 2) * (n / 2) * tokens +
+                                        std::size_t(t) * (n / 2) + row % (n / 2)];
+                const auto expected = result[std::size_t(t) * n + row];
+                if (std::memcmp(&got, &expected, sizeof(got)) != 0) {
+                    throw std::runtime_error("GGML K SM70 split descriptor offset mismatch");
+                }
+            }
+        }
+    }
+#endif
 }
+
+#ifdef NINFER_VOLTA_BUILD
+void run_fp32_output() {
+    constexpr int n = 48;
+    constexpr int k = 5120;
+    constexpr int tokens = 512;
+    std::mt19937 rng(19231);
+    std::vector<unsigned char> rows;
+    std::vector<std::uint64_t> descriptors(n);
+    for (int row = 0; row < n; ++row) {
+        const bool q6 = (row % 3) == 1;
+        descriptors[row] = (std::uint64_t(rows.size()) << 1) | q6;
+        for (int block = 0; block < k / 256; ++block) {
+            const std::size_t begin = rows.size();
+            const int bytes = q6 ? 210 : 144;
+            rows.resize(begin + bytes);
+            for (int j = 0; j < bytes; ++j) { rows[begin + j] = rng() & 255; }
+            const __half d = __float2half_rn(0.00001f * (1 + rng() % 19));
+            std::memcpy(rows.data() + begin + (q6 ? 208 : 0), &d, sizeof(d));
+            if (!q6) {
+                const __half m = __float2half_rn(0.0001f * (1 + rng() % 11));
+                std::memcpy(rows.data() + begin + 2, &m, sizeof(m));
+            }
+        }
+    }
+    std::vector<__nv_bfloat16> input(std::size_t(k) * tokens);
+    for (auto& value : input) {
+        value = __float2bfloat16_rn(float(int(rng() % 2001) - 1000) / 1000.0f);
+    }
+    DeviceBuffer codes(rows.size()), table(descriptors.size() * sizeof(std::uint64_t));
+    DeviceBuffer x(input.size() * 2), y(std::size_t(n) * tokens * sizeof(float));
+    codes.copy_from_host(rows.data(), rows.size());
+    table.copy_from_host(descriptors.data(), table.bytes);
+    x.copy_from_host(input.data(), x.bytes);
+    Weight weight;
+    weight.qtype = QType::GGML_K;
+    weight.layout = QuantLayout::GgmlK256;
+    weight.n = n;
+    weight.k = k;
+    weight.qdata = codes.p;
+    weight.qhigh = table.p;
+    Tensor xt(x.p, DType::BF16, {k, tokens});
+    Tensor yt(y.p, DType::FP32, {n, tokens});
+    WorkspaceArena workspace(ops::detail::ggml_k_cutlass_sm70_workspace_bytes(n, k, tokens));
+    ops::detail::ggml_k_project_split(xt, weight, &yt, 1, false, nullptr, false, &workspace);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> result(std::size_t(n) * tokens);
+    y.copy_to_host(result.data(), y.bytes);
+
+    double error2 = 0.0;
+    double reference2 = 0.0;
+    for (int row = 0; row < n; ++row) {
+        const auto descriptor = descriptors[row];
+        const bool q6 = descriptor & 1;
+        std::vector<double> decoded(k);
+        for (int block = 0; block < k / 256; ++block) {
+            const auto values = oracle_block(rows.data() + (descriptor >> 1) +
+                                             block * (q6 ? 210 : 144), q6);
+            std::copy(values.begin(), values.end(), decoded.begin() + block * 256);
+        }
+        for (int t = 0; t < tokens; ++t) {
+            double reference = 0.0;
+            for (int j = 0; j < k; ++j) {
+                reference += decoded[j] * double(__bfloat162float(input[t * k + j]));
+            }
+            const double actual = result[t * n + row];
+            error2 += (actual - reference) * (actual - reference);
+            reference2 += reference * reference;
+        }
+    }
+    const double relative = std::sqrt(error2 / reference2);
+    std::cout << "GGML_K FP32 output N=" << n << " K=" << k << " T=" << tokens
+              << " relative_l2=" << relative << '\n';
+    if (relative > 0.004) { throw std::runtime_error("GGML K FP32 oracle mismatch"); }
+}
+#endif
 } // namespace
 
 int main() {
@@ -217,6 +330,8 @@ int main() {
         // Real prefill spans many token tiles; check every output against FP64
         // with mixed Q4/Q6 rows, including the partial final row tile.
         for (int t : {512, 1024}) { run(48, 5120, t); }
+        run(7168, 5120, 512);
+        run(17408, 5120, 512);
         for (int k : {3072, 6144}) {
             for (int t : {1, 4, 17, 65}) {
                 run(96, k, t, true, false);
@@ -225,6 +340,9 @@ int main() {
         }
         run(48, 3072, 512, true, false);
         run(48, 3072, 512, true, true);
+#ifdef NINFER_VOLTA_BUILD
+        run_fp32_output();
+#endif
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

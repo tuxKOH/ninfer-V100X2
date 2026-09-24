@@ -30,6 +30,8 @@ Binder::Binder(const Reader& reader, int device_count)
     materialization_.device_count = device_count;
 }
 
+bool Binder::has_tensor(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
+
 void Binder::set_shard_resolver(ShardResolver resolver) {
     if (!materialization_.device_objects.empty()) {
         throw ArtifactError("the shard resolver must be installed before any tensor is placed");

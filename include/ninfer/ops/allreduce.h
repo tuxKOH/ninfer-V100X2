@@ -16,9 +16,11 @@
 // PCIe transfer. Linux translated IOMMU domains (DMA/DMA-FQ) prohibit direct P2P regardless of
 // advertised support or small-copy results. If either device uses such a domain, peer access is
 // unavailable, or copies fail the exact startup check, both directions are disabled and CUDA
-// stages the same copy through host memory. Startup validates
-// that route too before allowing inference. Both qualified paths are stream-ordered, so callers
-// need no peer-access branch; enable_peer_access() below reports which one is active.
+// stages the same copy through an explicit pair of long-lived pinned host buffers. This avoids the
+// opaque driver-side staging path observed with UVA D2D copies behind translated IOMMU domains.
+// Startup validates that route too before allowing inference. Both qualified paths are
+// stream-ordered, so callers need no peer-access branch; enable_peer_access() below reports which
+// one is active.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
@@ -32,7 +34,9 @@
 //   stream(r):  ...producer of the rank-r inputs...
 //               record(inputs_ready[r])
 //               wait(inputs_ready[1-r])              // peer's source is complete
-//               memcpyPeer(peer source -> rank-r storage)
+//               [direct] peer source -> rank-r storage
+//               [staged] rank-r source -> host[r], record(transfer_ready[r]);
+//                        wait(transfer_ready[1-r]); host[1-r] -> rank-r storage
 //               record(pull_done[r])
 //               wait(pull_done[1-r])                 // peer has finished reading MY source
 //               ...local combine, for allreduce_sum...
@@ -55,9 +59,10 @@
 // 128 all-reduces (64 layers x 2 row-parallel projections: the mixer output and the MLP down
 // projection) plus one allgather_rows per logit column, so 129 collectives at batch 1.
 //
-// Everything in a call is stream-ordered device work (memcpy, event record, event wait, kernel
-// launch): no host round trip, no host-memory spin flag, no device or stream synchronization. That
-// is what makes the sequence capturable. Measured: with both device streams enrolled in ONE
+// Everything in a call is stream-ordered CUDA work (memcpy, event record, event wait, kernel
+// launch): there is no host round trip or host-memory spin flag in the hot path. The explicit
+// fallback does use pinned host memory as a DMA landing zone, but never synchronizes the host
+// between legs. That is what makes the sequence capturable. Measured: with both device streams enrolled in ONE
 // capture -- the peer's stream joined to the origin's by an event fork -- the record/wait pairs
 // above become graph EDGES rather than nodes, and the whole 128-collective decode program
 // instantiates as a single cross-device cudaGraphExec. Event objects and staging storage are
@@ -87,7 +92,7 @@ namespace ninfer::ops {
 
 // Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
 // devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ select the
-// host-staged route without ever enabling direct P2P, even if a small probe could pass. Otherwise,
+// pinned host-staged route without ever enabling direct P2P, even if a small probe could pass. Otherwise,
 // when both directions advertise peer access, enable them and check two distinct 16 KiB patterns
 // with the collectives' UVA D2D API on
 // their destination compute streams. Returns true only when both copies are exact. A data
@@ -132,6 +137,17 @@ public:
         return pull_done_[static_cast<std::size_t>(rank)];
     }
 
+    // Host-staged transport uses one pinned slot per source rank. These slots are allocated on
+    // demand before capture and remain stable for every captured graph replay.
+    [[nodiscard]] cudaEvent_t transfer_ready(int rank) const noexcept {
+        return transfer_ready_[static_cast<std::size_t>(rank)];
+    }
+    [[nodiscard]] bool direct_transport() const noexcept { return direct_transport_; }
+    [[nodiscard]] void* host_staging(int rank) const noexcept {
+        return host_staging_[static_cast<std::size_t>(rank)];
+    }
+    void ensure_host_staging(std::size_t bytes) const;
+
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
         return inputs_ready_[0] != nullptr && inputs_ready_[1] != nullptr &&
@@ -140,7 +156,14 @@ public:
 
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
+    std::array<cudaEvent_t, 2> transfer_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
+    bool direct_transport_ = false;
+    std::array<int, 2> devices_{0, 0};
+    std::array<cudaStream_t, 2> streams_{nullptr, nullptr};
+    mutable std::array<void*, 2> host_staging_{nullptr, nullptr};
+    mutable std::size_t host_staging_bytes_ = 0;
+    bool host_staging_ready_ = false;
 };
 
 /**
@@ -190,5 +213,11 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
  */
 void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
                     const ExecutionContext& ec, const PeerEvents& events);
+
+// Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous
+// dtype and shape. Uses the qualified direct/staged transport and orders rank 0's next
+// overwrite after rank 1 has consumed the source, including under CUDA Graph capture.
+void broadcast_rank0(const Tensor& source, const Tensor& destination,
+                     const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

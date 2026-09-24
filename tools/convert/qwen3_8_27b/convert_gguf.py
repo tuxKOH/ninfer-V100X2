@@ -13,6 +13,9 @@ from pathlib import Path
 import struct
 from typing import Iterator
 
+import torch
+from tools.convert.common.safetensors import ShardReader
+
 from tools.artifact.container import (
     ArtifactIdentity, ArtifactWriter, ResourceSpec, TensorSpec,
 )
@@ -168,6 +171,75 @@ class QuantObject:
 class DirectObject:
     spec: TensorSpec
     data: bytes
+
+
+def build_dflash2_objects(model: str | Path) -> list[DirectObject]:
+    """Load the official Qwen3.8 DFlash2 BF16 draft package into native objects.
+
+    The draft checkpoint is intentionally kept as BF16: DFlash2's dynamic convolution and
+    candidate-selector numerics are part of its published behavior, and the target runtime can
+    consume contiguous BF16 matrices without a second quantization format.
+    """
+    import json
+
+    root = Path(model)
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    dcfg = config.get("dflash_config", {})
+    if dcfg.get("target_layer_ids") != [5, 19, 33, 47, 61] or dcfg.get("block_size") != 8:
+        raise ValueError("unsupported DFlash2 checkpoint configuration")
+    reader = ShardReader.from_file(root / "model.safetensors")
+    names: list[tuple[str, str, tuple[int, ...]]] = [
+        ("dflash/feature_projection", "fc.weight", (5120, 25600)),
+        ("dflash/context_norm", "hidden_norm.weight", (5120,)),
+    ]
+    for layer in range(5):
+        p = f"layers.{layer}."
+        q = f"dflash/layers/{layer}/"
+        names.extend([
+            (q + "input_norm", p + "input_layernorm.weight", (5120,)),
+            (q + "attention/query_key_value", "", (6144, 5120)),
+            (q + "attention/output", p + "self_attn.o_proj.weight", (5120, 4096)),
+            (q + "attention/query_norm", p + "self_attn.q_norm.weight", (128,)),
+            (q + "attention/key_norm", p + "self_attn.k_norm.weight", (128,)),
+            (q + "post_attention_norm", p + "post_attention_layernorm.weight", (5120,)),
+            (q + "mlp/gate_up", "", (34816, 5120)),
+            (q + "mlp/down", p + "mlp.down_proj.weight", (5120, 17408)),
+            (q + "attention_conv/base_kernel", p + "attention_conv.base_kernel", (5120, 2, 2)),
+            (q + "attention_conv/kernel_projection", p + "attention_conv.kernel_projection.weight", (1280, 5120)),
+            (q + "mlp_conv/base_kernel", p + "mlp_conv.base_kernel", (5120, 2, 2)),
+            (q + "mlp_conv/kernel_projection", p + "mlp_conv.kernel_projection.weight", (1280, 5120)),
+        ])
+    names.extend([
+        ("dflash/final_norm", "norm.weight", (5120,)),
+        ("dflash/candidate_selector/hidden_projection", "candidate_selector.hidden_projection.weight", (256, 5120)),
+        ("dflash/candidate_selector/predecessor_codebook", "candidate_selector.predecessor_codebook", (248320, 256)),
+        ("dflash/candidate_selector/successor_codebook", "candidate_selector.successor_codebook", (248320, 256)),
+    ])
+    expected_sources = {source for _, source, _ in names if source}
+    if not expected_sources.issubset(set(reader.names)):
+        missing = sorted(expected_sources - set(reader.names))
+        if missing:
+            raise ValueError(f"DFlash2 checkpoint is missing tensors: {missing[:4]}")
+    objects: list[DirectObject] = []
+    for target, source, shape in names:
+        if target.endswith("attention_conv/base_kernel") or target.endswith("mlp_conv/base_kernel"):
+            # Safetensors stores [side, tap, channel]. Its contiguous bytes are already the
+            # GGML/NInfer ne0-fast [channel, tap, side] layout. Change only the descriptor;
+            # permuting and materializing here would silently transpose the coefficients.
+            tensor = reader.get(source).view(5120, 2, 2)
+        elif target.endswith("attention/query_key_value"):
+            tensor = torch.cat([reader.get(f"layers.{int(target.split('/')[2])}.self_attn.{part}_proj.weight") for part in ("q", "k", "v")], dim=0)
+        elif target.endswith("mlp/gate_up"):
+            layer = int(target.split('/')[2])
+            tensor = torch.cat([reader.get(f"layers.{layer}.mlp.{part}_proj.weight") for part in ("gate", "up")], dim=0)
+        else:
+            tensor = reader.get(source)
+        actual_shape = tuple(tensor.shape)
+        if tensor.dtype != torch.bfloat16 or actual_shape != shape:
+            raise ValueError(f"{source}: expected BF16 {shape}, got {tensor.dtype} {tuple(tensor.shape)}")
+        payload = tensor.contiguous().view(torch.uint16).numpy().tobytes()
+        objects.append(DirectObject(TensorSpec(target, shape, "BF16", "contiguous-le-v1"), payload))
+    return objects
 
 
 def json_bytes(value) -> bytes:
@@ -370,11 +442,14 @@ def preflight(source: Gguf, vision: Gguf):
         raise ValueError("expected the companion Qwen3.8-27B BF16 Vision GGUF")
 
 
-def convert(model: Path, mmproj: Path, output: Path, ranking: Path, inspect_only=False):
+def convert(model: Path, mmproj: Path, output: Path, ranking: Path, inspect_only=False,
+            dflash2_model: Path | None = None):
     with Gguf(model) as source, Gguf(mmproj) as vision:
         preflight(source, vision)
         resources = frontend_resources(source, vision)
         objects = build_text_objects(source, ranking)
+        if dflash2_model is not None:
+            objects.extend(build_dflash2_objects(dflash2_model))
         specs = [ResourceSpec(name, "raw-bytes-v1", len(data)) for name, data in resources.items()]
         specs.extend(obj.spec for obj in objects)
         vision_specs = [TensorSpec("vision/gguf/" + tensor.name, tensor.shape,
@@ -419,8 +494,10 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ranking", type=Path, default=Path(__file__).resolve().parents[3] / "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64")
     parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument("--dflash2-model", type=Path,
+                        help="Qwen3.8-27B-DFlash2 safetensors directory")
     args = parser.parse_args()
-    convert(args.model, args.mmproj, args.out, args.ranking, args.inspect_only)
+    convert(args.model, args.mmproj, args.out, args.ranking, args.inspect_only, args.dflash2_model)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,10 @@ public:
     // 0's half-shard and size the arena for half a model, with nothing else noticing.
     [[nodiscard]] int device_count() const noexcept { return materialization_.device_count; }
 
+    // Optional companion packages (such as DFlash2) are allowed to live in the same artifact;
+    // targets use this read-only probe to bind them only when the startup feature selects them.
+    [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
+
     void set_shard_resolver(ShardResolver resolver);
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,

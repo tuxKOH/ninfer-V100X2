@@ -79,12 +79,16 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
 // is BF16 [128,3,H,T] (H=16, or H=8 per TP2 rank); the packed weight columns are
 // [128,H,3]. No weight is requantized: ideal is residual + W @ transpose_heads(x).
 // FP64 decodes W's original scales/codes and applies this permutation before the dot.
-// No workspace or persistent state. Split form adds the residual on rank 0 once
-// and all-reduces both partial projections, following linear_add_row_parallel.
-void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream);
+// Caller-owned transient workspace for the SM70 prefill route; no persistent state. Split form
+// adds the residual on rank 0 once and all-reduces both partial projections, following
+// linear_add_row_parallel.
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
+                       WorkspaceArena& workspace, cudaStream_t stream);
 void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                        const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+                       const std::array<Tensor, 2>& staging,
+                       const std::array<WorkspaceArena*, 2>& workspace,
+                       const ExecutionContext& ec,
                        const PeerEvents& events);
 
 // --- Tensor-parallel split form (tp == 2) -----------------------------------------------------

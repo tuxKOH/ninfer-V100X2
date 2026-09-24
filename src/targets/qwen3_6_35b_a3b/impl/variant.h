@@ -216,7 +216,8 @@ struct Variant {
                                                    qwen3_6::TextPhase phase, std::int32_t first,
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    gdn_norm_control_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);

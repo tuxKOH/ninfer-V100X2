@@ -21,6 +21,12 @@ the user's approximately 45 tok/s baseline. A separate **512-token prompt** code
 same 180K capacity measured **60.03 ± 0.057 tok/s** across three 256-token decode windows.
 Values are means ± sample standard deviations; all six output windows were EOS/EOG-free.
 
+The current SM70 GGML-K prefill route, with the V100X2 launcher's 4,096-token chunk, measured
+**1,672.9 tok/s** for an 8,192-token prompt and **1,251.0–1,257.5 tok/s** for the fixed
+85,000-token code corpus, both at 180,000-token capacity with INT8 KV and TP2. These are
+single-run prefill measurements; they do not update the separate
+512-token decode acceptance result above.
+
 Both profiles use INT8 KV, optimized MTP3, CUDA Graphs and verified CUDA host-staged TP2. Original
 weight codes/scales are preserved, with independent operator oracles and real-model MTP regression
 checks. These results apply to the measured code workloads. The short-input result exceeds the
@@ -84,9 +90,32 @@ comparison, not a filled-context benchmark or a programming-correctness evaluati
 
 Neither engine slows materially as capacity increases with this fixed short input. LM Studio is
 about 4% faster here; its MTP acceptance is 80.80%, compared with NInfer's 65.89%. In this sweep,
-the 512-token prefill takes 1.775–1.777 s in NInfer and 0.755–0.759 s in
-LM Studio. These short-input results are separate from the 85K occupied-context result above.
+the 512-token prefill took 1.775–1.777 s in the pre-optimization NInfer build and
+0.755–0.759 s in LM Studio. These short-input results are separate from the current 8K/85K
+prefill measurements and the 85K occupied-context decode result above.
 See the [method and reproduction commands](docs/performance.md#v100x2-maximum-context-capacity-sweep).
+
+## DFlash2 speculative route
+
+DFlash2 is integrated as an optional five-layer BF16 draft route for the registered Qwen3.8-27B
+artifact. It includes dynamic grouped convolution, lattice selection, TP2 replicated verification,
+and graph-stable selector scratch. Enable it with `--spec dflash --draft-tokens 3` (up to seven).
+A short two-V100 smoke run completed eight generated tokens with 100% draft acceptance; this is
+an integration check, not a long-context throughput claim.
+
+For comparison only, a temporary CUDA 12.8/`sm_70` llama.cpp build was run on the same
+local Q4_K_M target and two V100s with Q8 KV, greedy sampling, an approximately 6,020-token
+occupied prompt, and 128 generated tokens:
+
+| External route | Draft window | Generation rate |
+|---|---:|---:|
+| llama.cpp, no speculative draft | 0 | 34.2 tok/s |
+| llama.cpp + DFlash2 BF16 draft | 3 | 65.6 tok/s |
+| llama.cpp + DFlash2 BF16 draft | 7 | 85.0 tok/s |
+
+These comparison numbers are not NInfer measurements. The source checkpoint is kept under
+`/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-DFlash2/`; converted tensors are embedded
+in `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m_dflash2.ninfer`.
 
 ## Inherited RTX 5090 performance
 
@@ -226,7 +255,8 @@ cmake --build build-v100 -j
 ```
 
 The V100X2 launcher selects the local Qwen3.8-27B Q4_K_M artifact and the requested long-context
-profile (`--tp 2`, `--max-context 180000`, INT8 group-64 KV, CUDA Graphs, MTP draft window 3,
+profile (`--tp 2`, `--max-context 180000`, `--prefill-chunk 4096`, INT8 group-64 KV,
+CUDA Graphs, MTP draft window 3,
 optimized proposal head via `--lm-head-draft`) by default. Accepted draft counts can range from
 zero through three in each round. The target verifier still uses the full vocabulary. Pass the
 normal CLI options, including `--prompt` or `--messages`, after the launcher:
@@ -238,8 +268,9 @@ tools/v100/ninfer-v100x2.sh \
 ```
 
 Override the artifact, device pair, context capacity, or draft window with
-`NINFER_V100X2_ARTIFACT`, `NINFER_V100X2_DEVICES`, `NINFER_V100X2_MAX_CONTEXT`, and
-`NINFER_V100X2_DRAFT_TOKENS`. Set `NINFER_V100X2_PROPOSAL_HEAD=full` to use the full proposal
+`NINFER_V100X2_ARTIFACT`, `NINFER_V100X2_DEVICES`, `NINFER_V100X2_MAX_CONTEXT`,
+`NINFER_V100X2_PREFILL_CHUNK`, and `NINFER_V100X2_DRAFT_TOKENS`. Set
+`NINFER_V100X2_PROPOSAL_HEAD=full` to use the full proposal
 head; the only accepted values are `full` and `optimized` (the default). The launcher does not
 impose a low host-CPU affinity; the executor blocks when no request is ready, while an external
 cgroup/CPU quota can still cap the process if a host requires it.
@@ -264,13 +295,17 @@ the explicit paths to your installation:
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.convert_gguf \
-  --model /home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
-  --mmproj /home/z/.lmstudio/models/lmstudio-community/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-BF16.gguf \
+  --model /Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
+  --mmproj /Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-BF16.gguf \
   --out /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
 Use a Python environment containing NumPy. The runtime accepts the resulting `.ninfer`, not the
 source GGUF. When this artifact already exists, run the launcher directly.
+
+Local model weights live under `/Models`: source files in `/Models/LM-Studio-models` and NInfer
+artifacts in `/Models/ninfer-V100X2`. LM Studio's `~/.lmstudio/models` directory links to the
+source directory; the V100X2 launcher already uses the artifact's absolute path.
 
 ## Download a model
 
@@ -451,8 +486,9 @@ entirely inside the reasoning stream:
 - `--kv-dtype int8` is mandatory at 1M: BF16 KV needs four times the pool and does not fit.
 - `--max-concurrency 1` is arithmetic, not policy, at 1M -- one sequence costs 16.66 GiB per device
   without MTP and 17.69 GiB with it, so a second slot cannot fit on a 32 GiB card.
-- MTP speculative decoding (`--spec mtp --draft-tokens 1..5`, optionally `--lm-head-draft`) works
-  at `--tp 2` including at 1M. `--spec dflash` and `--vision` are rejected at `--tp 2`.
+- MTP speculative decoding (`--spec mtp --draft-tokens 1..5`, optionally `--lm-head-draft`) and
+  DFlash2 (`--spec dflash --draft-tokens 1..7`) work at `--tp 2`. Vision remains unavailable on
+  the DFlash2 route.
 
 See the [CLI guide](docs/cli.md) and [HTTP serving](docs/serving.md) for the full option contract.
 
@@ -763,3 +799,13 @@ The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
 repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
 under `third_party/`.
+
+## Acknowledgements
+
+The V100X2 design and measurements were informed by the upstream [Neroued/ninfer](https://github.com/Neroued/ninfer)
+project, the RTX 3060 TP2 work, and [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
+The prefill investigation consulted [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)'s
+SM70-oriented kernels and vLLM scheduling ideas. DFlash2 integration follows [Inco AI](https://inco.ai/blog/dflash2/) and its [Qwen3.8-27B draft checkpoint](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2). [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)
+was reviewed for RAM-backed KV ideas, but its selective-history attention semantics are not enabled
+in this full-context product. The prefill and DFlash2 comparison methodology is documented
+in [Serving performance](docs/performance.md).

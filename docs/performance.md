@@ -2,6 +2,81 @@
 
 ## V100X2 measurement and acceptance
 
+### Prefill and external optimisation review
+
+The promoted route is measured on the real Q4_K_M artifact with INT8 KV, TP2 and
+180,000-token capacity. With `prefill_chunk=4096`, an 8,192-token prompt took **4.897 s**
+to prefill (**1,672.9 tok/s**); the fixed 85,000-token code corpus took **67.597–67.943 s**
+(**1,251.0–1,257.5 tok/s**, two runs). The latter has exactly 85,000 occupied prompt tokens.
+These are prefill rates, not decode rates, and both exceed the requested 1,000 tok/s target.
+The 4,096-token chunk is the V100X2 launcher default; the Engine and generic CLI retain their
+target-agnostic 1,024-token default.
+
+On the 8,192-token probe with this kernel, a chunk sweep measured **1,454.4**, **1,599.3**,
+**1,636.1**, **1,672.9**, **1,672.3**, and **1,195.2 tok/s** for chunk sizes 1,024, 2,048,
+3,072, 4,096, 5,120, and 8,192 respectively. The 85,000-token corpus measured **1,133.0**,
+**1,213.4**, and **1,251.0 tok/s** at 1,024, 2,048, and 4,096 respectively. Larger chunks
+increase the startup workspace reservation; at 4,096 it was **1.49 GiB per device**, still within
+the two 16 GB cards' capacity at 180,000 context. Values are individual cold-prefill runs, not
+averages across repeated campaigns.
+
+Before the multi-output route was promoted, an 8,192-token probe took **27.130 s** with
+`prefill_chunk=1024` and **27.075 s** with `prefill_chunk=4096`. A CUDA Nsight Systems capture
+attributed **89.0%** of GPU kernel time to the existing Volta GGML-K Tensor-Core GEMM (`1036`
+launches, `11.544 s` aggregate in the 2,048-token capture). Those measurements are retained as
+historical attribution only; they are not the current implementation result.
+
+Two controlled tile experiments were rejected: using the 32-token GEMM tile for long prefill
+increased the 8K probe to **30.828 s**, and a 128-token/512-thread tile increased it to
+**38.725 s**. Both were reverted. The independent GGML-K FP64-oracle suite remains passing.
+The promoted SM70 route decodes each Q4_K block with one cooperative block-wide pass,
+materializes GGML-K rows into caller-owned FP16 workspace, and uses the existing CUTLASS Volta
+Tensor-Core GEMM, including an FP32 output path for GDN control projection. The packed Q4_K/Q6_K
+bytes remain unchanged. The first two generated IDs were unchanged (`71093, 10504`) in the
+controlled route comparison. These are prefill results only;
+the published decode acceptance remains the separately measured 53.4075 tok/s until a new long
+decode campaign is run.
+
+The external references and integration boundaries are:
+
+- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), an SM70-focused vLLM fork. Its
+  Flash-V100 attention and quantized kernels are not drop-in compatible with NInfer's preserved
+  GGUF Q4_K/Q6_K storage; porting one requires a separate oracle and graph-capture qualification.
+- [DFlash2](https://inco.ai/blog/dflash2/) and the [Qwen3.8-27B drafter](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2),
+  now integrated as an optional five-layer BF16 draft route with dynamic grouped convolution,
+  lattice selection, and TP2 replicated verification. A short two-V100 smoke run completed eight generated tokens with 100% acceptance; no long-context
+  throughput claim is published yet. A temporary llama.cpp `sm_70` build was used only as an external
+  reference: with the same local Q4_K_M target, Q8 KV, an approximately 6,020-token prompt and
+  128 generated tokens, it measured 34.2 tok/s without speculation, 65.6 tok/s with DFlash2
+  draft=3, and 85.0 tok/s with DFlash2 draft=7 on V100×2. These are not NInfer measurements.
+- [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp), which stores completed KV
+  blocks in host RAM and retrieves a query-selected subset into a bounded GPU window. That is an
+  approximate attention policy, not a transparent full-180K KV spill: it changes which history
+  participates in attention. The V100X2 contract therefore keeps complete-context semantics and
+  does not silently substitute KVMem retrieval.
+
+### PCIe-only transport optimization
+
+The two V100-SXM2 cards are behind a translated `DMA-FQ` IOMMU domain and have no active NVLink.
+That topology makes transport, rather than Q4/Q6 arithmetic, the common ceiling: TP2 executes 128
+hidden-width all-reduces per committed token (64 layers × mixer/MLP row-parallel outputs), each
+carrying 10 KiB at batch one. Quantization therefore cannot remove this fixed schedule, explaining
+why Q1, Q4, and Q6 runs converge near the same peak.
+
+The runtime keeps direct UVA P2P when startup qualifies it. On this host it selects a graph-safe
+explicit fallback: one pinned host slot per rank, asynchronous D2H exports followed by peer H2D
+imports, with event ordering across consecutive collectives. The 10 KiB all-reduce suite measures
+**34.47 us mean / 34.17 us p50** (500 iterations, host synchronization included), versus the
+previous implicit CUDA-staged path's approximately 48.4 us. A graph-captured Q4_K_M run with 85,000
+occupied tokens, 180,000 capacity, INT8 KV, and MTP3 produced **53.18 committed tok/s** (89 accepted
+/ 114 drafted, 78.07% acceptance); the matched earlier result was 53.41 tok/s, so this is a
+transport-latency cleanup rather than an 80 tok/s breakthrough.
+
+Removing the remaining PCIe dependency requires a pipeline-parallel 32/32 layer split (one hidden
+transfer at the layer boundary instead of two collectives per layer). That is a runtime/state/KV/
+CUDA-Graph architecture change, not a safe kernel tweak; it remains outside the current TP2
+contract.
+
 The active port uses two Tesla V100-SXM2 16 GB cards, CUDA 12.8 (`sm_70`), and the local
 `qwen3.8-27b/gguf-q4-k-m` artifact converted from LM Studio's Qwen3.8-27B Q4_K_M GGUF.
 On the fixed code-generation workload below, three valid runs at exactly 85,000 occupied prompt
@@ -13,7 +88,11 @@ are inherited results for different hardware and weight profiles.
 
 Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
 transfer route with exact byte comparisons in both directions, and rejects startup if verification
-fails. The current `DMA-FQ` host uses CUDA's host-staged copies. This route passes the collective
+fails. On this `DMA-FQ` host, TP2 now uses two long-lived pinned host slots and explicit asynchronous
+D2H/H2D legs for every collective instead of relying on the driver's opaque UVA-D2D staging path.
+The real 10 KiB decode-shaped all-reduce measures **33.67 us mean / 33.05 us p50** over 500
+iterations (down from the earlier 48.4 us host-staged measurement); this reduces transport overhead
+but cannot remove the 128 per-token collective dependencies. The explicit route passes the collective
 suite, including different tensor sizes, guards and 64 consecutive rounds, and the three public
 Engine CUDA Graph measurements below. The INT8 attention test also passes its independent FP64
 oracle at 85K occupied keys for all four queries, all 24 heads and every visible key, with TP1/TP2 comparisons
@@ -51,9 +130,10 @@ the verification result. The two engines therefore use related, but different, M
 | Mean ± sample standard deviation | **53.4075 ± 0.0639** |
 
 Every repetition produced the same 513 token IDs, with no EOS/EOG token in the captured window,
-and accepted **364 / 444 drafts (81.98%)**. Prefill took **298.132–298.154 s** per repetition and
-is excluded from decode throughput. Host CPU use was approximately one of 32 logical cores;
-observed GPU memory use was **13,768 / 13,454 MiB**, including about 313 MiB of desktop use on GPU 0.
+and accepted **364 / 444 drafts (81.98%)**. Before the current prefill route, this decode campaign's
+prefill took **298.132–298.154 s** per repetition and was excluded from decode throughput.
+Host CPU use was approximately one of 32 logical cores; observed GPU memory use was
+**13,768 / 13,454 MiB**, including about 313 MiB of desktop use on GPU 0.
 
 A separate short-input code-chat measurement used 512 prompt tokens, the same 180,000-token
 capacity and execution settings, one warmup, and three 256-token decode windows. Its wall decode
@@ -69,8 +149,9 @@ acceptance reference; the 18.68% gain is relative to the reported 45 tok/s value
 matched-engine measurement below. The 57 tok/s peak has not been exceeded by this 85K result and lacks
 the context occupancy needed for a like-for-like comparison.
 
-A matched diagnostic run of LM Studio's CUDA backend **2.33.0** used its automatic two-GPU split,
-the same source GGUF and exact 85,000 prompt IDs, Q8 KV, a requested 180,000-token capacity
+A matched diagnostic run before the current NInfer prefill optimization used LM Studio's CUDA
+backend **2.33.0** with its automatic two-GPU split, the same source GGUF and exact 85,000
+prompt IDs, Q8 KV, a requested 180,000-token capacity
 (rounded by the backend to 180,224), and maximum-three/minimum-zero MTP. Both engines used greedy
 sampling and generated 513 output tokens: one from prefill and 512 in the measured decode interval.
 
@@ -82,8 +163,8 @@ sampling and generated 513 output tokens: one from prefill and 512 in the measur
 The LM run decoded for **14.42347 s**, evaluated all 85,000 prompt tokens without cache reuse,
 and stopped at the output limit without any EOS/EOG token. NInfer's decode rate is **50.45% higher**
 in this comparison, with similar MTP acceptance. Its prefill is **1.61 times as long**, so this is
-a decode improvement, not a reduction in cold-request completion latency. The single LM run is
-a diagnostic, not a stable average, and does not replace the user's approximately 45 tok/s
+a decode improvement for that earlier implementation, not a current cold-request latency result.
+The single LM run is a diagnostic, not a stable average, and does not replace the user's approximately 45 tok/s
 acceptance baseline.
 
 Measure committed output tokens per decode second, excluding the first token produced by prefill.

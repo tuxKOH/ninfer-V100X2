@@ -46,6 +46,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                               min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens}, 256);
+        const std::size_t linear_bytes = linear_workspace_capacity_bytes(
+            qtype, gate_up_rows, input_rows, policy, min_tokens, max_tokens);
+        if (linear_bytes != 0) { (void)layout.alloc_bytes(linear_bytes); }
         return layout.peak_bytes(1);
     }
     if (qtype == QType::W8G32_F16S) {
@@ -108,7 +111,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (gate_up_weight.qtype == QType::GGML_K) {
         auto scope = ws.scope();
         Tensor projected = ws.alloc(DType::BF16, {gate_up_weight.n, t}, 256);
-        linear(x, gate_up_weight, projected, stream);
+        linear(x, gate_up_weight, projected, LinearPolicy::A16Only, ws, stream);
         const int width = gate_up_weight.n / 2;
         silu_mul(projected.slice(0, 0, width), projected.slice(0, width, width), out, stream);
         return;
@@ -267,18 +270,24 @@ void q4_column_parallel_rank(const Tensor& x, const Weight& w, Tensor& out,
     auto scope                  = workspace->scope();
     const Tensor materialized   = workspace->alloc(DType::BF16, {w.n, x.ne[1]}, 256);
     Tensor projected            = materialized;
-    // ops::linear()'s A16-only convenience form needs no workspace at ANY Q4 N/K it admits (Task
-    // 3.1's own dispatch never allocates for Q4) -- the same assumption Q4's tp1 Materialized route
-    // already relies on.
-    linear(x, w, projected, stream);
+    if (w.qtype == QType::GGML_K) {
+        linear(x, w, projected, LinearPolicy::A16Only, *workspace, stream);
+    } else {
+        linear(x, w, projected, stream);
+    }
     const std::int32_t intermediate = w.n / 2;
     silu_mul(projected.slice(0, 0, intermediate), projected.slice(0, intermediate, intermediate),
             out, stream);
 }
 
-std::size_t q4_column_parallel_workspace_bytes(std::int32_t max_tokens) {
+std::size_t q4_column_parallel_workspace_bytes(QType qtype, std::int32_t max_tokens) {
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {kShardGateUpRows, max_tokens}, 256);
+    if (qtype == QType::GGML_K) {
+        const std::size_t linear_bytes = linear_workspace_capacity_bytes(
+            qtype, kShardGateUpRows, 5120, LinearPolicy::A16Only, 1, max_tokens);
+        if (linear_bytes != 0) { (void)layout.alloc_bytes(linear_bytes); }
+    }
     return layout.peak_bytes(1);
 }
 
@@ -323,7 +332,7 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
             throw std::invalid_argument(
                 "linear_swiglu column-parallel workspace: Q4 admits only A16");
         }
-        return q4_column_parallel_workspace_bytes(max_tokens);
+        return q4_column_parallel_workspace_bytes(qtype, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu column-parallel workspace: unsupported weight format");
 }

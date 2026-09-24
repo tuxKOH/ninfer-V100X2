@@ -297,9 +297,9 @@ void require_ggml_k_parent(const Weight& weight, std::int32_t rows, LinearPolicy
 }
 
 void project_ggml_k(const Tensor& x, const Weight& weight, const Tensor& qkv,
-                    const Tensor& z, cudaStream_t stream) {
+                    const Tensor& z, cudaStream_t stream, WorkspaceArena* workspace = nullptr) {
     const Tensor outputs[]{qkv, z};
-    detail::ggml_k_project_split(x, weight, outputs, 2, false, stream);
+    detail::ggml_k_project_split(x, weight, outputs, 2, false, stream, false, workspace);
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -314,7 +314,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, 10240, cols, "qkv");
         require_matrix(z, 6144, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        project_ggml_k(x, weight, qkv, z, stream);
+        project_ggml_k(x, weight, qkv, z, stream, workspace);
         return;
     }
 
@@ -466,7 +466,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, 2048, 2048, 6144, geometry, workspace, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                project_ggml_k(x_flat, weight, projected, z_flat, stream);
+                project_ggml_k(x_flat, weight, projected, z_flat, stream, &workspace);
             });
         return;
     }
@@ -639,7 +639,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                        conv_record, query, key, value, z, geometry, workspace, stream,
                        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                           project_ggml_k(x_flat, weight, record_flat, z_flat, stream);
+                           project_ggml_k(x_flat, weight, record_flat, z_flat, stream, &workspace);
                        });
         return;
     }
@@ -828,7 +828,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     }
     if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
         policy == LinearPolicy::A16Only) {
-        return 0;
+        return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                              min_tokens, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
         if (parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
@@ -939,7 +940,10 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
         policy == LinearPolicy::A16Only) {
-        return composed_snapshot_capacity(10240, batch_size * max_width, 0);
+        const std::size_t projection = linear_workspace_capacity_bytes(
+            parent_qtype, parent_rows, input_rows, policy, batch_size * min_width,
+            batch_size * max_width);
+        return composed_snapshot_capacity(10240, batch_size * max_width, projection);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
@@ -999,7 +1003,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
         policy == LinearPolicy::A16Only) {
-        return 0;
+        return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                               batch_size * min_width, batch_size * max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
@@ -1290,7 +1295,8 @@ std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype,
                                                                      std::int32_t max_tokens) {
     if (qtype == QType::GGML_K && policy == LinearPolicy::A16Only && min_tokens > 0 &&
         max_tokens >= min_tokens) {
-        return 0;
+        return linear_workspace_capacity_bytes(qtype, kShardFusedRows, kShardHidden, policy,
+                                               min_tokens, max_tokens);
     }
     // The activation-quantize workspace (NVFP4 W4A4 / FP8 A8) is a pure function of (tokens, K),
     // and K=5120 is unchanged by the shard (only the output row count N halves) -- the tp1 query is
@@ -1330,7 +1336,8 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
         const auto slot = static_cast<std::size_t>(rank);
         const Weight& w = query_key_value_z_weight[slot];
         if (w.qtype == QType::GGML_K) {
-            project_ggml_k(x[slot], w, qkv_dst[slot], z_dst[slot], ec.dev[slot]->stream);
+            project_ggml_k(x[slot], w, qkv_dst[slot], z_dst[slot], ec.dev[slot]->stream,
+                           workspace[slot]);
         } else if (w.qtype == QType::NVFP4) {
             detail::nvfp4_gdn_input_dispatch_shard(x[slot], w, qkv_dst[slot], z_dst[slot], policy,
                                                    workspace[slot], ec.dev[slot]->stream);
@@ -1475,7 +1482,8 @@ std::size_t shard_projection_workspace_bytes(QType qtype, LinearPolicy policy,
                                              const char* op) {
     if (qtype == QType::GGML_K && policy == LinearPolicy::A16Only && min_columns > 0 &&
         max_columns >= min_columns) {
-        return 0;
+        return linear_workspace_capacity_bytes(qtype, kShardFusedRows, kShardHidden, policy,
+                                               min_columns, max_columns);
     }
     // K = 5120 is unchanged by the shard (only the output row count halves), so the tp1 activation
     // quantization query is exact -- the same argument
@@ -1583,7 +1591,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
         compose_shard_conv(x[slot], projected, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                if (w.qtype == QType::GGML_K) {
-                                   project_ggml_k(x_flat, w, out, z_flat, stream);
+                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
                                                                           policy, &arena, stream);
@@ -1705,7 +1713,7 @@ void gdn_input_proj_conv_record_column_parallel(
         compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                if (w.qtype == QType::GGML_K) {
-                                   project_ggml_k(x_flat, w, out, z_flat, stream);
+                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
                                                                           policy, &arena, stream);

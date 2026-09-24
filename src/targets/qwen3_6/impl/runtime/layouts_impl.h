@@ -142,10 +142,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp) {
-            throw std::invalid_argument(
-                "DFlash speculative decoding has no tensor-parallel path in this build");
-        }
         // ONE device's replay records, exactly like the decoder state above: the GDN verify round
         // records this device's own head/channel shard, and the registered
         // FoldGeometry<48, 8, 24, 5120> is the shape the peer's fold consumes. The RECORD
@@ -165,9 +161,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
-            if (tp != 1) {
-                throw std::invalid_argument("DFlash has no tensor-parallel path in this build");
-            }
             DFlashPersistentLayout& dflash = out.dflash.emplace();
             dflash.local = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
                                                 DFlashConfig::local_capacity,
@@ -290,7 +283,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
-        scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
+        scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(
+                            plan.weights_profile, first, last));
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Snapshot) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
@@ -553,19 +547,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                        width, batch),
                                      ops::bidirectional_gqa_attention_workspace_capacity_bytes(
                                          {0, plan.capacity}, width, width, batch)));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
                 }
                 {
                     auto mlp = layout.scope();
                     (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                    matrix(layout, DType::BF16, 2 * DFlashConfig::intermediate, tokens);
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
@@ -574,6 +560,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 } else {
                     matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
                 }
+                matrix(layout, DType::BF16, 256, drafts * batch);
+                matrix(layout, DType::I64,
+                       16 * ((TextConfig::output_rows + 1023) / 1024), drafts * batch);
+                matrix(layout, DType::I32, 16, drafts * batch);
                 return finish(layout);
             };
 
@@ -679,17 +669,7 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         throw std::invalid_argument("tensor-parallel width must be 1 or 2");
     }
     if (options.tp == 2) {
-        // MTP is split-aware (sharded stem/attention/post-mixer, sharded draft head with an
-        // allgather before the proposal argmax, per-device GDN replay records and per-device
-        // replay fold). DFlash is NOT: its weights are sharded by the load plan but
-        // its forward path composes plain linear/residual_add over whole-width tensors, and the
-        // Vision encoder runs entirely on device 0. Engine rejects both combinations too (its
-        // guard is the authority for callers that never reach a target); this is the
-        // target-layer statement of the same fact.
-        if (options.speculative.backend == SpeculativeBackend::DFlash) {
-            throw std::invalid_argument("--tp 2 does not support the DFlash speculative backend "
-                                        "in this build; use --tp 1, --spec mtp or --spec none");
-        }
+        // MTP and DFlash2 have explicit split schedules. Vision remains single-device.
         if (options.enable_vision) {
             throw std::invalid_argument("--tp 2 does not support Vision in this build");
         }

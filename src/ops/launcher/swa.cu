@@ -141,6 +141,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),
                 static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
+                static_cast<int>(context.capacity),
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -194,6 +195,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),
                 static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
+                static_cast<int>(context.capacity),
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
 #endif
