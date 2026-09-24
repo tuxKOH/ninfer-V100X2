@@ -141,7 +141,7 @@ std::string usage_text(const char* argv0) {
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
-           "two GPUs and requires --devices; it supports --spec mtp but not --spec dflash, and "
+           "two GPUs and requires --devices; it supports --spec mtp and --spec dflash, but "
            "not --vision.\n"
            "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
