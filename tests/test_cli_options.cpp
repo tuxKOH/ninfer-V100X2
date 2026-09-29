@@ -102,6 +102,22 @@ void check_documented() {
     const std::string usage = ninfer::cli::usage_text("ninfer");
     check(usage.find("--ignore-eos") != std::string::npos,
           "--ignore-eos is missing from the CLI usage text");
+    check(usage.find("--vision-max-tokens") != std::string::npos,
+          "--vision-max-tokens is missing from the CLI usage text");
+}
+
+void check_vision_budget() {
+    check(parse_cli(base()).vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
+          "CLI Vision token budget default changed");
+    check(parse_cli(with({"--vision", "--vision-max-tokens", "2048"})).vision_max_tokens == 2048,
+          "CLI Vision token budget was not parsed");
+    for (const std::string& invalid : {"0", "32769"}) {
+        bool rejected = false;
+        try {
+            (void)parse_cli(with({"--vision-max-tokens", invalid}));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "CLI accepted an out-of-range Vision token budget");
+    }
 }
 
 } // namespace
@@ -118,6 +134,7 @@ int main() {
               ram.ram_kv.budget_bytes == 32000000000ULL,
           "RAM KV did not separate logical and resident capacity");
     check(parse_cli(base()).ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
+    check_vision_budget();
     if (failures != 0) {
         std::cerr << failures << " CLI option check(s) failed\n";
         return 1;

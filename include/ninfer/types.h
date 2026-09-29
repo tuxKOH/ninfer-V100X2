@@ -23,6 +23,7 @@ inline constexpr std::uint32_t kMaximumConcurrency = 8;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+inline constexpr std::uint32_t kMaximumVisionTokenBudget = 32768;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -98,8 +99,8 @@ struct EngineOptions {
     int device = 0;
     // Tensor-parallel degree: 1, 2 or 4. Parallel execution requires `devices` to name exactly
     // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP
-    // and its optional DFlash2 backend. TP4 supports SM70 Qwen3.8 NVFP4/native FP8 Text/MTP. Vision requires TP1;
-    // the 35B-A3B package also requires TP1.
+    // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 NVFP4/native FP8
+    // Text/MTP without Vision. The 35B-A3B package requires TP1.
     int tp = 1;
     // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
     // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
@@ -130,6 +131,9 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
+    // use min(max_context, vision_max_tokens), independent of the text context ceiling.
+    std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
