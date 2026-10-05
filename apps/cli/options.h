@@ -39,6 +39,7 @@ struct Options {
     RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
+    std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool use_cuda_graph = true;
 
     bool raw_output      = false;

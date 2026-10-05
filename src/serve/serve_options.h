@@ -54,6 +54,7 @@ struct ServeOptions {
     RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
+    std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

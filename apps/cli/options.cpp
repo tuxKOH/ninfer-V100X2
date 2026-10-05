@@ -129,7 +129,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -138,14 +138,16 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--ram-kv-window enables experimental approximate lexical RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
+           "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
+           "independently of text context; smaller budgets reduce reserved Vision memory.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
-           "two GPUs and requires --devices; it supports --spec mtp and --spec dflash, but "
-           "not --vision.\n"
+           "two GPUs and requires --devices; it supports --spec mtp, --spec dflash and "
+           "--vision.\n"
            "--tp 4 supports SM70 Qwen3.8-27B NVFP4 and native FP8 Text/MTP; use --devices 0,1,2,3. Vision and DFlash "
            "remain unsupported at this width.\n"
            "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
@@ -240,6 +242,8 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-max-tokens") {
+            options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens");
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
@@ -314,6 +318,9 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.vision_max_tokens == 0 || options.vision_max_tokens > kMaximumVisionTokenBudget) {
+        throw std::invalid_argument("--vision-max-tokens must be in [1,32768]");
+    }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }

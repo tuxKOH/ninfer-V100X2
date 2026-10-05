@@ -51,8 +51,13 @@ up to seven. DFlash cannot be combined with `--vision`. A later request cannot e
 omitted at startup.
 
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
-distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2 at
-TP2, but rejects `--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
+distinct device per rank. The 27B package supports `--spec mtp`, optional Qwen3.8 DFlash2, and
+execution-qualified `--vision` at TP2. Vision weights and encoding reside only on the primary
+rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
+the same three-axis positions and per-request RoPE delta. Vision requests participate in the
+same compact concurrent decode batches as text requests. Vision requires additional startup
+memory; lower the text-only context profile rather than simply appending `--vision` to a
+near-capacity command. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
 `--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
 profile. The 35B-A3B package has no TP2 path, but it can use two GPUs as a single-device compute
@@ -211,9 +216,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
+media-token expansion, the result must fit Engine `--max-context`. The separately configurable
+`--vision-max-tokens` limits merged visual tokens across the prompt (four raw patches per merged
+token); it defaults to 32,768, and the effective Vision limit is
+`min(--max-context, --vision-max-tokens)`. Both its media-processing allowance and the startup
+Vision scratch/output reservations use this bound. A smaller visual-token budget leaves room for
+long text context on memory-constrained hardware; exceeding the media budget returns an error,
+not a shorter image. There is no fixed image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
@@ -556,6 +565,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |

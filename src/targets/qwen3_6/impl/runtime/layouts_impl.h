@@ -622,9 +622,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
-        const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
+        const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
             merged, std::min(merged, kFrontendSegmentLimit));
     }
@@ -677,6 +676,10 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
+    }
+    if (options.vision_max_tokens == 0 ||
+        options.vision_max_tokens > kMaximumVisionTokenBudget) {
+        throw std::invalid_argument("vision_max_tokens must be in [1,32768]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = options.ram_kv.gpu_tokens != 0
@@ -736,9 +739,11 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         throw std::invalid_argument("tensor-parallel width must be 1, 2 or 4");
     }
     if (options.tp > 1) {
-        // MTP and DFlash2 have explicit split schedules. Vision remains single-device.
-        if (options.enable_vision) {
-            throw std::invalid_argument("tensor-parallel execution does not support Vision");
+        // MTP and DFlash2 have explicit split schedules. Vision encodes on the primary rank and
+        // replicates the composed residual to the peer (see TextContext::prefill_impl_tp2);
+        // the TP4 route does not carry Vision.
+        if (options.tp == 4 && options.enable_vision) {
+            throw std::invalid_argument("--tp 4 does not support Vision");
         }
     }
     if (options.tp == 4 && options.speculative.backend == SpeculativeBackend::DFlash) {
@@ -758,6 +763,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->weights_profile     = inputs.weights_profile;
     impl->capacity            = inputs.capacity;
+    impl->vision_max_tokens   = inputs.vision_max_tokens;
     impl->main_page_groups    = main_page_groups;
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
@@ -795,10 +801,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
         impl->request_transient_capacity_bytes =
-            schedule::VisionContext::output_transient_bytes(merged);
+            schedule::VisionContext::output_transient_bytes(impl->vision_max_tokens);
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
@@ -892,6 +896,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
+        .vision_max_tokens   = std::min(options.max_context, options.vision_max_tokens),
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,

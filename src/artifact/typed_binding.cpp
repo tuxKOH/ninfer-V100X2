@@ -171,6 +171,10 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
         binder.materialize_on_device(handle);
+    } else if (placement == TensorPlacement::PrimaryDevice) {
+        // Whole tensor on the primary rank. Reuses the storage-mode primitive instead of a
+        // second placement entry point.
+        binder.materialize_on_device(handle, 0);
     } else {
         binder.validate_only(handle);
     }

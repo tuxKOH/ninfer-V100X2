@@ -18,6 +18,7 @@ inline constexpr std::size_t kVirtualStorageDevices = 2;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
+    PrimaryDevice,
     ValidateOnly,
 };
 

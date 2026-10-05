@@ -56,10 +56,10 @@ void require_supported_tp_features(const EngineOptions& options) {
     // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
     // verify round records and folds per device. DFlash has a separate split-aware proposal path;
     // its rank-0-only selector gather is deliberately not a full bidirectional all-gather.
-    // The Vision encoder runs entirely on the primary device against replicated weights and has no
-    // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
-    if (options.enable_vision) {
-        throw std::invalid_argument("tensor-parallel execution does not support Vision; use --tp 1");
+    // Vision encodes on the primary rank and replicates the composed residual to the peer
+    // (see TextContext::prefill_impl_tp2); the TP4 route does not carry Vision.
+    if (options.tp == 4 && options.enable_vision) {
+        throw std::invalid_argument("--tp 4 does not support Vision");
     }
     if (options.tp == 4 && options.speculative.backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--tp 4 supports Text/MTP, not DFlash");
