@@ -153,8 +153,11 @@ NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
 
 It checks real multimodal prefill, cross-chunk image lifetime, shifted MTP alignment,
 same-media reuse, changed/appended media, and visual prefix bridges. To verify actual concurrent
-HTTP generation, start the README's Vision profile with `--port 18081 --no-thinking --greedy
---request-log-jsonl /tmp/ninfer-vision.jsonl --log-stats-interval-ms 500`, then run with Python 3.11:
+HTTP generation, use the README's experimental Vision server profile with port `18081`,
+`--max-concurrency 2`, `--vision-max-tokens 2048`, `--greedy`,
+`--request-log-jsonl /tmp/ninfer-vision.jsonl` and `--log-stats-interval-ms 500` (retain
+`--no-prefix-reuse`). These larger reservations require additional free GPU memory. Then run
+with Python 3.11:
 
 ```bash
 /path/to/python3.11 tools/v100/check_vision_http.py --request-log /tmp/ninfer-vision.jsonl
@@ -234,6 +237,20 @@ python3 tools/smoke/serve_thinking_preservation.py \
 
 The shared messages are in
 [`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
+
+### Experimental TP2 Vision status
+
+The TP2 Vision path is opt-in and not fully qualified on the local two V100-SXM2 16 GB cards.
+With the official Qwen3.8-27B NVFP4 artifact, INT8 group-64 KV, 4096 capacity, 1024 prefill chunks
+and optimized-head MTP3, `ninfer_qwen3_6_27b_vision_tp2_real_test` repeatedly fails its visual-prefix
+bridge greedy-output comparison at the first output token. Earlier cross-chunk image lifetime,
+same/changed/appended-media reuse and stop/resume checks complete before this failure.
+
+The differing candidates are not an exact BF16 tie, but this does not by itself establish a state
+bug or a model-quality regression. The cause remains unresolved; no numerical criterion has been
+relaxed and the failing test is retained. The recommended experimental Vision server uses
+`--no-prefix-reuse` to avoid this cache path, not as evidence that the complete Vision route has
+passed qualification.
 
 ## What belongs here
 

@@ -13,16 +13,60 @@
 
 面向 **两张 Tesla V100-SXM2 16 GB、CUDA 12.8、SM70** 的 Qwen3.8-27B 高速推理分支，
 重点优化单个活跃请求。由上游 RTX 3060 TP2 路线与 `geoffwatts/ninfer-v100` 的 Volta
-实现结合而来。本文只介绍本分支的改动和本机测量，不把上游 RTX 5090 等平台的结果当作 V100 成绩。
+实现结合而来。本文介绍本分支的改动和实测；外部源模型质量评测单独标明，
+不把上游 RTX 5090 等平台的结果当作 V100 成绩。
 
-采用 TP2 **分张量**执行，不是 32/32 层的分层卸载。默认启动脚本使用 LM Studio GGUF
-转换得到的 Q4_K_M `.ninfer`；也支持官方 Qwen3.8-27B NVFP4 v3 容器。
-常用配置为 180000-token 容量、完整 INT8 group-64 KV、CUDA Graph 和 MTP3。
+采用 TP2 **分张量**执行，不是 32/32 层的分层卸载。**纯文本推理主推 QUASAR NVFP4 v3**，
+通用任务用 180000-token 容量、完整 INT8 group-64 KV、CUDA Graph 和 MTP3；高接受率
+结构化输出可选 98304 容量的 DFlash7。官方 NVFP4 和 GGUF 衍生 Q4_K_M 仍可使用。
+启动脚本未传模型时仍默认 Q4_K_M；下方[推荐启动命令](#cli-和-api-启动)显式选择 QUASAR。
 “MTP 3-0”在这里是最多提出三个草稿 token、允许接受零个，不保证每轮接受三个。
 
 **容量不等于实际上下文占用。** 下表中的 85K 是实际输入 85000 token；180K 是容量上限。
 Decode 只统计已提交输出，不把被拒绝的草稿算入吞吐。NVFP4 和 Q4_K_M 使用不同量化权重，
 这些表不是两种量化的质量等价证明。
+
+## 主推模型：QUASAR NVFP4
+
+使用 [QUASAR NInfer v3 成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3)。
+本机[实测](#quasar-nvfp4) MTP3 在 3072-token 代码输入下达到 **139.80 tok/s**，
+85K-token 代码输入热请求为 **100.34 tok/s**，均为已提交 wall decode。
+DFlash7 在原生 32 条 JSONL 任务达到 **249.00 tok/s**，85K 输入为 **153.12 tok/s**。
+这些是具体任务成绩，DFlash 并非所有任务都比 MTP 快。
+
+维护者个人实际体验是跟 FP8 一档的。
+
+公开的**源模型质量评测**显示多项任务分数接近 BF16，但不等于数学无损。
+[QUASAR 作者模型卡](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4#quality-and-size-comparison)
+报告 GPQA-D 两轮共 396 个答案、AIME'26 三轮共 90 个答案：
+
+| 源模型 | GPQA-D（%） | AIME'26（%） |
+|---|---:|---:|
+| BF16 原模型 | 91.41 | 100.0 |
+| QUASAR NVFP4 | 90.91 | 100.0 |
+
+[Rieker 的独立对比](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/192)采用 DGX Spark GB10、
+vLLM、FP8 KV 和 MTP5，不是本机 V100 路线。MBPP/HumanEval/GSM8K 关闭 thinking，
+分别测 257/164/500 题；PPL 使用 323 个窗口，文本 KLD 使用 49 条提示：
+
+| 源模型 | MBPP（%） | HumanEval（%） | GSM8K（%） | PPL ↓ | 文本 KLD ↓ |
+|---|---:|---:|---:|---:|---:|
+| BF16 原模型 | 70.8 | 93.3 | 97.0 | 7.993 | 参照 |
+| 官方 FP8 | 69.3 | 95.1 | 97.4 | 8.029 | 0.0117 |
+| QUASAR NVFP4 | 68.9 | 93.9 | 96.8 | 8.247 | 0.0682 |
+
+任务准确率接近 BF16，分布保真度则不等同于 FP8。两项公开评测均不代表本分支转换后
+`.ninfer` 成品的 V100 质量实测；我们的推理检查也不等于全面质量评分。V100 反量化执行，
+没有开启 A4 激活量化；v3 是容器升级，不是一次新的 QAT。
+
+**限制：本分支 QUASAR 不支持视觉。** 源模型和公开容器包含视觉数据，但当前运行时拒绝
+QUASAR 图像／视频请求，两卡均不上传视觉权重。MTP3 每卡权重为 8.66 GiB，完整模型文件
+占磁盘 18.42 GiB。
+
+TP2 Vision 是 [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1) 引入的**实验性、可选功能**，
+默认关闭，不会为 QUASAR 开启视觉。本机视觉前缀 bridge 测试未通过：缓存与冷 prefill
+产生不同的 greedy 输出，原因仍未确定。建议采用[禁用前缀复用的视觉 API 配置](#实验性-tp2-视觉)，
+避开尚未通过验证的视觉缓存路径。视觉需要额外显存；TP4 Vision、DFlash 加视觉仍不支持。
 
 ## 本分支的改动
 
@@ -227,12 +271,12 @@ NInfer 自动启用已有 direct P2P 路径。**这是 PCIe P2P，不是 NVLink�
 两区使用同一套启动命令；NInfer 在启动时依据实际双向通信检查自动选择路径。
 `iommu=pt` 本身不是 P2P 成功证明，`nvidia-smi topo -m` 的 PHB 标签也不是。
 
-### QUASAR NVFP4 试跑
+### QUASAR NVFP4
 
-新增独立的 `qwen3.8-27b/quasar-nvfp4` 实验配置，用公开 Engine 加载
+主推的 `qwen3.8-27b/quasar-nvfp4` 配置用公开 Engine 加载
 [QUASAR NInfer v3 成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)。
-开放 SM70 TP2 Text/普通解码/MTP/DFlash，不替换默认模型；保留原始 codes/scales 和全部
-256 对激活缩放参数。QUASAR 是 QAT，不是数学上的无损压缩；成品转换也含 BF16/W8
+开放 SM70 TP2 Text/普通解码/MTP/DFlash；启动脚本的历史默认不变，推荐显式选用 QUASAR。
+保留原始 codes/scales 和全部 256 对激活缩放参数。QUASAR 是 QAT，不是数学上的无损压缩；成品转换也含 BF16/W8
 精度边界，详见 [模型存储合同](docs/maintainer/qwen3.8-27b-artifact.md#13-quasar-trial-artifact)。
 
 Attention/GDN 输入与输出权重现已和 MLP 一样，加载时进入 Volta QPN 布局；窄输入直接
@@ -415,7 +459,7 @@ greedy optimized MTP3、CUDA Graph，各实现测两轮冷请求：
 通信平均延迟降低 44.33%，**不等于整段推理快 44.33%**。两路径的精确传输、
 不整齐 shape、guard 和 64 连续轮检查通过。
 
-Q4_K_M 与 NVFP4 v3 的真实 MTP、前缀缓存回归通过：Graph/eager 输出、logits、接受状态和
+Q4_K_M 与 NVFP4 v3 的真实**纯文本** MTP、前缀缓存回归通过：Graph/eager 输出、logits、接受状态和
 复用前沿一致；两个 probe 的 MTP/plain 32-token 序列一致；各检查 64 个 teacher-forcing
 位置，无分歧、worst emitted-logit deficit=0。前缀覆盖重复恢复、追加、前缀变更、
 精确前沿、接受轮内提前停止、改写回复后的恢复和恢复后采样。
@@ -583,8 +627,18 @@ cmake --build build-v100 -j2
 
 构建并发按本机情况调整，保留交互余量，整机 CPU 使用率不要超过约 85%。
 模型、原始语料和 profiler 文件是本地前提，不随代码仓库提交；C++ 产品只读取 `.ninfer`。
-NVFP4 可使用 [Neroued 官方容器](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)，
-本机放在 `/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer`。
+主推 QUASAR，使用现有 Hugging Face CLI 下载固定 v3 成品并校验发布者 checksum，
+无需本机转换权重：
+
+```bash
+hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer SHA256SUMS \
+  --revision v3 --local-dir /Models/ninfer-V100X2/quasar-v3
+(cd /Models/ninfer-V100X2/quasar-v3 && sha256sum --check SHA256SUMS)
+```
+
+其他可选配置：NVFP4 可使用 [Neroued 官方容器](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)，
+本机路径为 `/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer`。
 
 需要从本地 LM Studio GGUF 转换 Q4_K_M 时，用含 NumPy 的 Python 3.11 环境，例如本机 `.venv`：
 
@@ -599,38 +653,35 @@ GGUF 衍生身份只支持 Text/MTP，保留的 Vision 对象仅用于验证，�
 
 ## CLI 和 API 启动
 
-Q4_K_M 使用默认双卡脚本，180K 容量、4096-token chunk、INT8 KV、MTP3：
+推荐 QUASAR，显式选择模型，180K 容量、2560-token chunk、INT8 KV、optimized-head MTP3：
 
 ```bash
+NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+NINFER_V100X2_PREFILL_CHUNK=2560 \
 tools/v100/ninfer-v100x2.sh \
   --prompt "用 Python 实现一个有容量上限的任务队列，并解释测试方法。" \
   --max-new 512 --greedy --no-thinking
 ```
 
-NVFP4 换模型并使用 **3072-token chunk**；本机 NVFP4、180K 容量时，4096-token chunk 不够显存：
-
-如果桌面等进程占用显存导致 3072 无法通过启动余量检查，将下列 chunk 改为 2560；
-不要削减安全余量。上面的 prefill 更新已验证这个配置。
-
-```bash
-NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
-NINFER_V100X2_PREFILL_CHUNK=3072 \
-tools/v100/ninfer-v100x2.sh \
-  --prompt "用 Python 实现一个有容量上限的任务队列，并解释测试方法。" \
-  --max-new 512 --greedy --no-thinking
-```
-
-NVFP4、180K、MTP3 API 启动命令：
+QUASAR、180K、MTP3 API 启动命令：
 
 ```bash
 env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 8080 \
   --tp 2 --devices 0,1 --max-concurrency 1 \
-  --max-context 180000 --kv-capacity 180000 --kv-dtype int8 --prefill-chunk 3072 \
+  --max-context 180000 --kv-capacity 180000 --kv-dtype int8 --prefill-chunk 2560 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --default-max-tokens 65536 --no-thinking
 ```
+
+DFlash7 将上面两项容量均改为 `98304`，chunk 改为 `1024`；草稿选项换成
+`--spec dflash --draft-tokens 7`，去掉 `--lm-head-draft`，匹配 full-head 实测配置。
+QUASAR 两种配置均不支持视觉。
+
+Q4_K_M 仍可直接使用不带模型覆盖的默认脚本，默认 chunk 为 4096；官方 NVFP4 则显式指定
+`NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer`，并使用 3072-token
+chunk。桌面进程占显存导致 3072 无法通过启动余量检查时，改为 2560，不要削减安全余量。
 
 `--default-max-tokens 65536` 是未指定输出长度时的默认值，仍受剩余上下文容量限制。
 服务默认复用兼容前缀；`--no-prefix-reuse` 用于强制冷提示对照。
@@ -648,6 +699,25 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 还提供 `/v1/responses`、`/v1/messages`、`/health` 和 `/v1/models`。
 流式输出、tool calls、鉴权及状态语义见[HTTP 文档](docs/serving.md)，具体参数以程序 `--help` 为准。
 
+### 实验性 TP2 视觉
+
+使用官方 NVFP4 成品，不能使用 QUASAR 或 GGUF 衍生 Q4_K_M。在双 16 GB 卡上先用较小的
+文本/KV 容量和视觉预算；下面不是最大容量实测配置。`--vision-max-tokens` 限制合并后的视觉
+token 数，完整文本加媒体提示仍需满足 `--max-context`。
+
+```bash
+env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8080 --tp 2 --devices 0,1 --max-concurrency 1 \
+  --max-context 4096 --kv-capacity 4096 --kv-dtype int8 --prefill-chunk 1024 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --vision --vision-max-tokens 1024 --no-prefix-reuse --default-max-tokens 512 --no-thinking
+```
+
+这会关闭该服务器所有请求的 Engine 前缀复用，包括文本请求；独立的不可变媒体预处理缓存
+不受影响。上面的 QUASAR 文本配置仍保留前缀缓存。
+参见[媒体请求示例](docs/serving.md#multimodal-request)与[视觉测试已知限制](tests/README.md#experimental-tp2-vision-status)。
+
 ## 致谢与许可
 
 基础来自 [Neroued/ninfer](https://github.com/Neroued/ninfer)、RTX 3060 TP2 路线和
@@ -659,10 +729,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 原生原型采用 token 匹配检索，不是其 Q/K 向量检索移植；只让部分历史参与注意力是近似模式，
 必须显式开启，默认完整上下文注意力不变。
 
+感谢 [Li3age](https://github.com/Li3age) 在
+[PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1) 贡献 TP2 Vision 和可配置视觉 token 预算。
+
 模型来自 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)，NVFP4 的混合 FP8/NVFP4
 权重来自 [Unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)，容器由
 [Neroued](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) 打包。
-QUASAR 试跑使用 [QUASAR-QAT 的模型](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)，
+主推 QUASAR 使用 [QUASAR-QAT 的模型](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)，
 以及 [MirkoCovizzi 的 NInfer 转换成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)。
 
 本项目采用 [Apache-2.0](LICENSE)；归属声明见 [NOTICE](NOTICE)，第三方依赖保留各自许可。

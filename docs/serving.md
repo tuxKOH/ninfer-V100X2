@@ -51,8 +51,9 @@ up to seven. DFlash cannot be combined with `--vision`. A later request cannot e
 omitted at startup.
 
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
-distinct device per rank. The 27B package supports `--spec mtp`, optional Qwen3.8 DFlash2, and
-execution-qualified `--vision` at TP2. Vision weights and encoding reside only on the primary
+distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2.
+Experimental `--vision` is available at TP2 for artifacts with execution-qualified Vision weights;
+QUASAR and GGUF-derived Q4_K_M still reject it. Vision weights and encoding reside only on the primary
 rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
 the same three-axis positions and per-request RoPE delta. Vision requests participate in the
 same compact concurrent decode batches as text requests. Vision requires additional startup
@@ -66,6 +67,12 @@ and pass the other GPU with `--storage-device`; this requires peer access and le
 KV, GDN, and scheduling on the primary GPU.
 
 Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
+The visual-prefix bridge test fails on this two-card SM70 host; the difference has not been
+established as either a state bug or floating-point path variation. For experimental TP2 Vision,
+the recommended server profile uses `--no-prefix-reuse` to avoid that unqualified cache path.
+This flag disables Engine prefix reuse for text requests on the same server too, but does not
+disable the immutable-media preprocessing cache. The text-only recommendation is unchanged.
+See [test status](../tests/README.md#experimental-tp2-vision-status).
 The new SM70 `--tp 4 --devices 0,1,2,3` route is limited to Qwen3.8-27B NVFP4/native FP8
 Text/MTP and has completed its four-card state, prefix and performance qualification. It uses
 the same Engine and HTTP protocols; it is not a separate serving backend. Native FP8 requires

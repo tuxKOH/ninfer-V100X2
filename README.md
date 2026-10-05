@@ -12,16 +12,65 @@ Performance results are separated into [P2P enabled](#p2p-enabled) and
 [P2P disabled](#p2p-disabled); build and launch instructions are shared below.
 
 This fork is tuned for one-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**
-(`sm_70`, CUDA 12.8). Its default profile uses the LM Studio Q4_K_M-derived `.ninfer` artifact,
-180,000-token context capacity, complete INT8 group-64 KV, TP2, CUDA Graphs, and MTP with up to
-three drafts (zero accepted drafts is valid). Context capacity is an allocation limit, not the
-number of prompt tokens in a benchmark.
+(`sm_70`, CUDA 12.8). **QUASAR NVFP4 v3 is the recommended model for text inference**, with
+TP2, complete INT8 group-64 KV and CUDA Graphs. Use MTP3 at 180,000-token capacity for general
+tasks; DFlash7 at 98,304-token capacity is an alternative for high-acceptance structured output.
+Context capacity is an allocation limit, not the number of prompt tokens in a benchmark.
+The convenience launcher's unmodified default is still the LM Studio Q4_K_M-derived artifact;
+the [launch commands](#build-and-run) explicitly select QUASAR.
 
 The starting point combines the RTX 3060 TP2 work and the Volta implementation from
 [`geoffwatts/ninfer-v100`](https://github.com/geoffwatts/ninfer-v100), based on
-[Neroued/ninfer](https://github.com/Neroued/ninfer). This README contains V100X2-specific changes
-and measurements only; inherited RTX 5090/Ampere/Ada results and general upstream capabilities are
-intentionally omitted.
+[Neroued/ninfer](https://github.com/Neroued/ninfer). This README focuses on V100X2-specific changes
+and measurements, with external source-checkpoint quality evaluations labeled separately.
+Inherited RTX 5090/Ampere/Ada results and general upstream capabilities are intentionally omitted.
+
+## Recommended model: QUASAR NVFP4
+
+Use the [QUASAR NInfer artifact, release v3](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3).
+On this host, [measured QUASAR throughput](#quasar-nvfp4) reaches **139.80 tok/s** on a
+3,072-token coding input and **100.34 tok/s** after warming an 85,000-token coding input
+(MTP3, committed wall decode). DFlash7 reaches **249.00 tok/s** on the native 32-record JSONL
+task, or **153.12 tok/s** with 85,000 input tokens. These are workload-specific results;
+DFlash is not faster on every task.
+
+Maintainer's personal experience: "It feels in the same tier as FP8."
+
+Public **source-checkpoint quality** results support near-BF16 task accuracy, not mathematical
+losslessness. The [QUASAR authors' model card](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4#quality-and-size-comparison)
+reports GPQA-D over two runs (396 answers) and AIME'26 over three repeats (90 answers):
+
+| Source checkpoint | GPQA-D (%) | AIME'26 (%) |
+|---|---:|---:|
+| BF16 original | 91.41 | 100.0 |
+| QUASAR NVFP4 | 90.91 | 100.0 |
+
+[Rieker's independent comparison](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/192)
+uses a DGX Spark GB10 with vLLM, FP8 KV and MTP5, not this V100 runtime. MBPP/HumanEval/GSM8K
+use thinking off, with 257/164/500 cases; PPL uses 323 windows and text KLD uses 49 prompts:
+
+| Source checkpoint | MBPP (%) | HumanEval (%) | GSM8K (%) | PPL ↓ | Text KLD ↓ |
+|---|---:|---:|---:|---:|---:|
+| BF16 original | 70.8 | 93.3 | 97.0 | 7.993 | reference |
+| Official FP8 | 69.3 | 95.1 | 97.4 | 8.029 | 0.0117 |
+| QUASAR NVFP4 | 68.9 | 93.9 | 96.8 | 8.247 | 0.0682 |
+
+Task scores are close to BF16, but distribution fidelity is not equal to FP8. Neither public
+evaluation measures this converted `.ninfer` artifact on V100; broad quality equivalence is
+not established by our inference checks. V100 dequantizes these weights without A4 activation
+quantization. V3 is a container upgrade, not a new QAT checkpoint.
+
+**Limitation: QUASAR is text-only in this fork.** The source checkpoint and published container
+include Vision, but this runtime rejects QUASAR image/video requests and uploads zero Vision
+weights. MTP3 uses 8.66 GiB of weights per card; the full artifact occupies 18.42 GiB on disk.
+Official NVFP4 and GGUF-derived Q4_K_M remain supported alternatives.
+
+TP2 Vision is an **experimental, opt-in feature** from [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1).
+It is disabled by default and does not enable QUASAR Vision. Its visual-prefix bridge test
+fails on this host because cached and cold prefill produce different greedy continuations;
+the cause remains unresolved. Use the [cold-request Vision server profile](#experimental-tp2-vision)
+with `--no-prefix-reuse` to avoid this unqualified cache path. Enabling Vision requires extra
+GPU memory; TP4 Vision and DFlash plus Vision remain unsupported.
 
 ## V100X2 changes
 
@@ -270,13 +319,14 @@ NInfer automatically enables direct P2P. No inference algorithm or weight change
 for the MTP P2P A/B evaluation. Both transport areas use the same launch commands; startup
 qualifies the actual bidirectional copy route. `iommu=pt` alone does not prove working P2P.
 
-#### QUASAR NVFP4 trial
+#### QUASAR NVFP4
 
 The separate `qwen3.8-27b/quasar-nvfp4` profile now loads the published
 [QUASAR NInfer v3 artifact](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)
-through the public Engine. It admits SM70 TP2 Text/None/MTP/DFlash; the default model
-is unchanged. Source codes/scales and all 256 activation-divisor pairs are retained. QUASAR is
-QAT, not mathematically lossless compression, and the conversion includes BF16/W8 boundaries.
+through the public Engine. It admits SM70 TP2 Text/None/MTP/DFlash and is the recommended text
+model; the convenience launcher's default is unchanged. Source codes/scales and all 256
+activation-divisor pairs are retained. QUASAR is QAT, not mathematically lossless compression,
+and the conversion includes BF16/W8 boundaries.
 See the [artifact contract](docs/maintainer/qwen3.8-27b-artifact.md#13-quasar-trial-artifact).
 
 Attention/GDN input and output weights now join MLP in the load-time Volta QPN layout; narrow
@@ -466,7 +516,7 @@ The 10 KiB BF16 all-reduce measured 26.6085 µs mean, 25.901 µs p50 and 43.910 
 **44.33% lower communication latency**, not 44.33% end-to-end inference improvement. Both
 paths passed exact-transfer, uneven-shape, guard and 64-consecutive-round checks.
 
-Q4_K_M and NVFP4 v3 passed the real TP2 MTP and prefix-cache regressions. Graph/eager outputs,
+Q4_K_M and NVFP4 v3 passed the real **text-only** TP2 MTP and prefix-cache regressions. Graph/eager outputs,
 logits, acceptance and retained frontiers agree; each artifact had zero disagreements at
 64 teacher-forcing positions. At a 3,274-token prompt, median cold/cached TTFT was
 3.33492 s / 16.8689 ms for Q4_K_M and 3.01954 s / 14.6475 ms for NVFP4.
@@ -724,7 +774,44 @@ cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-v100 -j2
 ```
 
-Convert the local LM Studio source model once (Python 3.11 with NumPy):
+For the recommended QUASAR model, download the published v3 container with an existing Hugging
+Face CLI and verify the publisher's checksum (no local weight conversion is needed):
+
+```bash
+hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer SHA256SUMS \
+  --revision v3 --local-dir /Models/ninfer-V100X2/quasar-v3
+(cd /Models/ninfer-V100X2/quasar-v3 && sha256sum --check SHA256SUMS)
+```
+
+Run QUASAR with TP2, 180K capacity, 2560-token prefill chunks, INT8 KV and optimized-head MTP3:
+
+```bash
+NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+NINFER_V100X2_PREFILL_CHUNK=2560 \
+tools/v100/ninfer-v100x2.sh \
+  --prompt "Explain prefill and decode in three sentences." \
+  --max-new 128 --greedy --no-thinking
+```
+
+Start its OpenAI/Anthropic API with the same MTP3 profile:
+
+```bash
+env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --tp 2 --devices 0,1 --max-concurrency 1 \
+  --max-context 180000 --kv-capacity 180000 --kv-dtype int8 --prefill-chunk 2560 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --default-max-tokens 65536 --no-thinking
+```
+
+For DFlash7, set both capacities to `98304`, the chunk to `1024`, and replace the speculative
+options with `--spec dflash --draft-tokens 7`, omitting `--lm-head-draft` to match the full-head
+measurements. Output length is bounded by remaining context. See [serving](docs/serving.md)
+for requests and streaming. Neither QUASAR profile supports Vision.
+
+For the alternative Q4_K_M profile, convert the local LM Studio source once (Python 3.11 with NumPy):
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.convert_gguf \
@@ -733,7 +820,7 @@ python3 -m tools.convert.qwen3_8_27b.convert_gguf \
   --out /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
 ```
 
-Run a request with the V100X2 defaults (devices `0,1`, 180K capacity, 4K prefill chunks, INT8 KV,
+Run Q4_K_M with the unchanged launcher defaults (devices `0,1`, 180K capacity, 4K prefill chunks, INT8 KV,
 MTP3 and optimized draft head):
 
 ```bash
@@ -751,6 +838,27 @@ The current P2P corpus is local at `profiles/bench/v100-code-85000-iommu-pt.ids`
 measurements used `/tmp/v100-code-85000.ids`. Corpora, model artifacts and raw profiler reports
 are not included in the repository. See [performance methodology](docs/performance.md) for
 corpus generation, benchmark commands and additional qualifications.
+
+### Experimental TP2 Vision
+
+Use the official NVFP4 artifact, not QUASAR or GGUF-derived Q4_K_M. Start with a small text/KV
+capacity and visual-token budget on the two 16 GB cards; the command below is not a measured
+maximum-capacity profile. `--vision-max-tokens` bounds merged visual tokens, while the complete
+text-plus-media prompt must also fit `--max-context`.
+
+```bash
+env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8080 --tp 2 --devices 0,1 --max-concurrency 1 \
+  --max-context 4096 --kv-capacity 4096 --kv-dtype int8 --prefill-chunk 1024 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --vision --vision-max-tokens 1024 --no-prefix-reuse --default-max-tokens 512 --no-thinking
+```
+
+This disables Engine prefix reuse for all requests on this server, including text. It does not
+disable the separate immutable-media preprocessing cache. The normal QUASAR text profile above
+keeps prefix reuse. See [multimodal requests](docs/serving.md#multimodal-request) and
+[known Vision test limitation](tests/README.md#experimental-tp2-vision-status).
 
 ## Verification
 
@@ -784,11 +892,14 @@ consulted [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM). DFlash2 follo
 The native prototype uses lexical retrieval, not KVMem's Q/K-vector retrieval; selective-history
 attention is approximate and explicitly opt-in. The default profile retains full-context attention.
 
+[Li3age](https://github.com/Li3age) contributed TP2 Vision and the configurable visual-token
+budget in [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1).
+
 The measured models derive from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
 The NVFP4 artifact uses the mixed FP8/NVFP4 weights from
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4), packaged by
 [Neroued](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
-The separate QUASAR trial uses [QUASAR-QAT's checkpoint](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
+The recommended QUASAR profile uses [QUASAR-QAT's checkpoint](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
 and [MirkoCovizzi's NInfer conversion](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer).
 
 NInfer and this fork are licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for required

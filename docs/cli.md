@@ -64,6 +64,10 @@ exclusive. The default speculative and Vision settings produce the smallest resi
 default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
 fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
 context without promising to process images or videos beyond that separate budget.
+TP2 Vision is experimental on the two 16 GB V100 profile. Its visual-prefix bridge integration
+test currently fails on that host; see [test status](../tests/README.md#experimental-tp2-vision-status).
+CLI processes do not share Engine prefix state. For a persistent Vision server, the recommended
+profile uses the server option `--no-prefix-reuse` to avoid the unqualified multimodal cache path.
 
 ## Structured messages
 
@@ -239,8 +243,10 @@ device used at the default `--tp 1`; when both are given they must agree on the 
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
-`--tp 2` at startup. `--spec mtp`, optional Qwen3.8 DFlash2, and execution-qualified `--vision`
-are supported at `--tp 2`, including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
+`--tp 2` at startup. `--spec mtp` and optional Qwen3.8 DFlash2 support `--tp 2`, including
+compatible-prefix reuse in a resident Engine. Experimental `--vision` is also available at TP2
+for artifacts with execution-qualified Vision weights; QUASAR and GGUF-derived Q4_K_M reject it.
+Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
 
