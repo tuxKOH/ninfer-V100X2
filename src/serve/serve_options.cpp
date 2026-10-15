@@ -135,6 +135,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --pending-timeout-ms defaults to 30000 and bounds preparation plus admission wait; 0 disables the deadline\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
@@ -405,9 +406,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
-    }
-    if (options.pending_timeout_ms == 0) {
-        throw std::invalid_argument("--pending-timeout-ms must be positive");
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");

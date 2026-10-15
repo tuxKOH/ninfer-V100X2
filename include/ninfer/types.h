@@ -126,6 +126,9 @@ struct EngineOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
+    // Absolute bound from lifetime acquisition to admission: it covers media acquisition, prompt
+    // preparation and time spent waiting behind another request's prefill (one prefill owner at a
+    // time). Zero disables the deadline entirely, so a request waits as long as the Engine needs.
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;

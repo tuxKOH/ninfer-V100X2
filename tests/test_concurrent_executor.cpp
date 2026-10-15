@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -36,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -168,6 +170,13 @@ struct GenerationScript {
     // When set, decode_batch throws instead of licensing the token at this index. This is the
     // engine-scope leg: a Program/CUDA failure, not an output-session failure.
     int throw_at_decode_index = -1;
+    // Number of prefill steps; the first token is licensed on the FINAL step and earlier steps
+    // only make bounded progress. Because the Engine admits at most one prefill owner and refuses
+    // admission while any prefill is in flight, a multi-step prefill is how a test holds the
+    // admission gate shut. Each step sleeps |prefill_step_delay| so the worker observes real
+    // wall-clock progress, and with it real admission boundaries, between steps.
+    std::uint32_t prefill_steps = 1;
+    std::chrono::milliseconds prefill_step_delay{0};
 };
 
 class ScriptedProgram {
@@ -175,6 +184,11 @@ public:
     explicit ScriptedProgram(std::uint32_t max_concurrency) : max_concurrency_(max_concurrency) {}
 
     void push_script(GenerationScript script) { queued_.push_back(std::move(script)); }
+
+    // Extra service-work quanta reserved on top of the output budget. Real plans include prefill
+    // work in service_work_quanta; this fixture charges one quantum per prefill step, so a
+    // multi-step script needs headroom or the projection is overdrawn mid-prefill.
+    void set_service_allowance(std::uint64_t quanta) { service_allowance_ = quanta; }
 
     [[nodiscard]] rt::AdmissionResources admission_capacity() const noexcept {
         return rt::AdmissionResources{
@@ -196,7 +210,7 @@ public:
             .transient_bytes         = 0,
             .transient_alignment     = 1,
             .admission = rt::AdmissionResources{.active_lanes = 1, .main_kv_pages = 1},
-            .service_work_quanta = output_tokens,
+            .service_work_quanta = output_tokens + service_allowance_,
         }};
     }
 
@@ -217,24 +231,21 @@ public:
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
                                              ScriptedPlan&& plan, rt::TransientRegion) {
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
-        Lane& state     = lanes_[lane];
-        state.script    = std::move(queued_.front());
+        Lane& state         = lanes_[lane];
+        state.script        = std::move(queued_.front());
         queued_.pop_front();
-        state.lifecycle = Lifecycle::Active;
-        state.emitted   = 0;
-        state.token     = license(lane);
-        return rt::PrefillStepResult{
-            .summary = rt::BeginSummary{.prompt_tokens = plan.summary().prompt_tokens,
-                                        .reused_prompt_tokens = 0,
-                                        .prefix_reuse_path = ninfer::PrefixReusePath::FullReset},
-            .round   = rt::GeneratedRound{.tokens = std::span<const TokenId>(&state.token, 1)},
-            .processed_prompt_tokens = prompt.summary().prompt_tokens,
-            .complete                = true,
-        };
+        state.lifecycle     = Lifecycle::Active;
+        state.emitted       = 0;
+        state.prompt_tokens = plan.summary().prompt_tokens;
+        state.prefill_done  = 0;
+        return prefill_step(lane);
     }
 
-    rt::PrefillStepResult advance_prefill_lane(std::uint32_t) {
-        throw std::logic_error("scripted prefill always completes in one step");
+    rt::PrefillStepResult advance_prefill_lane(std::uint32_t lane) {
+        if (lanes_[lane].lifecycle != Lifecycle::Active) {
+            throw std::logic_error("scripted prefill step no longer matches Program state");
+        }
+        return prefill_step(lane);
     }
 
     void resolve_prefill_lane(std::uint32_t lane, bool finished) {
@@ -334,10 +345,39 @@ private:
 
     struct Lane {
         GenerationScript script;
-        std::size_t emitted = 0;
-        TokenId token       = 0;
-        Lifecycle lifecycle = Lifecycle::Empty;
+        std::size_t emitted        = 0;
+        TokenId token              = 0;
+        std::uint32_t prompt_tokens = 0;
+        std::uint32_t prefill_done  = 0;
+        Lifecycle lifecycle        = Lifecycle::Empty;
     };
+
+    // One bounded prefill step. Earlier steps report progress without licensing; the final step
+    // licenses the first generated token and completes, exactly as the one-step fixture always did.
+    rt::PrefillStepResult prefill_step(std::uint32_t lane) {
+        Lane& state = lanes_[lane];
+        if (state.script.prefill_step_delay.count() > 0) {
+            std::this_thread::sleep_for(state.script.prefill_step_delay);
+        }
+        ++state.prefill_done;
+        if (state.prefill_done < state.script.prefill_steps) {
+            return rt::PrefillStepResult{
+                .summary                 = rt::BeginSummary{.prompt_tokens = state.prompt_tokens},
+                .round                   = rt::GeneratedRound{},
+                .processed_prompt_tokens = 1,
+                .complete                = false,
+            };
+        }
+        state.token = license(lane);
+        return rt::PrefillStepResult{
+            .summary = rt::BeginSummary{.prompt_tokens = state.prompt_tokens,
+                                        .reused_prompt_tokens = 0,
+                                        .prefix_reuse_path = ninfer::PrefixReusePath::FullReset},
+            .round   = rt::GeneratedRound{.tokens = std::span<const TokenId>(&state.token, 1)},
+            .processed_prompt_tokens = 1,
+            .complete                = true,
+        };
+    }
 
     TokenId license(std::uint32_t lane) {
         Lane& state = lanes_[lane];
@@ -358,6 +398,7 @@ private:
     std::deque<GenerationScript> queued_;
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
+    std::uint64_t service_allowance_ = 0;
 };
 
 struct ScriptedPackage {
@@ -436,11 +477,12 @@ Outcome run_request(Executor& executor, const q36::Frontend& frontend,
     }
 }
 
-ninfer::EngineOptions executor_options(std::uint32_t max_concurrency = 1) {
+ninfer::EngineOptions executor_options(std::uint32_t max_concurrency = 1,
+                                       std::uint32_t pending_timeout_ms = 30'000) {
     ninfer::EngineOptions options;
     options.max_concurrency      = max_concurrency;
     options.max_pending_requests = 4;
-    options.pending_timeout_ms   = 30'000;
+    options.pending_timeout_ms   = pending_timeout_ms;
     return options;
 }
 
@@ -658,6 +700,59 @@ void test_multi_row_isolation(const q36::Frontend& frontend,
     expect(program.all_lanes_idle(), "a lane was left active after a multi-row failure");
 }
 
+// Admission is gated on "no prefill owner": while one request is prefilling, the worker never
+// reaches the admission stage, so a queued request can only be served once that prefill finishes.
+// A single long prompt (an agent conversation with a huge reconstructed context) therefore holds
+// the gate shut for its whole prefill. The deadline policy is the only defense against starving
+// the queue: a bounded timeout fails the waiter, and a DISABLED timeout (0) lets it wait and then
+// complete. Both halves are asserted here with a scripted multi-step prefill.
+void test_admission_deadline_expiry_and_disable(const q36::Frontend& frontend,
+                                                const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kSlowPrefillSteps = 6;
+    constexpr auto kSlowPrefillStepDelay      = std::chrono::milliseconds(25);
+
+    const auto run = [&](std::uint32_t pending_timeout_ms) {
+        ScriptedInstance instance{.loaded =
+                                      std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                                  .program                = std::make_unique<ScriptedProgram>(2),
+                                  .request_memory         = {},
+                                  .kv_capacity_resolution = {}};
+        instance.program->set_service_allowance(kSlowPrefillSteps);
+        // A: holds the prefill owner across six slow steps, then decodes two more tokens.
+        instance.program->push_script(GenerationScript{.tokens = {0, 0, 0},
+                                                       .prefill_steps = kSlowPrefillSteps,
+                                                       .prefill_step_delay = kSlowPrefillStepDelay});
+        // B: single-step prefill; admissible only after A's prefill owner clears.
+        instance.program->push_script(GenerationScript{.tokens = {28, 29}});
+        ScriptedProgram& program = *instance.program;
+        Executor executor(instance, executor_options(2, pending_timeout_ms), device);
+
+        auto first  = submit_request(executor, frontend, 3);
+        auto second = submit_request(executor, frontend, 2);
+        const Outcome second_outcome = await(std::move(second));
+        const Outcome first_outcome  = await(std::move(first));
+        expect(program.all_lanes_idle(), "an admission-deadline case left a lane active");
+        return std::pair<Outcome, Outcome>{first_outcome, second_outcome};
+    };
+
+    // Bounded deadline (40 ms) is far shorter than A's ~150 ms prefill, so the waiter expires.
+    const auto bounded = run(40);
+    expect(bounded.first.ok && bounded.first.content == "xxx",
+           "the prefilling request was disturbed by the queued request's timeout");
+    expect(!bounded.second.ok, "a request behind a long prefill did not hit its admission deadline");
+    expect(bounded.second.error.find("expired while waiting for admission") != std::string::npos,
+           "the expired waiter did not report an admission queue timeout");
+
+    // Disabled deadline (0): the same waiter must survive the prefill and complete normally.
+    const auto disabled = run(0);
+    expect(disabled.first.ok && disabled.first.content == "xxx",
+           "the prefilling request failed while the waiter was unbounded");
+    expect(disabled.second.ok && disabled.second.content == "ab",
+           "a request with a disabled admission deadline did not complete after the prefill");
+    expect(disabled.second.finish_reason == ninfer::FinishReason::OutputLimit,
+           "the disabled-deadline waiter did not finish at its own token budget");
+}
+
 // The other half of the contract: a failure of the shared execution unit still fails every
 // request and takes the Engine out of service. Narrowing the boundary must not weaken this.
 void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
@@ -698,6 +793,7 @@ int main() {
     test_multi_row_isolation(frontend, device);
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);
+    test_admission_deadline_expiry_and_disable(frontend, device);
     test_engine_scope_failure_still_fails_all(frontend, device);
     return failures == 0 ? 0 : 1;
 }

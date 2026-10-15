@@ -49,7 +49,7 @@ public:
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            pending_timeout_.count() < 0 || options.max_pending_requests == 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
@@ -129,7 +129,7 @@ public:
                       Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
-            pending_deadline = submitted + pending_timeout_;
+            pending_deadline = admission_deadline(submitted);
         }
         if (submitted >= pending_deadline) {
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -239,6 +239,13 @@ public:
     }
 
 private:
+    // Absolute admission deadline measured from lifetime acquisition. A zero timeout disables it:
+    // the request waits behind a prefill owner for as long as the Engine needs. The deadline is
+    // never reset while the request waits, so a nonzero value is a hard bound either way.
+    [[nodiscard]] Clock::time_point admission_deadline(Clock::time_point from) const noexcept {
+        return pending_timeout_.count() > 0 ? from + pending_timeout_ : Clock::time_point::max();
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {

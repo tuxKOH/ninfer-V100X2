@@ -144,6 +144,7 @@ class NInferGui(QWidget):
         self.prefix_reuse.setChecked(True)
         self.max_concurrency = self._spin(1, 1, 8, 1)
         self.default_max_tokens = self._spin(65536, 1, 1048576, 1024)
+        self.pending_timeout_ms = self._spin(0, 0, 86400000, 1000)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password if QT6 else QLineEdit.Password)
         self.temperature = QLineEdit()
@@ -212,6 +213,7 @@ class NInferGui(QWidget):
         service = QFormLayout()
         service.addRow("最大并发请求", self.max_concurrency)
         service.addRow("默认最大输出", self.default_max_tokens)
+        service.addRow("排队超时 ms（0 = 不限）", self.pending_timeout_ms)
         service.addRow("其它开关", self._checks())
 
         sampling = QFormLayout()
@@ -432,7 +434,8 @@ class NInferGui(QWidget):
         for name, widget in (("port", self.port), ("max_context", self.max_context),
                              ("prefill_chunk", self.prefill_chunk), ("draft_tokens", self.draft_tokens),
                              ("max_concurrency", self.max_concurrency),
-                             ("default_max_tokens", self.default_max_tokens)):
+                             ("default_max_tokens", self.default_max_tokens),
+                             ("pending_timeout_ms", self.pending_timeout_ms)):
             value = self.settings.value(name)
             if value is not None:
                 widget.setValue(int(value))
@@ -457,7 +460,8 @@ class NInferGui(QWidget):
         for name, widget in (("port", self.port), ("max_context", self.max_context),
                              ("prefill_chunk", self.prefill_chunk), ("draft_tokens", self.draft_tokens),
                              ("max_concurrency", self.max_concurrency),
-                             ("default_max_tokens", self.default_max_tokens)):
+                             ("default_max_tokens", self.default_max_tokens),
+                             ("pending_timeout_ms", self.pending_timeout_ms)):
             self.settings.setValue(name, widget.value())
         self.settings.remove("api_key")
         for name, widget in (("tp", self.tp), ("kv_dtype", self.kv_dtype), ("spec", self.spec)):
@@ -520,7 +524,8 @@ class NInferGui(QWidget):
                 "--devices", self.devices.text().strip(), "--max-context", str(self.max_context.value()),
                 "--kv-dtype", self.kv_dtype.currentText(),
                 "--prefill-chunk", str(self.prefill_chunk.value()), "--max-concurrency",
-                str(self.max_concurrency.value()), "--default-max-tokens", str(self.default_max_tokens.value())]
+                str(self.max_concurrency.value()), "--default-max-tokens", str(self.default_max_tokens.value()),
+                "--pending-timeout-ms", str(self.pending_timeout_ms.value())]
         spec = self.spec.currentText()
         if self.kv_capacity.text().strip():
             args += ["--kv-capacity", self.kv_capacity.text().strip()]

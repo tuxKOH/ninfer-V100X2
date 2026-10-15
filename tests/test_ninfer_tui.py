@@ -38,6 +38,16 @@ class LaunchContract(unittest.TestCase):
                     self.assertIn('--greedy', command)
                     self.assertIn('--no-prefix-reuse', command)
 
+    def test_admission_timeout_is_forwarded(self):
+        # 0 means "wait as long as the Engine needs"; it must reach the child verbatim, and a
+        # negative value must be refused before launch.
+        self.settings.pending_timeout_ms = 0
+        command = self.settings.command()
+        self.assertEqual(command[command.index('--pending-timeout-ms') + 1], '0')
+        self.settings.pending_timeout_ms = -1
+        with self.assertRaisesRegex(ValueError, 'timeout'):
+            self.settings.validate()
+
     def test_plain_decode_omits_speculative_options(self):
         self.settings.backend = 'none'
         command = self.settings.command()

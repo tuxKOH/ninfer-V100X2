@@ -157,6 +157,12 @@ int main() {
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
+    // 0 is a valid value: it disables the admission deadline so a request may wait behind a long
+    // prefill instead of failing with a queue timeout.
+    const ServeOptions unlimited =
+        parse({"ninfer-serve", "model.ninfer", "--pending-timeout-ms", "0"});
+    failures += check(unlimited.pending_timeout_ms == 0,
+                      "--pending-timeout-ms 0 was not accepted as an unlimited admission deadline");
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&

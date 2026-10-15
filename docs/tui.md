@@ -31,6 +31,9 @@ stop it before changing the model, GPUs or capacities. CUDA IDs are logical: wit
 `CUDA_VISIBLE_DEVICES=4,6`, enter `0,1`. The API output limit is still clamped to remaining
 context. The model's embedded template determines supported thinking effort; this launcher
 sets only the server's default thinking on/off, not a universal `xhigh` request setting.
+The `Admission timeout ms` setting maps to `--pending-timeout-ms`; it defaults to `0`, which
+disables the admission deadline so a request waits behind a long prefill instead of failing with
+a `request_queue_timeout` (the Engine admits at most one prefill owner at a time).
 
 ## Presets
 

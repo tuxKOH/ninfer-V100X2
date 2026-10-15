@@ -15,6 +15,16 @@
 
 namespace ninfer::serve {
 
+namespace {
+// Absolute deadline from lifetime acquisition. A zero timeout disables it: the request may wait
+// behind a long prefill for as long as the Engine needs (single-user serving).
+[[nodiscard]] std::chrono::steady_clock::time_point
+request_deadline(std::uint32_t timeout_ms, std::chrono::steady_clock::time_point started) noexcept {
+    return timeout_ms == 0 ? std::chrono::steady_clock::time_point::max()
+                           : started + std::chrono::milliseconds(timeout_ms);
+}
+} // namespace
+
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
@@ -271,8 +281,7 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     }
     try {
         return std::make_shared<RequestLifetime>(
-            request_capacity_, started,
-            started + std::chrono::milliseconds(options_.pending_timeout_ms));
+            request_capacity_, started, request_deadline(options_.pending_timeout_ms, started));
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
         --request_capacity_->active;
@@ -337,8 +346,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    const Clock::time_point deadline = request_deadline(options_.pending_timeout_ms, Clock::now());
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     try {

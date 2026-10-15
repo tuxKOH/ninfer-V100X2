@@ -83,6 +83,7 @@ class Settings:
     host: str = '127.0.0.1'
     port: int = 8080
     max_output: int = 65536
+    pending_timeout_ms: int = 0
     log: str = str(ROOT / 'profiles/tui-server.jsonl')
 
     def apply_profile(self, name: str) -> None:
@@ -100,6 +101,7 @@ class Settings:
                 '--devices', self.devices, '--max-context', str(self.context),
                 '--kv-dtype', 'int8', '--prefill-chunk', str(self.chunk),
                 '--max-concurrency', '1', '--default-max-tokens', str(self.max_output),
+                '--pending-timeout-ms', str(self.pending_timeout_ms),
                 '--request-log-jsonl', str(local_path(self.log)),
                 '--log-stats-interval-ms', '1000']
         if self.backend != 'none':
@@ -141,6 +143,8 @@ class Settings:
             raise ValueError('Host must be nonempty; port must be 1..65535')
         if self.max_output <= 0:
             raise ValueError('Output limit must be positive; remaining context still limits output')
+        if self.pending_timeout_ms < 0:
+            raise ValueError('Admission timeout must be >= 0 ms (0 = wait as long as needed)')
         if not self.log.strip():
             raise ValueError('Request log path is required')
 
@@ -262,7 +266,9 @@ FIELDS = [
     ('long_attention', 'Experimental attention', (False, True)),
     ('graphs', 'CUDA Graphs', (False, True)), ('prefix_reuse', 'Prefix cache', (False, True)),
     ('thinking', 'Default thinking', (False, True)), ('greedy', 'Force greedy', (False, True)),
-    ('max_output', 'Max output tokens', None), ('host', 'API host', None),
+    ('max_output', 'Max output tokens', None),
+    ('pending_timeout_ms', 'Admission timeout ms (0 = unlimited)', None),
+    ('host', 'API host', None),
     ('port', 'API port', None), ('log', 'Request JSONL log', None),
 ]
 
@@ -446,6 +452,8 @@ def main() -> int:
     parser.add_argument('--profile', choices=PROFILES, default='quasar-mtp3')
     parser.add_argument('--binary', type=Path, help='explicit ninfer-serve executable')
     parser.add_argument('--artifact', type=Path, help='explicit model .ninfer path')
+    parser.add_argument('--pending-timeout-ms', type=int,
+                        help='admission queue timeout in ms; 0 waits as long as needed (default 0)')
     parser.add_argument('--print-command', action='store_true', help='print command without loading a model')
     args = parser.parse_args()
     candidates = [ROOT / 'build-v100/apps/ninfer-serve', ROOT / 'build-v100-tp4/apps/ninfer-serve']
@@ -454,6 +462,8 @@ def main() -> int:
     settings.apply_profile(args.profile)
     if args.artifact:
         settings.artifact = str(args.artifact.expanduser().resolve())
+    if args.pending_timeout_ms is not None:
+        settings.pending_timeout_ms = args.pending_timeout_ms
     if args.print_command:
         print(shlex.join(settings.command()))
         return 0
