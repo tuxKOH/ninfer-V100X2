@@ -211,6 +211,54 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     }
 }
 
+std::size_t LinearAttentionStatePool::slot_image_bytes() const noexcept {
+    if (conv.empty()) { return 0; }
+    return static_cast<std::size_t>(layer_count()) *
+           (conv_slot(0, 0).bytes() + recurrent_slot(0, 0).bytes());
+}
+
+void LinearAttentionStatePool::export_slot(std::int32_t slot, std::span<std::byte> image,
+                                           cudaStream_t stream) const {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool export_slot");
+    if (image.size() != slot_image_bytes()) {
+        throw std::invalid_argument("Linear Attention slot image size does not match the pool");
+    }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor state = conv_slot(layer, slot);
+        CUDA_CHECK(cudaMemcpyAsync(image.data() + offset, state.data, state.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        offset += state.bytes();
+    }
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor state = recurrent_slot(layer, slot);
+        CUDA_CHECK(cudaMemcpyAsync(image.data() + offset, state.data, state.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        offset += state.bytes();
+    }
+}
+
+void LinearAttentionStatePool::import_slot(std::int32_t slot, std::span<const std::byte> image,
+                                           cudaStream_t stream) {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool import_slot");
+    if (image.size() != slot_image_bytes()) {
+        throw std::invalid_argument("Linear Attention slot image size does not match the pool");
+    }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor state = conv_slot(layer, slot);
+        CUDA_CHECK(cudaMemcpyAsync(state.data, image.data() + offset, state.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        offset += state.bytes();
+    }
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor state = recurrent_slot(layer, slot);
+        CUDA_CHECK(cudaMemcpyAsync(state.data, image.data() + offset, state.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        offset += state.bytes();
+    }
+}
+
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {

@@ -268,6 +268,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                       ? static_cast<double>(
                             qwen3_6::detail::yarn_rope_mscale(plan_yarn_params(plan)))
                       : 1.0),
+      parked(plan.kv_park_bytes),
       round_host(sizeof(TokenId)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
@@ -618,6 +619,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
+    // A parked conversation is materialized into the lane before anything below inspects it, so
+    // every check sees the same resident state a retained lane presents and the reuse taken from
+    // here on is the ordinary one. The lane's incumbent, if any, is parked by the same rule the
+    // FullReset path applies, so a request that restores A while B is resident keeps both.
+    if (request_plan.reuse == ReusePath::RestoreParkedKv) {
+        const std::uint64_t target = request_plan.parked_id;
+        if (sequence.retained) { (void)park_retained_lane(sequence.lane); }
+        // Make the target the last eviction candidate before the incumbent's park runs, so a full
+        // store cannot drop the very entry this plan is about to consume.
+        parked.touch(target, park_clock++);
+        const ParkedSequence* parked_entry = parked.find_by_id(target);
+        if (parked_entry == nullptr) {
+            throw std::logic_error("planned parked conversation is no longer stored");
+        }
+        restore_parked_lane(sequence, *parked_entry, request_plan.text_kv_page_entitlement,
+                            request_plan.backend_kv_page_entitlement);
+        parked.erase(target);
+        // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
+        // one, so the reuse branch below takes both, and the reported path stays truthful.
+    }
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
@@ -678,6 +699,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                             : 0U,
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
+    // The resident frontier is about to be released. Park it first when parking is on, so a
+    // conversation that comes back is restored rather than re-prefilled; when the store refuses,
+    // the lane is dropped exactly as before. This is the path that matters at one lane, where no
+    // other lane exists for the executor's eviction loop to reclaim, and so the only place the
+    // retained KV of a replaced conversation can be saved.
+    if (request_plan.reuse == ReusePath::FullReset && sequence.retained) {
+        (void)park_retained_lane(sequence.lane);
+    }
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
     try {
@@ -689,7 +718,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
-        } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
+        } else if (request_plan.reuse == ReusePath::AppendAtFrontier ||
+                   request_plan.reuse == ReusePath::RestoreParkedKv) {
+            // A restored parked conversation reaches this branch already materialized, so it
+            // resumes by exactly the rules an appended frontier does.
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -1108,7 +1140,114 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
+    // Reclaiming a lane is the one place a conversation's GPU state would otherwise be lost, so
+    // this is where parking happens: when the entry fits the host budget the lane is parked
+    // instead of dropped, and a later request for the same conversation resumes it.
+    if (park_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
+    try {
+        if (!parked.enabled() || lane >= max_concurrency) { return false; }
+        SequenceState& sequence = sequences[lane];
+        if (!sequence.retained || !sequence.kv) { return false; }
+        // Park only what this store can restore bit-exactly. RAM KV keeps its own single-request
+        // host window, Vision keeps planner-side media state, and a rewrite checkpoint's auxiliary
+        // GDN slot is not mirrored; in each case refuse, and let the lane be dropped as before.
+        if (ram_kv.gpu_tokens != 0 || vision_enabled) { return false; }
+        if (sequence.execution_frontier == 0 ||
+            sequence.text_kv_valid != sequence.execution_frontier) {
+            return false;
+        }
+        // The ledger and its identity are what a later restore matches against, and the resume
+        // resizes the ledger to the frontier, so a lane whose frontier and ledger disagree is not
+        // parkable: resuming it would extend the ledger with tokens that were never generated.
+        if (sequence.ledger.size() != sequence.execution_frontier ||
+            sequence.prefix_identity.size() != sequence.execution_frontier) {
+            return false;
+        }
+
+        // Size the entry before copying anything: an entry that cannot fit must leave the lane
+        // exactly as it was, never half-detached.
+        std::size_t planned = sequence.kv->text.mapped_payload_bytes() +
+                              decoder->linear_attention.slot_image_bytes() +
+                              static_cast<std::size_t>(sequence.tail_hidden.bytes());
+        if (sequence.kv->backend) { planned += sequence.kv->backend->mapped_payload_bytes(); }
+        for (auto& peer : peers) {
+            planned += sequence.kv->text_peers[peer->rank - 1]->mapped_payload_bytes() +
+                       peer->decoder->linear_attention.slot_image_bytes();
+            if (sequence.kv->backend_peers[peer->rank - 1]) {
+                planned += sequence.kv->backend_peers[peer->rank - 1]->mapped_payload_bytes();
+            }
+        }
+        if (planned > parked.budget_bytes()) { return false; }
+
+        auto entry                = std::make_unique<ParkedSequence>();
+        entry->ledger             = sequence.ledger;
+        entry->prefix_identity    = sequence.prefix_identity;
+        entry->execution_frontier = sequence.execution_frontier;
+        entry->ledger_frontier    = sequence.ledger_frontier;
+        entry->mtp_kv_valid       = sequence.mtp_kv_valid;
+        entry->rope_delta         = sequence.rope_delta;
+        entry->tail_hidden_valid  = sequence.tail_hidden_valid;
+        entry->mtp_draft_count    = sequence.mtp_draft_count;
+        entry->mtp_drafts         = sequence.mtp_drafts;
+
+        // One rank's KV payloads and its own GDN slot. The caller has made this rank's device
+        // current; each image is keyed by logical page, so the physical pages freed here are
+        // irrelevant to the restore that will take fresh ones.
+        const auto export_rank = [&](PagedKVAllocation& text, PagedKVAllocation* backend,
+                                     LinearAttentionStatePool& state, cudaStream_t stream) {
+            entry->text.push_back(text.detach_to_host(stream));
+            if (backend != nullptr) { entry->backend.push_back(backend->detach_to_host(stream)); }
+            std::vector<std::byte> slot(state.slot_image_bytes());
+            state.export_slot(LinearStateSlots::current_state_slot(lane, max_concurrency),
+                              std::span<std::byte>(slot), stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            entry->linear_state.push_back(std::move(slot));
+        };
+
+        export_rank(sequence.kv->text, sequence.kv->backend ? &*sequence.kv->backend : nullptr,
+                    decoder->linear_attention, device.stream);
+        {
+            // Rank 0 alone owns the tail hidden: the peer runtime carries no such store, so there
+            // is no per-rank hidden to mirror.
+            std::vector<std::byte> hidden(static_cast<std::size_t>(sequence.tail_hidden.bytes()));
+            if (sequence.tail_hidden_valid) {
+                CUDA_CHECK(cudaMemcpyAsync(hidden.data(), sequence.tail_hidden.data, hidden.size(),
+                                           cudaMemcpyDeviceToHost, device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            }
+            entry->tail_hidden.push_back(std::move(hidden));
+        }
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            export_rank(*sequence.kv->text_peers[peer->rank - 1],
+                        sequence.kv->backend_peers[peer->rank - 1]
+                            ? &*sequence.kv->backend_peers[peer->rank - 1]
+                            : nullptr,
+                        peer->decoder->linear_attention, peer->device.stream);
+        }
+
+        // Budget what was actually copied, not the estimate: the two agree today, and the copies
+        // are the authority if a plane shape ever changes underneath the estimate.
+        std::size_t bytes = 0;
+        for (const auto& image : entry->text) { bytes += image->bytes(); }
+        for (const auto& image : entry->backend) { bytes += image->bytes(); }
+        for (const auto& slot : entry->linear_state) { bytes += slot.size(); }
+        for (const auto& hidden : entry->tail_hidden) { bytes += hidden.size(); }
+        entry->bytes = bytes;
+
+        if (!parked.insert(std::move(entry), park_clock++)) { return false; }
+        clear_lane(sequence, requests[lane]);
+        return true;
+    } catch (...) {
+        // Best-effort by contract. A copy that failed partway has already released some of the
+        // lane's pages; the caller's fallback clears the rest, which is exactly what it would have
+        // done without parking.
+        return false;
+    }
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1395,6 +1534,74 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
     for (auto& peer : peers) {
         auto& backend = sequence.kv->backend_peers[peer->rank - 1];
         if (backend) { backend->cancel_unmapped_entitlement(); }
+    }
+}
+
+void ProgramImplCore::restore_parked_lane(SequenceState& sequence, const ParkedSequence& entry,
+                                          std::uint32_t text_pages, std::uint32_t backend_pages) {
+    if (sequence.kv) { throw std::logic_error("parked restore requires an empty lane"); }
+    const bool has_backend = backend_kv_cache() != nullptr;
+    if (entry.text.size() != static_cast<std::size_t>(device_count) ||
+        entry.linear_state.size() != entry.text.size() ||
+        entry.backend.size() != (has_backend ? entry.text.size() : 0) ||
+        entry.tail_hidden.size() != 1) {
+        throw std::logic_error("parked conversation does not describe this engine's rank set");
+    }
+    if (entry.ledger.size() != entry.execution_frontier ||
+        entry.prefix_identity.size() != entry.execution_frontier) {
+        throw std::logic_error("parked conversation ledger does not match its frontier");
+    }
+    // Reserve first: a restore that cannot fit must leave the lane empty rather than half-built.
+    reserve_sequence_kv(sequence, text_pages, backend_pages);
+    try {
+        sequence.kv->text.attach_from_host(*entry.text[0], device.stream);
+        if (sequence.kv->backend) {
+            sequence.kv->backend->attach_from_host(*entry.backend[0], device.stream);
+        }
+        decoder->linear_attention.import_slot(
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+            std::span<const std::byte>(entry.linear_state[0]), device.stream);
+        if (entry.tail_hidden_valid) {
+            CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, entry.tail_hidden[0].data(),
+                                       entry.tail_hidden[0].size(), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            sequence.kv->text_peers[peer->rank - 1]->attach_from_host(*entry.text[peer->rank],
+                                                                      peer->device.stream);
+            if (sequence.kv->backend_peers[peer->rank - 1]) {
+                sequence.kv->backend_peers[peer->rank - 1]->attach_from_host(
+                    *entry.backend[peer->rank], peer->device.stream);
+            }
+            peer->decoder->linear_attention.import_slot(
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                std::span<const std::byte>(entry.linear_state[peer->rank]), peer->device.stream);
+        }
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+
+        sequence.execution_frontier = entry.execution_frontier;
+        sequence.ledger_frontier    = entry.ledger_frontier;
+        sequence.text_kv_valid      = entry.execution_frontier;
+        sequence.mtp_kv_valid       = entry.mtp_kv_valid;
+        sequence.ledger             = entry.ledger;
+        sequence.prefix_identity    = entry.prefix_identity;
+        sequence.rope_delta         = entry.rope_delta;
+        sequence.tail_hidden_valid  = entry.tail_hidden_valid;
+        sequence.mtp_draft_count    = entry.mtp_draft_count;
+        sequence.mtp_drafts         = entry.mtp_drafts;
+        // Parking does not mirror the rewrite checkpoint's auxiliary GDN slot, so the restored
+        // conversation resumes from its frontier alone. This costs the checkpoint reuse
+        // opportunity the parked lane had, never correctness.
+        sequence.rewrite_checkpoint = {};
+        sequence.retained           = true;
+    } catch (...) {
+        clear_lane(sequence, requests[sequence.lane]);
+        throw;
     }
 }
 

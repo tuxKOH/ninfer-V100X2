@@ -313,6 +313,14 @@ target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+# Host-only: no artifact, no device. The parked-conversation store's byte budget, least-recently-
+# used eviction, and prefix-identity match -- the rules that decide which parked conversation a
+# returning request resumes, exercised without any KV copy.
+ninfer_add_test(ninfer_parked_sequence_store_test
+  SOURCES test_parked_sequence_store.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_parked_sequence_store_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)

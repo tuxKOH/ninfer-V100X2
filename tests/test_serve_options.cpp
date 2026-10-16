@@ -49,6 +49,9 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
+    failures += check(defaults.stream_keepalive_ms == 15000,
+                      "SSE keepalive interval default mismatch");
+    failures += check(defaults.kv_park_bytes == 0, "KV parking must be off by default");
     failures += check(defaults.default_max_tokens == 65536,
                       "default output-token budget mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
@@ -165,6 +168,18 @@ int main() {
                       "--pending-timeout-ms 0 was not accepted as an unlimited admission deadline");
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
+    const ServeOptions keepalive =
+        parse({"ninfer-serve", "model.ninfer", "--stream-keepalive-ms", "0"});
+    failures += check(keepalive.stream_keepalive_ms == 0,
+                      "--stream-keepalive-ms did not disable SSE keepalive pings");
+    const ServeOptions keepalive_tuned =
+        parse({"ninfer-serve", "model.ninfer", "--stream-keepalive-ms", "2500"});
+    failures += check(keepalive_tuned.stream_keepalive_ms == 2500,
+                      "--stream-keepalive-ms did not reach serving options");
+    const ServeOptions parked =
+        parse({"ninfer-serve", "model.ninfer", "--kv-park-bytes", "4294967296"});
+    failures += check(parked.kv_park_bytes == 4294967296ULL,
+                      "--kv-park-bytes did not reach serving options");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
@@ -225,6 +240,12 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--stream-keepalive-ms") !=
+                          std::string::npos,
+                      "serve help omits --stream-keepalive-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--kv-park-bytes") !=
+                          std::string::npos,
+                      "serve help omits --kv-park-bytes");
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");

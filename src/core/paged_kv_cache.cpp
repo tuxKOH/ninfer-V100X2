@@ -375,6 +375,15 @@ std::uint32_t PagedKVAllocation::mapped_token_capacity() const noexcept {
     return static_cast<std::uint32_t>(page_ids_.size()) * kPagedKVPageSize;
 }
 
+std::size_t PagedKVAllocation::mapped_payload_bytes() const noexcept {
+    if (!valid()) { return 0; }
+    std::size_t per_page = 0;
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        per_page += static_cast<std::size_t>(pool_->plane(p).nb[3]);
+    }
+    return per_page * page_ids_.size();
+}
+
 std::int32_t PagedKVAllocation::bound_row() const noexcept { return bound_row_; }
 
 std::span<const std::int32_t> PagedKVAllocation::page_ids() const noexcept { return page_ids_; }
@@ -495,6 +504,111 @@ void PagedKVAllocation::release() noexcept {
     page_ids_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
+}
+
+PagedKVImage::PagedKVImage() noexcept = default;
+
+PagedKVImage::~PagedKVImage() = default;
+
+PagedKVImage::PagedKVImage(PagedKVImage&& other) noexcept
+    : pool_(other.pool_), pages_(other.pages_),
+      plane_offsets_(std::move(other.plane_offsets_)),
+      plane_page_bytes_(std::move(other.plane_page_bytes_)), data_(std::move(other.data_)) {
+    other.pool_  = nullptr;
+    other.pages_ = 0;
+}
+
+PagedKVImage& PagedKVImage::operator=(PagedKVImage&& other) noexcept {
+    if (this == &other) { return *this; }
+    pool_             = other.pool_;
+    pages_            = other.pages_;
+    plane_offsets_    = std::move(other.plane_offsets_);
+    plane_page_bytes_ = std::move(other.plane_page_bytes_);
+    data_             = std::move(other.data_);
+    other.pool_       = nullptr;
+    other.pages_      = 0;
+    return *this;
+}
+
+std::unique_ptr<PagedKVImage> PagedKVAllocation::detach_to_host(cudaStream_t stream) {
+    if (!valid()) { throw std::logic_error("Cannot detach an empty Paged KV allocation"); }
+    if (ram_) { throw std::logic_error("Paged KV detach is not supported with RAM KV"); }
+    if (bound_row_ >= 0) {
+        throw std::logic_error("Paged KV detach requires an unbound allocation");
+    }
+
+    auto image         = std::make_unique<PagedKVImage>();
+    image->pool_       = pool_;
+    image->pages_      = static_cast<std::uint32_t>(page_ids_.size());
+    std::size_t offset = 0;
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        const std::size_t page_bytes = static_cast<std::size_t>(pool_->plane(p).nb[3]);
+        image->plane_page_bytes_.push_back(page_bytes);
+        image->plane_offsets_.push_back(offset);
+        offset += page_bytes * image->pages_;
+    }
+    // Every byte written below, so the value-initialization pass is pure overhead. It stays
+    // because a partially failed detach must not hand back uninitialized host memory.
+    image->data_.resize(offset);
+
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        const Tensor& plane          = pool_->plane(p);
+        const std::size_t page_bytes = image->plane_page_bytes_[p];
+        unsigned char* host          = image->data_.data() + image->plane_offsets_[p];
+        for (std::uint32_t page = 0; page < image->pages_; ++page) {
+            const std::int32_t id = page_ids_[page];
+            if (id < 0) { throw std::logic_error("Paged KV detach found an unmapped logical page"); }
+            CUDA_CHECK(cudaMemcpyAsync(
+                host + static_cast<std::size_t>(page) * page_bytes,
+                static_cast<const unsigned char*>(plane.data) +
+                    static_cast<std::size_t>(id) * page_bytes,
+                page_bytes, cudaMemcpyDeviceToHost, stream));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    release();
+    return image;
+}
+
+void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t stream) {
+    if (!valid() || !image.valid()) {
+        throw std::invalid_argument("Paged KV attach requires a live allocation and image");
+    }
+    if (image.pool_ != pool_) {
+        throw std::invalid_argument("Paged KV image belongs to a different pool");
+    }
+    if (mapped_page_count() != 0) {
+        throw std::logic_error("Paged KV attach requires an allocation with no mapped pages");
+    }
+    if (image.pages_ > page_entitlement_) {
+        throw std::invalid_argument("Paged KV image exceeds the allocation entitlement");
+    }
+    if (image.plane_page_bytes_.size() != pool_->plane_count()) {
+        throw std::invalid_argument("Paged KV image plane count does not match the pool");
+    }
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        if (image.plane_page_bytes_[p] != static_cast<std::size_t>(pool_->plane(p).nb[3])) {
+            throw std::invalid_argument("Paged KV image plane geometry does not match the pool");
+        }
+    }
+
+    materialize_pages(image.pages_, stream);
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        const Tensor& plane          = pool_->plane(p);
+        const std::size_t page_bytes = image.plane_page_bytes_[p];
+        const unsigned char* host    = image.data_.data() + image.plane_offsets_[p];
+        for (std::uint32_t page = 0; page < image.pages_; ++page) {
+            const std::int32_t id = page_ids_[page];
+            if (id < 0) { throw std::logic_error("Paged KV image attach materialized no page"); }
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<unsigned char*>(plane.data) +
+                    static_cast<std::size_t>(id) * page_bytes,
+                host + static_cast<std::size_t>(page) * page_bytes,
+                page_bytes, cudaMemcpyHostToDevice, stream));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (bound_row_ >= 0) { publish_mapping(stream); }
 }
 
 void PagedKVAllocation::prefer_pages(std::span<const std::int32_t> ranked_pages) {

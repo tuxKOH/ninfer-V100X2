@@ -684,6 +684,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
+                // A long prefill (or time queued behind another prefill) writes no deltas, so the
+                // stream would otherwise sit silent long enough for an idle connection to be torn
+                // down. Emit an Anthropic `ping` event across that gap; a client that has already
+                // gone away makes write_stream_item throw ClientDisconnected, ending the request.
+                output.on_keepalive = [&] {
+                    write_stream_item(sink, *stream, make_messages_ping());
+                };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);

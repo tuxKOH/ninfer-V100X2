@@ -47,6 +47,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          keepalive_interval_(std::chrono::milliseconds(options.stream_keepalive_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             pending_timeout_.count() < 0 || options.max_pending_requests == 0) {
@@ -253,6 +254,13 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        if (prefill_lane_) {
+            if (const std::shared_ptr<Request>& active = slots_[*prefill_lane_];
+                active != nullptr) {
+                snapshot.prefill_prompt_tokens    = active->prompt_summary.prompt_tokens;
+                snapshot.prefill_processed_tokens = active->prefill_processed_tokens;
+            }
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -273,6 +281,7 @@ private:
 
         std::exception_ptr caller_error;
         std::vector<OutputDelta> events;
+        Clock::time_point last_activity = Clock::now();
         for (;;) {
             events.clear();
             bool done = false;
@@ -283,10 +292,27 @@ private:
                 events.swap(request->events);
                 done = request->done;
             }
+            if (!events.empty()) { last_activity = Clock::now(); }
 
             if (caller_error == nullptr && sink != nullptr) {
                 try {
                     for (OutputDelta& event : events) { sink->publish(std::move(event)); }
+                } catch (...) {
+                    caller_error = std::current_exception();
+                    request->cancelled.store(true, std::memory_order_release);
+                    queue_cv_.notify_one();
+                }
+            }
+
+            // While the request produces no output -- a long prefill, or time queued behind
+            // another request's prefill -- hand the consumer a periodic liveness ping on this
+            // same thread so it can keep the transport warm and, just as importantly, notice a
+            // client that has already gone away. A throw here is handled like a publish throw.
+            if (caller_error == nullptr && sink != nullptr && keepalive_interval_.count() > 0 &&
+                Clock::now() - last_activity >= keepalive_interval_) {
+                try {
+                    sink->keepalive();
+                    last_activity = Clock::now();
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
@@ -341,6 +367,9 @@ private:
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
+        // Prompt tokens of this request made resident so far (reused prefix + prefill work), a
+        // live progress readout for the runtime-stats snapshot while it owns the prefill lane.
+        std::uint32_t prefill_processed_tokens = 0;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -693,6 +722,7 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->prefill_processed_tokens += step.processed_prompt_tokens;
         consume_service_work(request, 1);
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -881,6 +911,9 @@ private:
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
+            // A reused prefix is already resident, so progress starts there and the prefill work
+            // below carries it to the full prompt length.
+            request->prefill_processed_tokens = summary.reusable_prompt_tokens;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
@@ -1283,6 +1316,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::chrono::milliseconds keepalive_interval_;
     const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;

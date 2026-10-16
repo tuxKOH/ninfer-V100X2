@@ -213,6 +213,10 @@ public:
         }
     }
 
+    void keepalive() override {
+        if (sink_->on_keepalive) { sink_->on_keepalive(); }
+    }
+
     std::size_t finish(bool is_tool_call_response) {
         if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
         return content_bytes_;
@@ -252,8 +256,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.stream_keepalive_ms       = options_.stream_keepalive_ms;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
+    engine_options.kv_park_bytes            = options_.kv_park_bytes;
     engine_options.volta_long_attention     = options_.volta_long_attention;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;

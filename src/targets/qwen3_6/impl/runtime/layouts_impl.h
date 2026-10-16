@@ -679,6 +679,18 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("RAM KV requires kv_capacity equal to its GPU window");
         }
     }
+    if (options.kv_park_bytes != 0) {
+        // Parking mirrors a lane's whole continuation state, which is defined for the plain
+        // per-rank KV and GDN layout only. RAM KV already owns a host archive, Vision keeps media
+        // state in the planner, DFlash keeps a context the store does not mirror, and a PP peer
+        // holds a layer range rather than a head shard, so each is refused rather than parked
+        // approximately.
+        if (options.ram_kv.gpu_tokens != 0 || options.enable_vision || options.pp != 1 ||
+            options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument(
+                "KV parking requires single-stage Text/MTP without RAM KV, Vision or DFlash");
+        }
+    }
     // This call is also where every rope-option rejection lives (unsupported variant, Vision,
     // DFlash, wrong origin, factor that overshoots the 1,048,576 product ceiling) -- see
     // yarn_rope.h.
@@ -800,6 +812,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pp                  = inputs.pp;
     impl->pipeline_chunks     = inputs.pipeline_chunks;
     impl->ram_kv              = inputs.ram_kv;
+    impl->kv_park_bytes       = inputs.kv_park_bytes;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -936,6 +949,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .pp             = options.pp,
         .pipeline_chunks = options.pp == 2 ? options.pipeline_chunks : 1U,
         .ram_kv         = options.ram_kv,
+        .kv_park_bytes  = options.kv_park_bytes,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

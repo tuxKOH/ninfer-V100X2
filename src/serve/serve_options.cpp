@@ -114,14 +114,15 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--stream-keepalive-ms N] "
+           "[--device N] [--tp 1|2|4] "
            "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
-           "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
+           "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -131,6 +132,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --volta-long-attention: experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ\n"
            "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; one SM70 27B Text/MTP request, TP1/TP2/PP2\n"
            "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
+           "       --kv-park-bytes moves a replaced conversation's KV to host memory instead of dropping it,\n"
+           "       so it resumes without a re-prefill; a byte budget, 0 (default) disables parking\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -144,6 +147,7 @@ std::string serve_usage_text(const char* argv0) {
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
+           "       --stream-keepalive-ms defaults to 15000; 0 disables SSE prefill keepalive pings\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768)\n"
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
@@ -242,6 +246,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.ram_kv.gpu_tokens == 0) { throw std::invalid_argument("RAM KV window must be positive"); }
         } else if (arg == "--ram-kv-budget-bytes") {
             options.ram_kv.budget_bytes = parse_u64(require_value("--ram-kv-budget-bytes"), "ram-kv-budget-bytes");
+        } else if (arg == "--kv-park-bytes") {
+            options.kv_park_bytes = parse_u64(require_value("--kv-park-bytes"), "kv-park-bytes");
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -257,6 +263,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
+        } else if (arg == "--stream-keepalive-ms") {
+            options.stream_keepalive_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--stream-keepalive-ms"), "stream-keepalive-ms"));
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--max-request-mib"), "max-request-mib");

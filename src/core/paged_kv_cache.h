@@ -100,6 +100,7 @@ struct PagedKVPoolLayout {
                                                    const PagedKVPoolSpec& spec);
 
 class PagedKVAllocation;
+class PagedKVImage;
 struct PagedKVResize;
 
 class PagedKVPool {
@@ -171,6 +172,9 @@ public:
     [[nodiscard]] std::uint32_t page_entitlement() const noexcept;
     [[nodiscard]] std::uint32_t mapped_page_count() const noexcept;
     [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept;
+    // Every storage plane's bytes for one page, times the mapped page count: exactly the host
+    // image detach_to_host() produces, and so the host cost of parking this allocation.
+    [[nodiscard]] std::size_t mapped_payload_bytes() const noexcept;
     [[nodiscard]] std::int32_t bound_row() const noexcept;
     [[nodiscard]] std::span<const std::int32_t> page_ids() const noexcept;
     [[nodiscard]] bool belongs_to(const PagedKVPool& pool) const noexcept;
@@ -186,6 +190,18 @@ public:
     void publish_mapping(cudaStream_t stream = nullptr) const;
     void unbind_row() noexcept;
     [[nodiscard]] Tensor block_table() const;
+
+    // Copies every mapped logical page's packed payload to host and returns every physical page
+    // to the pool, leaving this allocation empty (as release() would). The image is keyed by
+    // LOGICAL page order: which physical page a logical page occupied is pool state that must not
+    // survive parking, so attach_from_host() takes fresh pages and copies the payloads back
+    // instead. Requires an unbound allocation and is rejected under RAM KV, whose archive and
+    // retrieval window are a different (single-request) host scheme. The caller must have made
+    // this pool's device current, since the payload copies are issued on it.
+    [[nodiscard]] std::unique_ptr<PagedKVImage> detach_to_host(cudaStream_t stream = nullptr);
+    // Restores a detached image into this allocation, which must be freshly reserved in the
+    // image's own pool with at least image.pages() of entitlement and no mapped pages yet.
+    void attach_from_host(const PagedKVImage& image, cudaStream_t stream = nullptr);
 
     void release() noexcept;
     // Ranking is storage-policy input supplied by the model family, not interpreted by core.
@@ -210,6 +226,45 @@ private:
     std::unique_ptr<RamState> ram_;
     void materialize_ram_pages(std::uint32_t pages, cudaStream_t stream);
     void publish_ram_mapping(cudaStream_t stream) const;
+};
+
+/**
+ * Host-resident image of one allocation's logical page payload.
+ *
+ * Layout is plane-major then logical page: plane p occupies plane_offsets()[p] ..
+ * plane_offsets()[p] + plane_page_bytes()[p] * pages(), and logical page q of that plane sits at
+ * the start of that span plus q * plane_page_bytes()[p]. Nothing here names a physical page or a
+ * pool offset, so an image is portable across allocations of one pool but not across pools (the
+ * plane geometry is a pool property, and `pool` witnesses that at attach time).
+ */
+class PagedKVImage {
+public:
+    PagedKVImage() noexcept;
+    ~PagedKVImage();
+
+    PagedKVImage(const PagedKVImage&)            = delete;
+    PagedKVImage& operator=(const PagedKVImage&) = delete;
+    PagedKVImage(PagedKVImage&&) noexcept;
+    PagedKVImage& operator=(PagedKVImage&&) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return pool_ != nullptr; }
+    [[nodiscard]] std::uint32_t pages() const noexcept { return pages_; }
+    [[nodiscard]] std::size_t bytes() const noexcept { return data_.size(); }
+    [[nodiscard]] const std::vector<std::size_t>& plane_offsets() const noexcept {
+        return plane_offsets_;
+    }
+    [[nodiscard]] const std::vector<std::size_t>& plane_page_bytes() const noexcept {
+        return plane_page_bytes_;
+    }
+
+private:
+    friend class PagedKVAllocation;
+
+    PagedKVPool* pool_ = nullptr;
+    std::uint32_t pages_ = 0;
+    std::vector<std::size_t> plane_offsets_;
+    std::vector<std::size_t> plane_page_bytes_;
+    std::vector<unsigned char> data_;
 };
 
 struct PagedKVReservation {

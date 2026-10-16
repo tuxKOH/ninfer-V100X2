@@ -215,7 +215,28 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    // A conversation whose KV was parked by an earlier eviction resumes from the host store. It
+    // is matched by the same token-prefix identity the resident lane above is matched by, so
+    // parking widens how many conversations can be resumed without widening what "the same
+    // conversation" means. The store is consulted only when nothing resident already matches, so
+    // a resident prefix always wins and parking never displaces the cheaper path.
+    const qwen3_6::detail::ParkedSequence* parked_entry = nullptr;
+    if (plan->reuse == ReusePath::FullReset && base.allow_prefix_reuse &&
+        prompt.identity.reusable && parked.enabled() &&
+        speculative_backend != SpeculativeBackend::DFlash) {
+        parked_entry = parked.match(prompt);
+        if (parked_entry != nullptr) {
+            plan->reuse      = ReusePath::RestoreParkedKv;
+            plan->reuse_base = parked_entry->execution_frontier;
+            plan->parked_id  = parked_entry->id;
+        }
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
+        const bool parked_ready = parked_entry != nullptr && parked_entry->tail_hidden_valid &&
+                                  decoder->mtp_cache() != nullptr &&
+                                  (plan->reuse_base == 0 ||
+                                   parked_entry->mtp_kv_valid >= plan->reuse_base - 1);
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
@@ -223,9 +244,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
+            !parked_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            plan->parked_id  = 0;
+            parked_entry     = nullptr;
         }
     }
 
@@ -239,8 +263,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    // A parked plan names the lane's *replaced* occupant only until the restore runs, so the
+    // occupant's checkpoint says nothing about the conversation being resumed: never let it
+    // authorize a retention the restored state cannot back.
     const bool existing_checkpoint_matches =
-        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
+        desired && plan->reuse != ReusePath::FullReset &&
+        plan->reuse != ReusePath::RestoreParkedKv && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                         desired->frontier);
@@ -270,6 +298,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
         } else if (is_rewrite_checkpoint_restore(plan->reuse)) {
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
+                                    ? MtpBridgeMode::BeforeSuffix
+                                    : MtpBridgeMode::AfterExactHit;
+        } else if (plan->reuse == ReusePath::RestoreParkedKv) {
+            // A restored lane resumes exactly as an appended one does, so it takes the same MTP
+            // bridge: a suffix to prefill, or an exact hit that samples from the parked hidden.
             plan->prepare_mtp = true;
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix

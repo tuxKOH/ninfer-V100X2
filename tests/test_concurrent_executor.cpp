@@ -777,6 +777,162 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+// A request owning the prefill lane publishes its token progress in the runtime-stats snapshot:
+// a watcher sees the prompt length, watches the processed count climb toward it, then both clear
+// to zero once the request leaves the lane. This is the readout a server uses to show a long
+// prompt's prefill advancing instead of a bare "prefilling=1".
+//
+// The scripted prefill consumes exactly one prompt token per step, so the prompt is made as long
+// as the step count. Progress is then physical: it must climb to (prompt - 1) -- the final step
+// clears the lane before its completion publish, so equality is never observed -- and must never
+// exceed the prompt length.
+void test_prefill_progress_is_published(const q36::Frontend& frontend,
+                                        const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kPromptTokens = 20;
+    constexpr auto kStepDelay             = std::chrono::milliseconds(15);
+
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(1),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->set_service_allowance(kPromptTokens);
+    instance.program->push_script(GenerationScript{.tokens             = {0, 0, 0},
+                                                   .prefill_steps      = kPromptTokens,
+                                                   .prefill_step_delay = kStepDelay});
+    Executor executor(instance, executor_options(), device);
+
+    q36::PreparedPrompt prompt         = frontend.prepare_tokens(std::vector<TokenId>(kPromptTokens, 0));
+    const ninfer::PromptSummary summary = prompt.summary();
+    const std::uint32_t prompt_tokens   = summary.prompt_tokens;
+    auto submission = executor.submit(std::move(prompt), summary, 0.0, request_options(3));
+
+    // Sample the lane until the request is admitted and then has left it.
+    std::uint32_t observed_prompt = 0;
+    std::uint32_t max_processed   = 0;
+    std::vector<std::uint32_t> processed;
+    bool saw_prefill       = false;
+    bool saw_cleared_after = false;
+    for (int guard = 0; guard < 8000; ++guard) {
+        const ninfer::RuntimeStats stats = executor.runtime_stats();
+        if (stats.prefilling_requests != 0) {
+            saw_prefill     = true;
+            observed_prompt = stats.prefill_prompt_tokens;
+            if (stats.prefill_processed_tokens > max_processed) {
+                max_processed = stats.prefill_processed_tokens;
+            }
+            processed.push_back(stats.prefill_processed_tokens);
+        } else if (saw_prefill) {
+            saw_cleared_after = stats.prefill_prompt_tokens == 0 &&
+                                stats.prefill_processed_tokens == 0;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const Outcome outcome = await(std::move(submission));
+
+    expect(outcome.ok, "the prefill-progress sampling request did not complete");
+    expect(saw_prefill, "the prefill lane was never observed active");
+    expect(prompt_tokens == kPromptTokens,
+           "the scripted prompt length did not match the prefill step count");
+    expect(observed_prompt == prompt_tokens,
+           "the published prefill prompt length did not match the request summary");
+    bool non_decreasing = true;
+    for (std::size_t i = 1; i < processed.size(); ++i) {
+        if (processed[i] < processed[i - 1]) { non_decreasing = false; }
+    }
+    expect(processed.size() >= 2, "too few prefill progress samples were captured");
+    expect(non_decreasing, "published prefill progress moved backwards");
+    expect(max_processed <= prompt_tokens, "published prefill progress exceeded the prompt length");
+    expect(max_processed + 1 >= prompt_tokens,
+           "published prefill progress stalled short of the prompt; final observable step missed");
+    expect(saw_cleared_after, "prefill progress was not cleared once the request left the lane");
+}
+
+// A streaming consumer must receive periodic liveness pings while a request produces no output,
+// so a multi-minute prefill does not leave the transport silent (and idle-dropped). The pings are
+// driven from the same consumer thread that owns the sink, so this fixture observes them directly:
+// the count at the first publish is proof a ping fired *before* any content, i.e. during prefill.
+struct CountingSink final : ninfer::OutputSink {
+    void publish(ninfer::OutputDelta delta) override {
+        if (!saw_publish) {
+            saw_publish                 = true;
+            keepalives_at_first_publish = keepalives;
+        }
+        bytes += delta.text.size();
+    }
+    void keepalive() override { ++keepalives; }
+
+    std::size_t bytes = 0;
+    int keepalives    = 0;
+    bool saw_publish  = false;
+    int keepalives_at_first_publish = 0;
+};
+
+ninfer::EngineOptions keepalive_options(std::uint32_t interval_ms) {
+    ninfer::EngineOptions options       = executor_options();
+    options.stream_keepalive_ms         = interval_ms;
+    return options;
+}
+
+// Shared fixture: a prefill long enough (kPromptTokens steps spaced by step_delay) that a
+// keepalive interval of a fraction of that duration must fire several times.
+ScriptedInstance long_prefill_instance(const q36::Frontend& frontend, std::uint32_t prompt_tokens,
+                                       std::chrono::milliseconds step_delay) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(1),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->set_service_allowance(prompt_tokens);
+    instance.program->push_script(GenerationScript{.tokens             = {0, 0, 0},
+                                                   .prefill_steps      = prompt_tokens,
+                                                   .prefill_step_delay = step_delay});
+    return instance;
+}
+
+ninfer::GenerationResult run_with_sink(Executor& executor, const q36::Frontend& frontend,
+                                       std::uint32_t prompt_tokens, CountingSink& sink) {
+    q36::PreparedPrompt prompt          = frontend.prepare_tokens(std::vector<TokenId>(prompt_tokens, 0));
+    const ninfer::PromptSummary summary = prompt.summary();
+    auto submission = executor.submit(std::move(prompt), summary, 0.0, request_options(3));
+    return submission.wait(&sink, ninfer::CancellationView{});
+}
+
+void test_stream_keepalive_fires_during_prefill(const q36::Frontend& frontend,
+                                                const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kPromptTokens        = 20;
+    constexpr auto kStepDelay                    = std::chrono::milliseconds(15);
+    constexpr std::uint32_t kKeepaliveIntervalMs = 50;
+
+    ScriptedInstance instance = long_prefill_instance(frontend, kPromptTokens, kStepDelay);
+    Executor executor(instance, keepalive_options(kKeepaliveIntervalMs), device);
+
+    CountingSink sink;
+    const ninfer::GenerationResult result = run_with_sink(executor, frontend, kPromptTokens, sink);
+
+    expect(result.generated_token_ids.size() == 3,
+           "the keepalive request produced the wrong number of tokens");
+    expect(sink.saw_publish, "the keepalive request published no content");
+    expect(sink.keepalives_at_first_publish > 0,
+           "no keepalive was emitted before the first token: a long prefill stayed silent");
+}
+
+void test_stream_keepalive_disabled(const q36::Frontend& frontend,
+                                    const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kPromptTokens = 20;
+    constexpr auto kStepDelay             = std::chrono::milliseconds(15);
+
+    ScriptedInstance instance = long_prefill_instance(frontend, kPromptTokens, kStepDelay);
+    Executor executor(instance, keepalive_options(0), device);
+
+    CountingSink sink;
+    const ninfer::GenerationResult result = run_with_sink(executor, frontend, kPromptTokens, sink);
+
+    expect(result.generated_token_ids.size() == 3,
+           "the disabled-keepalive request produced the wrong number of tokens");
+    expect(sink.keepalives == 0,
+           "a keepalive was emitted even though the interval was disabled");
+}
+
 } // namespace
 
 int main() {
@@ -795,5 +951,8 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_admission_deadline_expiry_and_disable(frontend, device);
     test_engine_scope_failure_still_fails_all(frontend, device);
+    test_prefill_progress_is_published(frontend, device);
+    test_stream_keepalive_fires_during_prefill(frontend, device);
+    test_stream_keepalive_disabled(frontend, device);
     return failures == 0 ? 0 : 1;
 }

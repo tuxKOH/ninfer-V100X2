@@ -113,6 +113,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreParkedKv:
+        return "restore_parked_kv";
     }
     return "unknown";
 }
@@ -419,8 +421,17 @@ std::string format_throughput(const ThroughputReport& report) {
     out << "throughput interval=" << std::fixed << std::setprecision(3) << report.interval_seconds
         << "s prefill=" << std::setprecision(1) << prefill_rate << "tok/s decode=" << decode_rate
         << "tok/s running=" << report.scheduler.running_requests
-        << " prefilling=" << report.scheduler.prefilling_requests
-        << " decode_ready=" << report.scheduler.decode_ready_requests
+        << " prefilling=" << report.scheduler.prefilling_requests;
+    // Progress of the one request on the prefill lane, so a long prompt's advance is visible
+    // instead of a bare `prefilling=1`. Precision is already 1 from the rate fields above.
+    if (report.scheduler.prefill_prompt_tokens != 0) {
+        out << " prefill_progress=" << report.scheduler.prefill_processed_tokens << '/'
+            << report.scheduler.prefill_prompt_tokens << " ("
+            << (100.0 * static_cast<double>(report.scheduler.prefill_processed_tokens) /
+                static_cast<double>(report.scheduler.prefill_prompt_tokens))
+            << "%)";
+    }
+    out << " decode_ready=" << report.scheduler.decode_ready_requests
         << " waiting=" << report.scheduler.waiting_requests << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
@@ -617,6 +628,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
     record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
                                   {"prefilling", report.scheduler.prefilling_requests},
+                                  {"prefill_processed_tokens",
+                                   report.scheduler.prefill_processed_tokens},
+                                  {"prefill_prompt_tokens", report.scheduler.prefill_prompt_tokens},
                                   {"decode_ready", report.scheduler.decode_ready_requests},
                                   {"waiting", report.scheduler.waiting_requests}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},

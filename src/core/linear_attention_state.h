@@ -5,7 +5,9 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ninfer {
@@ -63,6 +65,16 @@ struct LinearAttentionStatePool {
 
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
+
+    // Host mirror of one logical slot: every layer's conv payload in layer order, then every
+    // layer's recurrent payload in layer order, each payload packed with no inter-layer padding.
+    // slot_image_bytes() is the exact buffer size; a span of any other length is rejected, so an
+    // image cannot be silently misaligned with the slot geometry it was taken from.
+    [[nodiscard]] std::size_t slot_image_bytes() const noexcept;
+    void export_slot(std::int32_t slot, std::span<std::byte> image,
+                     cudaStream_t stream = nullptr) const;
+    void import_slot(std::int32_t slot, std::span<const std::byte> image,
+                     cudaStream_t stream = nullptr);
 };
 
 } // namespace ninfer

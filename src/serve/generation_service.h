@@ -56,6 +56,10 @@ struct StreamSink {
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
+    // Optional transport liveness ping emitted while the request produces no output (a long
+    // prefill, or time queued behind another prefill). Unset means "no ping". A throw (e.g. a
+    // write to a closed socket) cancels the request like a failed on_content.
+    std::function<void()> on_keepalive;
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.

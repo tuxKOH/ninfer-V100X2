@@ -38,6 +38,9 @@ struct ServeOptions {
     std::uint32_t pending_timeout_ms       = 30000;
     std::uint32_t prefill_chunk            = 1024;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
+    // Interval between SSE keepalive pings emitted while a streaming request produces no output
+    // (a long prefill, or time queued behind another prefill). 0 disables the pings.
+    std::uint32_t stream_keepalive_ms       = 15000;
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
@@ -54,6 +57,11 @@ struct ServeOptions {
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
+    // Host budget, in bytes, for parked conversations. A finished conversation's KV is retained on
+    // the GPU for prefix reuse; when the lane is reclaimed it is dropped. With a budget it is
+    // copied to host memory instead, so a conversation that comes back resumes without a
+    // re-prefill. 0 disables parking.
+    std::uint64_t kv_park_bytes = 0;
     bool volta_long_attention = false;
     SpeculativeOptions speculative;
     bool enable_vision      = false;

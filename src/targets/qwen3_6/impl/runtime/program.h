@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/parked_sequence_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -76,6 +77,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
+    // Identification of the parked entry a RestoreParkedKv plan resumes, resolved against the
+    // store when the plan is executed rather than carried as a pointer, which an intervening
+    // park could invalidate.
+    std::uint64_t parked_id = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -282,6 +287,11 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Copies a retained lane's complete continuation state to the park store and clears the lane,
+    // returning true when it was parked. Best-effort and infallible by contract: a lane that
+    // cannot be parked (parking disabled, RAM KV, Vision, or no room left in the store) is
+    // reported false and left untouched, so the caller can fall back to dropping it.
+    [[nodiscard]] bool park_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -364,6 +374,9 @@ public:
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
+    // Conversations whose resident frontier did not fit the KV pool, held in host memory so they
+    // can be resumed exactly instead of re-prefilled. Disabled (zero budget) by default.
+    ParkedSequenceStore parked;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -414,6 +427,10 @@ public:
 
 
     std::size_t workspace_logical_peak_bytes = 0;
+
+    // Monotonic tick ordering park-store use, advanced once per park and once per plan that
+    // targets a parked entry. Only relative order matters, so any monotone counter will do.
+    std::uint64_t park_clock = 0;
 
     // See logits_capture's comment. Read-only; the caller owns thread-safety (single-lane, read
     // after wait() returns). Empty while capture is disabled.
@@ -492,6 +509,11 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
+    // Materializes a parked conversation into an empty lane: reserves the KV bundle, copies the
+    // parked pages and GDN slot back on every rank, and restores the ledger, identity and
+    // frontiers, so the resident reuse path can resume from the parked frontier unchanged.
+    void restore_parked_lane(SequenceState& sequence, const ParkedSequence& entry,
+                             std::uint32_t text_pages, std::uint32_t backend_pages);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);

@@ -131,11 +131,22 @@ struct EngineOptions {
     // time). Zero disables the deadline entirely, so a request waits as long as the Engine needs.
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Interval at which the executor emits an OutputSink::keepalive() ping while a request is
+    // producing no output -- a multi-minute prefill, or time spent queued behind another
+    // request's prefill. The consumer (e.g. an SSE handler) turns this into a transport-level
+    // liveness frame so the connection is not torn down as idle. Zero disables the ping.
+    std::uint32_t stream_keepalive_ms   = 15000;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // Complete-history SM70 TP2 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
     RamKvOptions ram_kv;
+    // Host budget, in bytes, for parked conversations. Zero (the default) disables parking: a
+    // finished conversation's KV stays resident for prefix reuse and is dropped the moment another
+    // conversation needs the lane. With a budget, that KV and its GDN state are instead copied to
+    // host memory when the lane is reclaimed, so a conversation that comes back resumes exactly
+    // without re-prefilling its prompt.
+    std::uint64_t kv_park_bytes = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -400,6 +411,12 @@ class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+    // Liveness ping emitted periodically while the request produces no output (see
+    // EngineOptions::stream_keepalive_ms). Consumers that do not care may ignore it;
+    // a consumer that owns a transport turns it into a keepalive frame. A throw from here is
+    // treated exactly like a throw from publish(): the request is cancelled. It runs on the
+    // same thread as publish(), so implementations need no extra synchronization.
+    virtual void keepalive() {}
 };
 
 class CancellationView {
@@ -445,6 +462,10 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    // The resident frontier was parked to host memory by an earlier eviction and is being brought
+    // back. Reported only when it is materialized; from the model's point of view it resumes
+    // exactly like AppendAtFrontier at the parked frontier.
+    RestoreParkedKv,
 };
 
 struct GenerationResult {
@@ -543,6 +564,17 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    // Progress of the single request currently owning the prefill lane. At most one prefill
+    // runs at a time, so these name that request: `prefill_prompt_tokens` is its full prompt
+    // length, `prefill_processed_tokens` counts the tokens made resident so far (reused prefix
+    // hits plus prefill work completed this run). Both are 0 when no prefill is in flight, and
+    // the count climbs toward the prompt length as the lane advances. Unlike the counters above
+    // these are instantaneous, not monotonic, so a reader must not difference them across
+    // snapshots. A reader sees the lane go 0 -> the running progress -> 0; the final step clears
+    // the lane before it publishes, so the peak observed value is (prompt length - final chunk),
+    // not equality.
+    std::uint32_t prefill_prompt_tokens    = 0;
+    std::uint32_t prefill_processed_tokens = 0;
 };
 
 struct LoadSummary {

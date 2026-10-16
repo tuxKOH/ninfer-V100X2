@@ -325,6 +325,11 @@ int main() {
     failures += check(response_restore.at("result").at("prefix_reuse_path") ==
                           "restore_response_checkpoint",
                       "response checkpoint reuse path missing");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreParkedKv;
+    const Json parked_restore =
+        Json::parse(format_request_done_json("serve-test", 3002, context, outcome));
+    failures += check(parked_restore.at("result").at("prefix_reuse_path") == "restore_parked_kv",
+                      "parked reuse path missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -364,15 +369,20 @@ int main() {
     throughput.committed_decode_tokens         = 40;
     throughput.decode_rounds                   = 10;
     throughput.decode_row_rounds               = 18;
-    throughput.scheduler.running_requests      = 2;
-    throughput.scheduler.prefilling_requests   = 1;
-    throughput.scheduler.decode_ready_requests = 1;
-    throughput.scheduler.waiting_requests      = 3;
-    const std::string human_throughput         = format_throughput(throughput);
+    throughput.scheduler.running_requests         = 2;
+    throughput.scheduler.prefilling_requests      = 1;
+    throughput.scheduler.prefill_prompt_tokens    = 204721;
+    throughput.scheduler.prefill_processed_tokens = 45000;
+    throughput.scheduler.decode_ready_requests    = 1;
+    throughput.scheduler.waiting_requests         = 3;
+    const std::string human_throughput            = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
                           human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
                       "human throughput report mismatch");
+    failures += check(human_throughput.find("prefill_progress=45000/204721 (22.0%)") !=
+                          std::string::npos,
+                      "human throughput report omits prefill progress");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -381,6 +391,15 @@ int main() {
                       "throughput token deltas mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
+    failures += check(throughput_json.at("scheduler").at("prefill_processed_tokens") == 45000 &&
+                          throughput_json.at("scheduler").at("prefill_prompt_tokens") == 204721,
+                      "throughput JSON omits prefill progress");
+
+    // No prefill in flight -> the progress field is absent so an idle report stays uncluttered.
+    ThroughputReport idle;
+    idle.scheduler.prefilling_requests = 0;
+    failures += check(format_throughput(idle).find("prefill_progress") == std::string::npos,
+                      "idle throughput report should not advertise prefill progress");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);
