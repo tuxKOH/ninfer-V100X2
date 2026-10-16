@@ -1161,10 +1161,13 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
             return false;
         }
         // The ledger and its identity are what a later restore matches against, and the resume
-        // resizes the ledger to the frontier, so a lane whose frontier and ledger disagree is not
+        // resizes the ledger to the frontier, so a lane whose ledger and frontier disagree is not
         // parkable: resuming it would extend the ledger with tokens that were never generated.
-        if (sequence.ledger.size() != sequence.execution_frontier ||
-            sequence.prefix_identity.size() != sequence.execution_frontier) {
+        // Both run one entry past the execution frontier -- the token sampled but not yet executed,
+        // which is the offset a decode-ready lane asserts -- so the ledger frontier, not the
+        // execution frontier, is what they have to match.
+        if (sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier) {
             return false;
         }
 
@@ -1547,8 +1550,11 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, const ParkedS
         entry.tail_hidden.size() != 1) {
         throw std::logic_error("parked conversation does not describe this engine's rank set");
     }
-    if (entry.ledger.size() != entry.execution_frontier ||
-        entry.prefix_identity.size() != entry.execution_frontier) {
+    // Mirrors the decode-ready invariant: the ledger and its identity run one entry past the
+    // execution frontier (the sampled-but-unexecuted token), so both are sized by the ledger
+    // frontier, not the execution frontier.
+    if (entry.ledger.size() != entry.ledger_frontier ||
+        entry.prefix_identity.size() != entry.ledger_frontier) {
         throw std::logic_error("parked conversation ledger does not match its frontier");
     }
     // Reserve first: a restore that cannot fit must leave the lane empty rather than half-built.
