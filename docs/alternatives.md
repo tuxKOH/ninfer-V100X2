@@ -1,6 +1,8 @@
 # Alternative models and experimental Vision
 
-QUASAR is the recommended text-only model. This page retains Q4_K_M conversion and the opt-in official-NVFP4 Vision route. These profiles have their own numerical and memory constraints.
+QUASAR is the recommended text model. This page retains Q4_K_M conversion and the opt-in TP2
+Vision route (official NVFP4, or QUASAR v3 with `--vision`). These profiles have their own numerical
+and memory constraints.
 
 TP2 Vision is experimental and disabled by default. The visual-prefix bridge test fails on
 the local host because cached and cold prefill produce different greedy continuations; the
@@ -32,10 +34,11 @@ host CPU affinity; benchmark CPU use should remain below the operator's 85% ceil
 
 ### Experimental TP2 Vision
 
-Use the official NVFP4 artifact, not QUASAR or GGUF-derived Q4_K_M. Start with a small text/KV
-capacity and visual-token budget on the two 16 GB cards; the command below is not a measured
-maximum-capacity profile. `--vision-max-tokens` bounds merged visual tokens, while the complete
-text-plus-media prompt must also fit `--max-context`.
+Use the official NVFP4 artifact, or QUASAR v3 at TP2 (both carry execution-qualified Vision;
+GGUF-derived Q4_K_M does not). Start with a small text/KV capacity and visual-token budget on the
+two 16 GB cards; the command below is not a measured maximum-capacity profile. `--vision-max-tokens`
+bounds merged visual tokens, while the complete text-plus-media prompt must also fit
+`--max-context`.
 
 ```bash
 env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \

@@ -681,14 +681,16 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     }
     if (options.kv_park_bytes != 0) {
         // Parking mirrors a lane's whole continuation state, which is defined for the plain
-        // per-rank KV and GDN layout only. RAM KV already owns a host archive, Vision keeps media
-        // state in the planner, DFlash keeps a context the store does not mirror, and a PP peer
-        // holds a layer range rather than a head shard, so each is refused rather than parked
-        // approximately.
-        if (options.ram_kv.gpu_tokens != 0 || options.enable_vision || options.pp != 1 ||
+        // per-rank KV and GDN layout only. RAM KV already owns a host archive, DFlash keeps a
+        // context the store does not mirror, and a PP peer holds a layer range rather than a
+        // head shard, so each is refused rather than parked approximately. Vision is admitted:
+        // the parked identity already carries the media digests and consumer spans, and a
+        // restored lane resumes through the ordinary prefix path, which skips Vision execution
+        // for media wholly inside the matched prefix.
+        if (options.ram_kv.gpu_tokens != 0 || options.pp != 1 ||
             options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument(
-                "KV parking requires single-stage Text/MTP without RAM KV, Vision or DFlash");
+                "KV parking requires single-stage Text/MTP without RAM KV or DFlash");
         }
     }
     // This call is also where every rope-option rejection lives (unsupported variant, Vision,

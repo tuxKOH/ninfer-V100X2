@@ -26,7 +26,10 @@ evaluation measures this converted `.ninfer` artifact on V100; broad quality equ
 not established by our inference checks. V100 dequantizes these weights without A4 activation
 quantization. V3 is a container upgrade, not a new QAT checkpoint.
 
-**Limitation: QUASAR is text-only in this fork.** The source checkpoint and published container
-include Vision, but this runtime rejects QUASAR image/video requests and uploads zero Vision
-weights. MTP3 uses 8.66 GiB of weights per card; the full artifact occupies 18.42 GiB on disk.
+**Vision is opt-in and experimental for QUASAR.** The source checkpoint and published container
+include Vision, and the v3 container stores the complete set in the formats the Vision binder
+expects, so `--vision` at TP2 binds and executes it. The default profile remains text-only and
+uploads zero Vision weights. As with the official artifact, TP2 Vision is not fully qualified on
+this host and its visual-prefix bridge test still fails; the recommended experimental Vision
+profile uses `--no-prefix-reuse`. MTP3 uses 8.66 GiB of weights per card; the full artifact occupies 18.42 GiB on disk.
 Official NVFP4 and GGUF-derived Q4_K_M remain supported alternatives.

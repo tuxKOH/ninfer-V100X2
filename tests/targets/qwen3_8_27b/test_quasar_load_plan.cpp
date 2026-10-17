@@ -123,6 +123,33 @@ void verify(const char* path) {
         require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
                 "QUASAR DFlash projections lost their W8 format");
     }
+
+    // --vision at TP2 binds the container's complete Vision set. The default plans above upload
+    // none of it; with the flag every Vision tensor must land on the primary device only, because
+    // the Vision encoder runs on rank 0 and replicates composed embeddings to the peer.
+    std::size_t stored_vision = 0;
+    for (const auto& object : reader.objects()) {
+        if (object_name(object).starts_with("vision/")) { ++stored_vision; }
+    }
+    require(stored_vision != 0, "QUASAR container has no Vision set to bind");
+    for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
+        Binder binder(reader, 2);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+                                        {.vision = true, .speculative = backend}, 2);
+        int vision_primary = 0;
+        int vision_peer    = 0;
+        for (const auto& placement : plan.materialization.device_objects) {
+            const auto name = object_name(binder.descriptor(placement.object));
+            if (!name.starts_with("vision/")) { continue; }
+            if (placement.device == 0) {
+                ++vision_primary;
+            } else {
+                ++vision_peer;
+            }
+        }
+        require(vision_primary == static_cast<int>(stored_vision) && vision_peer == 0,
+                "QUASAR Vision did not upload its complete set to the primary device only");
+    }
 }
 } // namespace
 

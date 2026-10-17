@@ -164,8 +164,11 @@ retain the original FP32 SIMT accumulation association; three through eight-colu
 four-partition QPN association, and wider calls decode the same packed planes into the Volta
 MMA staging tiles. No second resident weight copy or request-time repacking is added.
 
-The trial admits SM70 TP2 Text/None/MTP/DFlash and experimental TP1/PP2 Text/None/MTP.
-Standalone TP1, TP4 and Vision are rejected. PP2 uses the same registered artifact and
+The trial admits SM70 TP2 Text/None/MTP/DFlash, TP2 Vision through `--vision`, and
+experimental TP1/PP2 Text/None/MTP. The container stores the complete Vision set in the
+formats the Vision binder expects (Q6G64 patch embedding, Q4/Q5 layer projections, W8
+merger, BF16 norms/biases), so `--vision` binds and uploads it on the primary device.
+Standalone TP1 and TP4 are rejected, as is PP2 + Vision. PP2 uses the same registered artifact and
 complete immutable parents: layers 0..31 reside on the second device, layers 32..63
 and output/MTP on the primary; token embedding is replicated. No TP shard repacking
 or new quantization is performed. See the [runtime ownership contract](concurrent-inference-architecture.md#121-single-request-pp2-experiment).
@@ -174,10 +177,11 @@ DFlash2 objects retain W8 projections and BF16 auxiliaries, use the same text-on
 as the official v3 package, and become resident only when DFlash is selected. MTP and DFlash
 are mutually exclusive; the DFlash window is at most seven.
 The host-only `ninfer_quasar_load_plan_test` checks every NVFP4 parent's original file range,
-all 256 exact FP32 scale pairs, None/MTP/DFlash residency and zero Vision objects uploaded to
-either GPU. Vision remains validation-only in the original file; removing its disk payload
-would not reduce this text-only profile's GPU memory. The public-Engine state gate and trial
-measurements are separate evidence; neither proves BF16-equivalent model quality.
+all 256 exact FP32 scale pairs, None/MTP/DFlash residency, zero Vision objects uploaded by the
+default text-only plan, and primary-device-only Vision placement when `--vision` is selected.
+Without the flag Vision remains validation-only in the original file, so removing its disk
+payload would not reduce the text-only profile's GPU memory. The public-Engine state gate and
+trial measurements are separate evidence; neither proves BF16-equivalent model quality.
 
 The fixed target facts below also apply to this checkpoint; Section 3's mixed FP8/NVFP4
 assignment describes the official `nvfp4` identity, not QUASAR.

@@ -53,7 +53,10 @@ omitted at startup.
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
 distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2.
 Experimental `--vision` is available at TP2 for artifacts with execution-qualified Vision weights;
-QUASAR and GGUF-derived Q4_K_M still reject it. Vision weights and encoding reside only on the primary
+GGUF-derived Q4_K_M still rejects it. QUASAR v3 stores the complete Vision set in the formats the
+Vision binder expects and accepts `--vision` at TP2; without the flag it uploads no Vision object.
+`--vision` may be combined with `--kv-park-bytes`: a parked identity carries the media digests and
+consumer spans a returning request needs. Vision weights and encoding reside only on the primary
 rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
 the same three-axis positions and per-request RoPE delta. Vision requests participate in the
 same compact concurrent decode batches as text requests. Vision requires additional startup

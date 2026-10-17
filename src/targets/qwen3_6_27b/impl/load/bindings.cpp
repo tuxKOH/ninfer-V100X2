@@ -938,9 +938,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                     (weights_profile != WeightsProfile::Qwen38Nvfp4 && !quasar))) {
         throw std::invalid_argument("PP2 currently supports Qwen3.8 NVFP4/QUASAR Text/None/MTP only");
     }
-    if (quasar && ((tp != 2 && pp != 2) || features.vision)) {
-        throw std::invalid_argument("QUASAR requires text-only TP2 or PP2 (DFlash is TP2 only)");
+    if (quasar && tp != 2 && pp != 2) {
+        throw std::invalid_argument("QUASAR requires TP2 or PP2 (DFlash is TP2 only)");
     }
+    // QUASAR TP2 may bind Vision: the v3 container stores the complete Vision set in exactly the
+    // formats bind_vision_backbone expects (Q6G64 patch embedding, Q4/Q5 layer projections, W8
+    // merger, BF16 norms/biases). It stays opt-in through --vision and experimental; the trial's
+    // default profile remains text-only and uploads no Vision object. PP2 + Vision is rejected
+    // by the pipeline check above.
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
     }

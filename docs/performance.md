@@ -152,8 +152,10 @@ operator and full-vocabulary comparisons above retain their completed evidence.
 The separate `qwen3.8-27b/quasar-nvfp4` trial uses the published QUASAR NInfer v3 artifact
 on this two-card PCIe-P2P host, without NVLink. QUASAR is QAT, not mathematically lossless
 compression. Its stored NVFP4 codes/scales and FP32 activation divisors remain unchanged;
-this does not establish BF16-equivalent artifact quality. The profile is text-only and loads
-zero Vision objects onto either GPU; validation-only Vision data remains in the original file.
+this does not establish BF16-equivalent artifact quality. The recommended profile is text-only:
+without `--vision` it loads zero Vision objects onto either GPU, and validation-only Vision data
+remains in the original file. `--vision` at TP2 binds that data on the primary device as an
+experimental route.
 
 SM70 Attention/GDN input and output projections now share the load-time QPN layout with MLP.
 Narrow inputs write final output planes directly. Wide projections decode weights once per

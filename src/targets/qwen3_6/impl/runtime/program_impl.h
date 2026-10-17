@@ -1222,12 +1222,14 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         SequenceState& sequence = sequences[lane];
         if (!sequence.retained || !sequence.kv) { return false; }
         // Park only what this store can restore bit-exactly. RAM KV keeps its own single-request
-        // host window and Vision keeps planner-side media state; in both cases refuse, and let
-        // the lane be dropped as before. A rewrite checkpoint IS mirrored (see below), because
-        // without its auxiliary GDN slot and hidden a returning conversation whose replay
-        // diverges inside the last response could only resume at the execution frontier -- which
-        // is exactly the case parking exists to avoid.
-        if (ram_kv.gpu_tokens != 0 || vision_enabled) { return false; }
+        // host window, so refuse and let the lane be dropped as before. A rewrite checkpoint IS
+        // mirrored (see below), because without its auxiliary GDN slot and hidden a returning
+        // conversation whose replay diverges inside the last response could only resume at the
+        // execution frontier -- which is exactly the case parking exists to avoid. Vision needs
+        // nothing beyond the ledger/identity (which carry media digests and spans) plus the
+        // mirrored KV/GDN/hidden: a restored prefix skips Vision execution for media wholly
+        // inside it.
+        if (ram_kv.gpu_tokens != 0) { return false; }
         if (sequence.execution_frontier == 0 ||
             sequence.text_kv_valid != sequence.execution_frontier) {
             return false;
