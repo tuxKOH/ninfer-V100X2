@@ -724,14 +724,14 @@ checkpoint are eligible reuse positions, rather than an arbitrary longest common
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
-rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
-`preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
-response's complete deterministic generation prologue. For thinking generation this includes
-`<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
-that frontier does not split a tiny trailing prologue into a separate prefill unit, and a normalized
-response which no longer matches the raw generated tokens replays only that response and its
-suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
-be recomputed without its reasoning.
+rewritten suffix; matching KV tokens alone never authorize a partial hit. Both kinds stop at the
+last assistant opener, before `<think>`: the deterministic generation prologue (thinking or empty
+thinking block) is replayed as part of the suffix. A frontier after `<think>\n` would end on a
+newline that can merge with the replay's first byte into a different token, so the stored boundary
+could never match and the conversation would fall back to a full reset. A normalized response which
+no longer matches the raw generated tokens replays only that response and its suffix. Stable `false`
+keeps the first assistant opener in the open turn so a newly closed turn can be recomputed without
+its reasoning.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
 bit. An exact current frontier or matching complete checkpoint remains reusable across a mode

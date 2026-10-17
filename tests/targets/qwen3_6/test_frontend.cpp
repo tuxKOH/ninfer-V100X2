@@ -652,19 +652,21 @@ int test_rewrite_checkpoint_trace() {
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved.rewrite_checkpoint->offset == preserved.text.size() &&
+                          preserved.rewrite_checkpoint->offset ==
+                              preserved_header + assistant_header.size() &&
                           preserved.text.ends_with("<think>\n"),
-                      "preserve_thinking did not publish the complete generation prologue");
+                      "preserve_thinking did not stop at the assistant header");
 
     preserve.enable_thinking           = false;
     const fi::RenderedChat nonthinking = render_chat(tool_loop, preserve);
-    failures += check(nonthinking.rewrite_checkpoint &&
+    const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
+    failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking.rewrite_checkpoint->offset == nonthinking.text.size() &&
+                          nonthinking.rewrite_checkpoint->offset ==
+                              nonthinking_header + assistant_header.size() &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
-                      "non-thinking response replay did not retain its complete generation "
-                      "prologue");
+                      "non-thinking response replay did not stop at the assistant header");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
@@ -774,8 +776,8 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                           preserved_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           preserved_data.identity.rewrite_checkpoint->frontier ==
-                              preserved_data.token_ids.size(),
-                      "preserve-thinking prompt did not publish a prompt-frontier response "
+                              preserved_data.token_ids.size() - 2,
+                      "preserve-thinking prompt did not publish an assistant-header response "
                       "checkpoint");
 
     ninfer::ChatMessage nonthinking_message;
@@ -791,10 +793,11 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking_data.identity.rewrite_checkpoint->frontier ==
+                          nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
                           !nonthinking_data.starts_in_reasoning,
-                      "non-thinking prompt did not publish a prompt-frontier response checkpoint");
+                      "non-thinking prompt did not publish an assistant-header response "
+                      "checkpoint");
 
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;

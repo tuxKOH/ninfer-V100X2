@@ -430,9 +430,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
+        // Both checkpoint kinds stop at the assistant header, before "<think>". A frontier
+        // after "<think>\n" would end on a newline that is immediately followed by replayed
+        // content: when that content starts with a newline the two merge into one token, so
+        // the stored frontier's last token can never match the replaying prompt. Here the
+        // next bytes are always the template's fixed "<think>", which cannot retokenize the
+        // boundary.
+        const std::size_t assistant_frontier = rendered.size();
         if (!preserve_thinking && !rewrite_checkpoint) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = assistant_frontier};
         }
         if (options.enable_thinking) {
             rendered += "<think>\n";
@@ -440,11 +447,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered += "<think>\n\n</think>\n\n";
         }
         if (preserve_thinking) {
-            // Response replay retains the deterministic generation prologue. This is the prompt
-            // frontier for both thinking modes, so capturing it does not split off a tiny final
-            // prefill unit. The complete rendered prefix is tokenized independently below.
             rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+                .kind = RewriteCheckpointKind::ResponseReplay, .offset = assistant_frontier};
         }
     }
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
