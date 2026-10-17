@@ -633,7 +633,11 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
-            instance_.program->abort_lane(lane);
+            // A cancelled decode stopped at a resolved round boundary, so its KV and checkpoint
+            // are exactly what the conversation's next request can resume from. Retain that
+            // state (a cancelled staged prefill is still cleared); dropping it here is what
+            // made an ESC during generation cost a full re-prefill.
+            instance_.program->retain_cancelled_lane(lane);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -1116,8 +1120,9 @@ private:
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         // A row whose own output session failed. The batch still has to be resolved for every
         // lane -- the Program's pending state is per-round, not per-row -- so such a row is
-        // resolved as if it had been cancelled (accepted 0, lane cleared) and the request is
-        // errored afterwards, once the shared batch state is consistent again.
+        // resolved as if it had been cancelled (accepted 0; the Program keeps the pre-round
+        // continuation when it can rewind) and the request is errored afterwards, once the shared
+        // batch state is consistent again.
         std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];

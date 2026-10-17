@@ -205,13 +205,64 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                             sequence.execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+        } else {
+            // The replay diverged from the lane's frontier. Resume from the largest retained
+            // boundary that is still a prefix of it: the current checkpoint first, then the
+            // history. A stale or forked replay of the same conversation usually matches an
+            // older turn boundary, which turns its full prefill into a suffix prefill. After a
+            // branch resume the history is not sorted, so every entry is considered.
+            std::uint32_t best_frontier = 0;
+            std::uint32_t best_index    = 0;  // 0 = no checkpoint selected
+            RewriteCheckpointKind best_kind = RewriteCheckpointKind::TurnClosure;
+            // Two independent checks are required. (1) The lane's own ledger/KV must contain
+            // this prompt prefix -- otherwise the resident KV pages the resume would read were
+            // produced for a different branch. (2) The checkpoint's OWN lineage must contain it
+            // too -- otherwise its host recurrent state was produced for a different branch
+            // (branches share a prefix only up to their fork). The checkpoint frontier must also
+            // still be materialized: a branch switch trims the KV to an older boundary.
+            const auto consider_checkpoint = [&](RewriteCheckpointKind kind, std::uint32_t frontier,
+                                                 std::uint32_t index,
+                                                 const std::vector<TokenId>& ledger,
+                                                 const qwen3_6::detail::ResidentPrefixIdentity&
+                                                     identity) {
+                if (frontier == 0 || frontier > prompt.token_ids.size() ||
+                    frontier <= best_frontier || frontier > ledger.size() ||
+                    frontier > sequence.text_kv_valid) {
+                    return;
+                }
+                if (!qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                     sequence.prefix_identity, frontier) ||
+                    !qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier)) {
+                    return;
+                }
+                best_frontier = frontier;
+                best_index    = index;
+                best_kind     = kind;
+            };
+            if (sequence.rewrite_checkpoint.valid) {
+                const bool own = !sequence.checkpoint_ledger.empty();
+                consider_checkpoint(
+                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0,
+                    own ? sequence.checkpoint_ledger : sequence.ledger,
+                    own ? sequence.checkpoint_identity : sequence.prefix_identity);
+            }
+            // DFlash keeps its checkpoint state in its own context, so the host history (which
+            // mirrors only the recurrent slot and hidden) cannot restore it.
+            if (speculative_backend != SpeculativeBackend::DFlash) {
+                for (std::size_t i = 0; i < sequence.checkpoint_history.size(); ++i) {
+                    const HostCheckpoint& host = sequence.checkpoint_history[i];
+                    const bool own             = !host.ledger.empty();
+                    consider_checkpoint(host.kind, host.frontier,
+                                        static_cast<std::uint32_t>(i + 1),
+                                        own ? host.ledger : sequence.ledger,
+                                        own ? host.identity : sequence.prefix_identity);
+                }
+            }
+            if (best_index != 0 || best_frontier != 0) {
+                plan->reuse            = restore_path(best_kind);
+                plan->reuse_base       = best_frontier;
+                plan->checkpoint_index = best_index;
+            }
         }
     }
 
@@ -225,18 +276,47 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         prompt.identity.reusable && parked.enabled() &&
         speculative_backend != SpeculativeBackend::DFlash) {
         parked_entry = parked.match(prompt);
-        if (parked_entry != nullptr) {
+        // A replay that diverged inside the parked conversation's last response matches no
+        // execution frontier, but it still contains a retained checkpoint's prefix. Both
+        // frontiers are valid reuse points, so take the longer one: a checkpoint resume only
+        // costs the suffix re-prefill a resident lane would pay anyway. An exact resume needs the
+        // parked tail hidden under MTP, and a checkpoint resume does not, so an entry whose tail
+        // hidden was invalidated (a cancellation during a speculative round) is still useful.
+        const std::optional<qwen3_6::detail::ParkedCheckpointMatch> checkpoint_match =
+            parked.match_checkpoint(prompt);
+        const bool exact_usable = parked_entry != nullptr &&
+                                  (speculative_backend != SpeculativeBackend::Mtp ||
+                                   parked_entry->tail_hidden_valid);
+        const bool checkpoint_usable =
+            checkpoint_match.has_value() &&
+            (speculative_backend != SpeculativeBackend::Mtp ||
+             (decoder->mtp_cache() != nullptr &&
+              checkpoint_match->entry->mtp_kv_valid >= checkpoint_match->frontier - 1));
+        if (checkpoint_usable &&
+            (!exact_usable || checkpoint_match->frontier > parked_entry->execution_frontier)) {
+            parked_entry            = checkpoint_match->entry;
+            plan->reuse             = ReusePath::RestoreParkedKv;
+            plan->reuse_base        = checkpoint_match->frontier;
+            plan->parked_id         = parked_entry->id;
+            plan->parked_checkpoint = true;
+            plan->checkpoint_index  = checkpoint_match->checkpoint_index;
+        } else if (exact_usable) {
             plan->reuse      = ReusePath::RestoreParkedKv;
             plan->reuse_base = parked_entry->execution_frontier;
             plan->parked_id  = parked_entry->id;
+        } else {
+            parked_entry = nullptr;
         }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const bool parked_ready = parked_entry != nullptr && parked_entry->tail_hidden_valid &&
-                                  decoder->mtp_cache() != nullptr &&
-                                  (plan->reuse_base == 0 ||
-                                   parked_entry->mtp_kv_valid >= plan->reuse_base - 1);
+        // A checkpoint resume restores its own hidden, so it does not need the parked tail
+        // hidden; an exact resume does.
+        const bool parked_ready =
+            parked_entry != nullptr &&
+            (parked_entry->tail_hidden_valid || plan->parked_checkpoint) &&
+            decoder->mtp_cache() != nullptr &&
+            (plan->reuse_base == 0 || parked_entry->mtp_kv_valid >= plan->reuse_base - 1);
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
@@ -244,12 +324,66 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
+        bool checkpoint_fallback = false;
+        if (plan->reuse == ReusePath::AppendAtFrontier && !append_ready &&
+            decoder->mtp_cache() != nullptr) {
+            // The append frontier is unusable only because the tail hidden is not authoritative
+            // (a cancellation during a speculative round). The lane's rewrite checkpoints are
+            // still intact, and resuming from the largest matching one is exactly what a
+            // resident lane would do.
+            std::uint32_t best_frontier = 0;
+            std::uint32_t best_index    = 0;
+            RewriteCheckpointKind best_kind = RewriteCheckpointKind::TurnClosure;
+            const auto consider_checkpoint = [&](RewriteCheckpointKind kind, std::uint32_t frontier,
+                                                 std::uint32_t index,
+                                                 const std::vector<TokenId>& ledger,
+                                                 const qwen3_6::detail::ResidentPrefixIdentity&
+                                                     identity) {
+                if (frontier == 0 || frontier > prompt.token_ids.size() ||
+                    frontier <= best_frontier || frontier > ledger.size() ||
+                    frontier > sequence.text_kv_valid ||
+                    sequence.mtp_kv_valid < frontier - 1 ||
+                    !qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                     sequence.prefix_identity, frontier) ||
+                    !qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier)) {
+                    return;
+                }
+                best_frontier = frontier;
+                best_index    = index;
+                best_kind     = kind;
+            };
+            if (sequence.rewrite_checkpoint.valid) {
+                const bool own = !sequence.checkpoint_ledger.empty();
+                consider_checkpoint(
+                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0,
+                    own ? sequence.checkpoint_ledger : sequence.ledger,
+                    own ? sequence.checkpoint_identity : sequence.prefix_identity);
+            }
+            for (std::size_t i = 0; i < sequence.checkpoint_history.size(); ++i) {
+                const HostCheckpoint& host = sequence.checkpoint_history[i];
+                const bool own             = !host.ledger.empty();
+                consider_checkpoint(host.kind, host.frontier, static_cast<std::uint32_t>(i + 1),
+                                    own ? host.ledger : sequence.ledger,
+                                    own ? host.identity : sequence.prefix_identity);
+            }
+            if (best_frontier != 0) {
+                plan->reuse             = restore_path(best_kind);
+                plan->reuse_base        = best_frontier;
+                plan->checkpoint_index  = best_index;
+                plan->parked_id         = 0;
+                plan->parked_checkpoint = false;
+                parked_entry            = nullptr;
+                checkpoint_fallback     = true;
+            }
+        }
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
-            !parked_ready) {
-            plan->reuse      = ReusePath::FullReset;
-            plan->reuse_base = 0;
-            plan->parked_id  = 0;
-            parked_entry     = nullptr;
+            !parked_ready && !checkpoint_fallback) {
+            plan->reuse             = ReusePath::FullReset;
+            plan->reuse_base        = 0;
+            plan->parked_id         = 0;
+            plan->parked_checkpoint = false;
+            plan->checkpoint_index  = 0;
+            parked_entry            = nullptr;
         }
     }
 
@@ -258,17 +392,21 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         (!dflash || !sequence.kv ||
          dflash->full.has_value() != sequence.kv->backend.has_value() ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
+        plan->reuse            = ReusePath::FullReset;
+        plan->reuse_base       = 0;
+        plan->checkpoint_index = 0;
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     // A parked plan names the lane's *replaced* occupant only until the restore runs, so the
     // occupant's checkpoint says nothing about the conversation being resumed: never let it
-    // authorize a retention the restored state cannot back.
+    // authorize a retention the restored state cannot back. A historical plan likewise replaces
+    // the lane's current checkpoint with an older boundary before execution, so an action
+    // validated against the pre-restore checkpoint would fail (or retain the wrong state).
     const bool existing_checkpoint_matches =
         desired && plan->reuse != ReusePath::FullReset &&
-        plan->reuse != ReusePath::RestoreParkedKv && sequence.rewrite_checkpoint.valid &&
+        plan->reuse != ReusePath::RestoreParkedKv && plan->checkpoint_index == 0 &&
+        sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                         desired->frontier);

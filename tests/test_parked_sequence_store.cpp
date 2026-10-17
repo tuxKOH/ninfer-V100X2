@@ -13,6 +13,8 @@
 
 using ninfer::TokenId;
 using ninfer::targets::qwen3_6::PreparedPromptData;
+using ninfer::targets::qwen3_6::RewriteCheckpointKind;
+using ninfer::targets::qwen3_6::detail::HostCheckpoint;
 using ninfer::targets::qwen3_6::detail::ParkedSequence;
 using ninfer::targets::qwen3_6::detail::ParkedSequenceStore;
 using ninfer::targets::qwen3_6::detail::ResidentPrefixIdentity;
@@ -39,6 +41,16 @@ PreparedPromptData prompt_of(const std::vector<TokenId>& tokens) {
         }
     }
     return prompt;
+}
+
+HostCheckpoint checkpoint_of(const std::vector<TokenId>& tokens, std::uint32_t frontier) {
+    const PreparedPromptData prompt = prompt_of(tokens);
+    HostCheckpoint checkpoint;
+    checkpoint.kind     = RewriteCheckpointKind::ResponseReplay;
+    checkpoint.frontier = frontier;
+    checkpoint.ledger   = tokens;
+    checkpoint.identity.assign(prompt);
+    return checkpoint;
 }
 
 std::unique_ptr<ParkedSequence> entry_of(const PreparedPromptData& prompt, std::size_t bytes) {
@@ -122,6 +134,107 @@ int main() {
     check(lru.used_bytes() == 80, "eviction must release the evicted entry's bytes");
     check(lru.find_by_id(*first) != nullptr, "a touched entry must survive eviction");
     check(lru.find_by_id(*second) == nullptr, "the least recently used entry must be evicted");
+
+    // The rewrite checkpoint is a second match frontier. A replay that diverges inside the last
+    // response matches no execution frontier, but it still contains the checkpoint prefix, so the
+    // checkpoint matcher finds the entry that the exact matcher must not.
+    const PreparedPromptData gamma = prompt_of({60, 61, 62, 63, 64, 65});
+    auto checkpoint_entry          = entry_of(gamma, 10);
+    checkpoint_entry->checkpoint_valid    = true;
+    checkpoint_entry->checkpoint_kind     = RewriteCheckpointKind::ResponseReplay;
+    checkpoint_entry->checkpoint_frontier = 4;
+    ParkedSequenceStore checkpointed(100);
+    (void)checkpointed.insert(std::move(checkpoint_entry), 1);
+    const PreparedPromptData diverged = prompt_of({60, 61, 62, 63, 90, 91, 92});
+    check(checkpointed.match(diverged) == nullptr,
+          "a replay that diverged inside the last response must not match the full frontier");
+    const auto checkpoint_hit = checkpointed.match_checkpoint(diverged);
+    check(checkpoint_hit.has_value() && checkpoint_hit->frontier == 4 &&
+              checkpoint_hit->checkpoint_index == 0,
+          "the current checkpoint frontier must match a diverged replay");
+    // A prompt that diverges before the checkpoint is still unusable.
+    check(!checkpointed.match_checkpoint(prompt_of({60, 61, 99, 63, 64, 65})).has_value(),
+          "a replay that diverged before the checkpoint must not match");
+
+    // A historical boundary is a second-chance resume point for a stale or forked replay. It is
+    // reported with its index so the caller can import that boundary's state.
+    const PreparedPromptData delta = prompt_of({70, 71, 72, 73, 74, 75, 76});
+    auto history_entry             = entry_of(delta, 10);
+    HostCheckpoint historical;
+    historical.kind     = RewriteCheckpointKind::ResponseReplay;
+    historical.frontier = 3;
+    history_entry->checkpoint_history.push_back(std::move(historical));
+    ParkedSequenceStore historical_store(100);
+    (void)historical_store.insert(std::move(history_entry), 1);
+    const auto historical_hit =
+        historical_store.match_checkpoint(prompt_of({70, 71, 72, 99, 99, 99}));
+    check(historical_hit.has_value() && historical_hit->frontier == 3 &&
+              historical_hit->checkpoint_index == 1,
+          "a historical checkpoint boundary must match a stale replay");
+    // Provenance: a retained checkpoint belongs to the branch it was captured from. Two branches
+    // of one conversation share a token prefix only up to their fork, so a checkpoint from the
+    // other branch must never be selected merely because the current lane ledger matches at its
+    // frontier -- its recurrent state is from tokens this replay never had.
+    auto forked_entry = entry_of(prompt_of({1, 2, 3, 4, 5, 6}), 10);
+    forked_entry->checkpoint_history.push_back(checkpoint_of({1, 2, 9, 9, 9, 9}, 5));
+    ParkedSequenceStore forked_store(100);
+    (void)forked_store.insert(std::move(forked_entry), 1);
+    check(!forked_store.match_checkpoint(prompt_of({1, 2, 3, 4, 5, 6, 7})).has_value(),
+          "a checkpoint from another branch must not be selected by the entry's tokens");
+    // Nor may its state be paired with this entry's KV just because the prompt matches the
+    // checkpoint's own lineage: both the KV and the state must describe the same prefix.
+    check(!forked_store.match_checkpoint(prompt_of({1, 2, 9, 9, 9, 9, 0})).has_value(),
+          "a checkpoint must not be paired with KV from a different branch");
+    // When the entry itself belongs to that lineage, the boundary is selectable.
+    auto matching_entry = entry_of(prompt_of({1, 2, 9, 9, 9, 9}), 10);
+    matching_entry->checkpoint_history.push_back(checkpoint_of({1, 2, 9, 9, 9, 9}, 5));
+    ParkedSequenceStore matching_store(100);
+    (void)matching_store.insert(std::move(matching_entry), 1);
+    const auto provenance_hit =
+        matching_store.match_checkpoint(prompt_of({1, 2, 9, 9, 9, 9, 0}));
+    check(provenance_hit.has_value() && provenance_hit->frontier == 5 &&
+              provenance_hit->checkpoint_index == 1,
+          "a replay matching both the entry and the checkpoint lineage must select it");
+
+    // The newest matching boundary wins even when several are retained.
+    auto two_history_entry = entry_of(delta, 10);
+    HostCheckpoint older;
+    older.kind     = RewriteCheckpointKind::ResponseReplay;
+    older.frontier = 2;
+    HostCheckpoint newer = older;
+    newer.frontier       = 5;
+    two_history_entry->checkpoint_history.push_back(std::move(older));
+    two_history_entry->checkpoint_history.push_back(std::move(newer));
+    ParkedSequenceStore two_history_store(100);
+    (void)two_history_store.insert(std::move(two_history_entry), 1);
+    const auto newest_match = two_history_store.match_checkpoint(delta);
+    check(newest_match.has_value() && newest_match->frontier == 5,
+          "the largest matching retained boundary must win");
+
+    // A protected insert may evict other entries, but never the entry it protects.
+    ParkedSequenceStore guarded(100);
+    const auto guarded_first  = guarded.insert(entry_of(prompt_of({70, 71}), 40), 1);
+    const auto guarded_second = guarded.insert(entry_of(prompt_of({72, 73}), 40), 2);
+    const auto guarded_third =
+        guarded.insert(entry_of(prompt_of({74, 75}), 40), 3, *guarded_first);
+    check(guarded_third.has_value(), "a protected insert must still be admitted");
+    check(guarded.find_by_id(*guarded_first) != nullptr,
+          "a protected entry must survive the insert");
+    check(guarded.find_by_id(*guarded_second) == nullptr,
+          "the unprotected least-recently-used entry must be evicted");
+
+    // When the new entry cannot fit beside the protected one, the insert is refused before any
+    // eviction, leaving every stored entry intact.
+    ParkedSequenceStore protected_full(100);
+    const auto protected_big   = protected_full.insert(entry_of(prompt_of({80, 81}), 80), 1);
+    const auto protected_small = protected_full.insert(entry_of(prompt_of({82, 83}), 20), 2);
+    check(!protected_full.insert(entry_of(prompt_of({84, 85}), 30), 3, *protected_big)
+               .has_value(),
+          "an insert that cannot fit beside the protected entry must be refused");
+    check(protected_full.used_bytes() == 100 && protected_full.entry_count() == 2,
+          "a refused protected insert must not evict anything");
+    check(protected_full.find_by_id(*protected_small) != nullptr,
+          "a refused protected insert must leave the other entries intact");
 
     // Erasing releases the bytes it accounted for.
     lru.erase(*first);

@@ -112,6 +112,42 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     vision_items_.resize(retained_items);
 }
 
+bool ResidentPrefixIdentity::same_prefix(const ResidentPrefixIdentity& other,
+                                         std::size_t count) const noexcept {
+    if (count > size() || count > other.size()) { return false; }
+    if (!std::equal(token_types_.begin(),
+                    token_types_.begin() + static_cast<std::ptrdiff_t>(count),
+                    other.token_types_.begin())) {
+        return false;
+    }
+    for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
+        if (!std::equal(positions_[axis].begin(),
+                        positions_[axis].begin() + static_cast<std::ptrdiff_t>(count),
+                        other.positions_[axis].begin())) {
+            return false;
+        }
+    }
+    std::size_t own_items   = 0;
+    std::size_t other_items = 0;
+    if (!prefix_item_count(vision_items_, count, &own_items) ||
+        !prefix_item_count(other.vision_items_, count, &other_items) ||
+        own_items != other_items) {
+        return false;
+    }
+    for (std::size_t i = 0; i < own_items; ++i) {
+        if (!same_item(vision_items_[i], other.vision_items_[i])) { return false; }
+    }
+    return true;
+}
+
+std::size_t ResidentPrefixIdentity::bytes() const noexcept {
+    std::size_t total = token_types_.capacity();
+    for (const auto& axis : positions_) { total += axis.capacity() * sizeof(std::int32_t); }
+    // Vision items are rare in this deployment; count a conservative per-item estimate.
+    total += vision_items_.capacity() * sizeof(VisionItem);
+    return total;
+}
+
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
     const std::size_t prompt_tokens = prompt.token_ids.size();
     if (count > prompt_tokens || count > size() || prompt.token_types.size() != prompt_tokens ||

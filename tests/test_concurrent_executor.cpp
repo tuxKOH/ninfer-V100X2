@@ -309,6 +309,12 @@ public:
         if (lane < max_concurrency_) { clear(lane); }
     }
 
+    // The fake does not model retained continuation state, so a cancelled lane is cleared for
+    // both entry points; the executor contract only requires that the call is made.
+    void retain_cancelled_lane(std::uint32_t lane) noexcept {
+        if (lane < max_concurrency_) { clear(lane); }
+    }
+
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     void evict_retained_lane(std::uint32_t) noexcept {}
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {

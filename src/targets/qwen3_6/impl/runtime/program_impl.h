@@ -625,19 +625,39 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     // FullReset path applies, so a request that restores A while B is resident keeps both.
     if (request_plan.reuse == ReusePath::RestoreParkedKv) {
         const std::uint64_t target = request_plan.parked_id;
-        if (sequence.retained) { (void)park_retained_lane(sequence.lane); }
-        // Make the target the last eviction candidate before the incumbent's park runs, so a full
-        // store cannot drop the very entry this plan is about to consume.
+        // Protect the target from the incumbent's insert: an insert that cannot fit without
+        // evicting it is refused, and the incumbent is dropped exactly as it would be without
+        // parking, so the entry this plan is about to consume always survives.
         parked.touch(target, park_clock++);
-        const ParkedSequence* parked_entry = parked.find_by_id(target);
+        if (sequence.retained && !park_retained_lane(sequence.lane, target)) {
+            // No empty lane to restore into unless the incumbent is dropped. A refused insert
+            // may already have detached part of the incumbent's KV, which is exactly the state
+            // clear_lane is for.
+            clear_lane(sequence, requests[lane]);
+        }
+        ParkedSequence* parked_entry = parked.find_by_id(target);
         if (parked_entry == nullptr) {
             throw std::logic_error("planned parked conversation is no longer stored");
         }
         restore_parked_lane(sequence, *parked_entry, request_plan.text_kv_page_entitlement,
-                            request_plan.backend_kv_page_entitlement);
+                            request_plan.backend_kv_page_entitlement,
+                            request_plan.parked_checkpoint, request_plan.checkpoint_index);
         parked.erase(target);
         // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
         // one, so the reuse branch below takes both, and the reported path stays truthful.
+    }
+    // A resident plan may resume from an older boundary of the same conversation (a stale or
+    // forked replay). Import it first so the checkpoint validation below sees the boundary the
+    // plan selected, and preserve the current checkpoint this request is about to overwrite.
+    if (request_plan.checkpoint_index > 0 &&
+        request_plan.reuse != ReusePath::RestoreParkedKv) {
+        restore_historical_checkpoint(
+            sequence, request_plan.checkpoint_index,
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew);
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+        sequence.rewrite_checkpoint.valid) {
+        rotate_device_checkpoint(sequence);
     }
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
@@ -714,6 +734,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            sequence.checkpoint_history.clear();
+            sequence.rewrite_checkpoint = {};
+            sequence.checkpoint_ledger.clear();
+            sequence.checkpoint_identity.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
@@ -828,6 +852,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
             sequence.rewrite_checkpoint = {};
+            sequence.checkpoint_ledger.clear();
+            sequence.checkpoint_identity.clear();
         } else if (request_plan.rewrite_checkpoint_action ==
                    RewriteCheckpointAction::ReclassifyExisting) {
             sequence.rewrite_checkpoint.kind = prompt.identity.rewrite_checkpoint->kind;
@@ -1075,7 +1101,26 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
-                clear_lane(sequence, request);
+                // MTP is the only backend that can keep a cancelled round's lane: the fold above
+                // rewound its recurrent state to the round's base, and planning gates an append
+                // on the tail hidden, which the round overwrote with its last accepted draft's
+                // state (so it is marked invalid here and the next request resumes through the
+                // rewrite checkpoint). DFlash has no equivalent gate on its append path, and the
+                // non-speculative path above has no fold to rewind at all, so both are cleared as
+                // before.
+                if (speculative_backend != SpeculativeBackend::Mtp) {
+                    clear_lane(sequence, request);
+                    continue;
+                }
+                const PendingCandidate pending = request.pending;
+                request.pending            = {};
+                sequence.text_kv_valid     = pending.base_E;
+                sequence.tail_hidden_valid = false;
+                trim_sequence_kv(sequence, pending.base_E, backend_kv_valid(sequence));
+                release_sequence_growth_entitlement(sequence);
+                unbind_sequence_kv(sequence);
+                sequence.retained = true;
+                request.lifecycle = Lifecycle::Complete;
                 continue;
             }
 
@@ -1134,6 +1179,30 @@ void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     clear_lane(sequences[lane], requests[lane]);
 }
 
+void ProgramImplCore::retain_cancelled_lane(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    // Cancellation is sampled at a round boundary, so an Active lane holds exactly the state a
+    // terminal round leaves behind -- ledger, frontends, tail hidden, and the rewrite checkpoint
+    // of the response in flight. Keeping it turns the conversation's next request into an
+    // append/checkpoint resume instead of a full re-prefill. Anything else (a cancelled staged
+    // prefill, a half-resolved batch) is not continuable and is cleared as before.
+    if (request.lifecycle != Lifecycle::Active || !sequence.kv ||
+        sequence.execution_frontier == 0 ||
+        sequence.text_kv_valid != sequence.execution_frontier ||
+        sequence.ledger.size() != sequence.ledger_frontier ||
+        sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        clear_lane(sequence, request);
+        return;
+    }
+    request.pending = {};
+    release_sequence_growth_entitlement(sequence);
+    unbind_sequence_kv(sequence);
+    sequence.retained = true;
+    request.lifecycle = Lifecycle::Complete;
+}
+
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
@@ -1147,14 +1216,17 @@ void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     clear_lane(sequences[lane], requests[lane]);
 }
 
-bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
+bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t protect_id) noexcept {
     try {
         if (!parked.enabled() || lane >= max_concurrency) { return false; }
         SequenceState& sequence = sequences[lane];
         if (!sequence.retained || !sequence.kv) { return false; }
         // Park only what this store can restore bit-exactly. RAM KV keeps its own single-request
-        // host window, Vision keeps planner-side media state, and a rewrite checkpoint's auxiliary
-        // GDN slot is not mirrored; in each case refuse, and let the lane be dropped as before.
+        // host window and Vision keeps planner-side media state; in both cases refuse, and let
+        // the lane be dropped as before. A rewrite checkpoint IS mirrored (see below), because
+        // without its auxiliary GDN slot and hidden a returning conversation whose replay
+        // diverges inside the last response could only resume at the execution frontier -- which
+        // is exactly the case parking exists to avoid.
         if (ram_kv.gpu_tokens != 0 || vision_enabled) { return false; }
         if (sequence.execution_frontier == 0 ||
             sequence.text_kv_valid != sequence.execution_frontier) {
@@ -1173,13 +1245,22 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
 
         // Size the entry before copying anything: an entry that cannot fit must leave the lane
         // exactly as it was, never half-detached.
+        const bool checkpoint = sequence.rewrite_checkpoint.valid;
         std::size_t planned = sequence.kv->text.mapped_payload_bytes() +
                               decoder->linear_attention.slot_image_bytes() +
                               static_cast<std::size_t>(sequence.tail_hidden.bytes());
+        if (checkpoint) {
+            planned += decoder->linear_attention.slot_image_bytes() +
+                       static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes()) +
+                       sequence.checkpoint_ledger.size() * sizeof(TokenId) +
+                       sequence.checkpoint_identity.bytes();
+        }
+        for (const HostCheckpoint& host : sequence.checkpoint_history) { planned += host.bytes; }
         if (sequence.kv->backend) { planned += sequence.kv->backend->mapped_payload_bytes(); }
         for (auto& peer : peers) {
             planned += sequence.kv->text_peers[peer->rank - 1]->mapped_payload_bytes() +
                        peer->decoder->linear_attention.slot_image_bytes();
+            if (checkpoint) { planned += peer->decoder->linear_attention.slot_image_bytes(); }
             if (sequence.kv->backend_peers[peer->rank - 1]) {
                 planned += sequence.kv->backend_peers[peer->rank - 1]->mapped_payload_bytes();
             }
@@ -1196,10 +1277,19 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
         entry->tail_hidden_valid  = sequence.tail_hidden_valid;
         entry->mtp_draft_count    = sequence.mtp_draft_count;
         entry->mtp_drafts         = sequence.mtp_drafts;
+        if (checkpoint) {
+            entry->checkpoint_valid    = true;
+            entry->checkpoint_kind     = sequence.rewrite_checkpoint.kind;
+            entry->checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+            entry->checkpoint_ledger   = sequence.checkpoint_ledger;
+            entry->checkpoint_identity = sequence.checkpoint_identity;
+        }
+        entry->checkpoint_history = sequence.checkpoint_history;
 
-        // One rank's KV payloads and its own GDN slot. The caller has made this rank's device
-        // current; each image is keyed by logical page, so the physical pages freed here are
-        // irrelevant to the restore that will take fresh ones.
+        // One rank's KV payloads and its own GDN slots -- the current slot always, and the
+        // checkpoint slot when the lane carries a rewrite checkpoint. The caller has made this
+        // rank's device current; each image is keyed by logical page, so the physical pages
+        // freed here are irrelevant to the restore that will take fresh ones.
         const auto export_rank = [&](PagedKVAllocation& text, PagedKVAllocation* backend,
                                      LinearAttentionStatePool& state, cudaStream_t stream) {
             entry->text.push_back(text.detach_to_host(stream));
@@ -1209,6 +1299,14 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
                               std::span<std::byte>(slot), stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             entry->linear_state.push_back(std::move(slot));
+            if (checkpoint) {
+                std::vector<std::byte> checkpoint_slot(state.slot_image_bytes());
+                state.export_slot(
+                    LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
+                    std::span<std::byte>(checkpoint_slot), stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                entry->checkpoint_state.push_back(std::move(checkpoint_slot));
+            }
         };
 
         export_rank(sequence.kv->text, sequence.kv->backend ? &*sequence.kv->backend : nullptr,
@@ -1223,6 +1321,19 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
             }
             entry->tail_hidden.push_back(std::move(hidden));
+            if (checkpoint) {
+                // The checkpoint hidden is the lane's own rank-0 tensor: the kernel stores the
+                // hidden state at the captured frontier there and nothing overwrites it until the
+                // next capture, so it can be mirrored alongside the checkpoint slot.
+                std::vector<std::byte> checkpoint_hidden(
+                    static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes()));
+                CUDA_CHECK(cudaMemcpyAsync(checkpoint_hidden.data(),
+                                           sequence.rewrite_checkpoint_hidden.data,
+                                           checkpoint_hidden.size(), cudaMemcpyDeviceToHost,
+                                           device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                entry->checkpoint_hidden = std::move(checkpoint_hidden);
+            }
         }
         for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
@@ -1240,9 +1351,14 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane) noexcept {
         for (const auto& image : entry->backend) { bytes += image->bytes(); }
         for (const auto& slot : entry->linear_state) { bytes += slot.size(); }
         for (const auto& hidden : entry->tail_hidden) { bytes += hidden.size(); }
+        for (const auto& slot : entry->checkpoint_state) { bytes += slot.size(); }
+        bytes += entry->checkpoint_hidden.size();
+        bytes += entry->checkpoint_ledger.size() * sizeof(TokenId) +
+                 entry->checkpoint_identity.bytes();
+        for (const HostCheckpoint& host : entry->checkpoint_history) { bytes += host.bytes; }
         entry->bytes = bytes;
 
-        if (!parked.insert(std::move(entry), park_clock++)) { return false; }
+        if (!parked.insert(std::move(entry), park_clock++, protect_id)) { return false; }
         clear_lane(sequence, requests[lane]);
         return true;
     } catch (...) {
@@ -1276,6 +1392,9 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
+    sequence.checkpoint_ledger.clear();
+    sequence.checkpoint_identity.clear();
+    sequence.checkpoint_history.clear();
     request.pending                  = {};
 }
 
@@ -1540,8 +1659,108 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
     }
 }
 
-void ProgramImplCore::restore_parked_lane(SequenceState& sequence, const ParkedSequence& entry,
-                                          std::uint32_t text_pages, std::uint32_t backend_pages) {
+HostCheckpoint ProgramImplCore::export_checkpoint(SequenceState& sequence) {
+    HostCheckpoint checkpoint;
+    checkpoint.kind     = sequence.rewrite_checkpoint.kind;
+    checkpoint.frontier = sequence.rewrite_checkpoint.frontier;
+    // Provenance, not the live ledger: after a branch resume the lane's ledger may already
+    // describe a different continuation of the same conversation.
+    checkpoint.ledger = sequence.checkpoint_ledger.empty() ? sequence.ledger
+                                                           : sequence.checkpoint_ledger;
+    checkpoint.identity = sequence.checkpoint_ledger.empty() ? sequence.prefix_identity
+                                                             : sequence.checkpoint_identity;
+    checkpoint.bytes += checkpoint.ledger.size() * sizeof(TokenId) + checkpoint.identity.bytes();
+    const auto export_rank = [&](LinearAttentionStatePool& state, cudaStream_t stream) {
+        std::vector<std::byte> image(state.slot_image_bytes());
+        state.export_slot(
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            std::span<std::byte>(image), stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        checkpoint.bytes += image.size();
+        checkpoint.state.push_back(std::move(image));
+    };
+    export_rank(decoder->linear_attention, device.stream);
+    for (auto& peer : peers) {
+        const ScopedDevice scope(peer->device.device);
+        export_rank(peer->decoder->linear_attention, peer->device.stream);
+    }
+    checkpoint.hidden.resize(static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes()));
+    CUDA_CHECK(cudaMemcpyAsync(checkpoint.hidden.data(), sequence.rewrite_checkpoint_hidden.data,
+                               checkpoint.hidden.size(), cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    checkpoint.bytes += checkpoint.hidden.size();
+    return checkpoint;
+}
+
+void ProgramImplCore::rotate_device_checkpoint(SequenceState& sequence) {
+    // DFlash keeps its checkpoint in its own context state, which the host history does not
+    // mirror, so its boundaries are never offered as reuse candidates; keeping them would only
+    // cost host memory and a copy per turn.
+    if (speculative_backend == SpeculativeBackend::DFlash) { return; }
+    if (!sequence.rewrite_checkpoint.valid) { return; }
+    push_host_checkpoint(sequence.checkpoint_history, export_checkpoint(sequence));
+}
+
+void ProgramImplCore::import_checkpoint_state(SequenceState& sequence,
+                                              const HostCheckpoint& checkpoint,
+                                              bool into_current) {
+    if (checkpoint.frontier == 0 ||
+        checkpoint.state.size() != static_cast<std::size_t>(device_count) ||
+        checkpoint.hidden.size() !=
+            static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes())) {
+        throw std::logic_error("retained checkpoint does not describe this engine's rank set");
+    }
+    const auto import_rank = [&](LinearAttentionStatePool& state,
+                                 std::span<const std::byte> image, cudaStream_t stream) {
+        if (into_current) {
+            state.import_slot(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                              image, stream);
+        }
+        state.import_slot(
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency), image,
+            stream);
+    };
+    import_rank(decoder->linear_attention, std::span<const std::byte>(checkpoint.state[0]),
+                device.stream);
+    CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data, checkpoint.hidden.data(),
+                               checkpoint.hidden.size(), cudaMemcpyHostToDevice, device.stream));
+    for (auto& peer : peers) {
+        const ScopedDevice scope(peer->device.device);
+        import_rank(peer->decoder->linear_attention,
+                    std::span<const std::byte>(checkpoint.state[peer->rank]), peer->device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    sequence.rewrite_checkpoint  = RewriteCheckpoint{
+        .valid = true, .kind = checkpoint.kind, .frontier = checkpoint.frontier};
+    sequence.checkpoint_ledger   = checkpoint.ledger;
+    sequence.checkpoint_identity = checkpoint.identity;
+}
+
+void ProgramImplCore::restore_historical_checkpoint(SequenceState& sequence,
+                                                    std::uint32_t checkpoint_index,
+                                                    bool preserve) {
+    if (checkpoint_index == 0 || checkpoint_index - 1 >= sequence.checkpoint_history.size()) {
+        throw std::logic_error("planned historical checkpoint is no longer retained");
+    }
+    HostCheckpoint target = std::move(sequence.checkpoint_history[checkpoint_index - 1]);
+    sequence.checkpoint_history.erase(
+        sequence.checkpoint_history.begin() + static_cast<std::ptrdiff_t>(checkpoint_index - 1));
+    // The lane's current checkpoint is newer than the one this request resumes from; keep it for
+    // a future continuation of the branch that produced it.
+    rotate_device_checkpoint(sequence);
+    import_checkpoint_state(sequence, target, /*into_current=*/false);
+    if (preserve) {
+        // This request will capture a new checkpoint over the device slot, so the boundary it
+        // resumed from must be kept in the history rather than lost with the slot.
+        push_host_checkpoint(sequence.checkpoint_history, std::move(target));
+    }
+}
+
+void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequence& entry,
+                                          std::uint32_t text_pages, std::uint32_t backend_pages,
+                                          bool resume_at_checkpoint,
+                                          std::uint32_t checkpoint_index) {
     if (sequence.kv) { throw std::logic_error("parked restore requires an empty lane"); }
     const bool has_backend = backend_kv_cache() != nullptr;
     if (entry.text.size() != static_cast<std::size_t>(device_count) ||
@@ -1549,6 +1768,28 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, const ParkedS
         entry.backend.size() != (has_backend ? entry.text.size() : 0) ||
         entry.tail_hidden.size() != 1) {
         throw std::logic_error("parked conversation does not describe this engine's rank set");
+    }
+    if (resume_at_checkpoint) {
+        if (checkpoint_index == 0) {
+            if (!entry.checkpoint_valid || entry.checkpoint_frontier == 0 ||
+                entry.checkpoint_frontier > entry.execution_frontier ||
+                entry.checkpoint_state.size() != entry.text.size() ||
+                entry.checkpoint_hidden.size() !=
+                    static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes())) {
+                throw std::logic_error("parked conversation has no restorable rewrite checkpoint");
+            }
+        } else {
+            if (checkpoint_index - 1 >= entry.checkpoint_history.size()) {
+                throw std::logic_error("planned parked checkpoint is no longer retained");
+            }
+            const HostCheckpoint& selected = entry.checkpoint_history[checkpoint_index - 1];
+            if (selected.frontier == 0 || selected.frontier > entry.execution_frontier ||
+                selected.state.size() != entry.text.size() ||
+                selected.hidden.size() !=
+                    static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes())) {
+                throw std::logic_error("parked historical checkpoint is incomplete");
+            }
+        }
     }
     // Mirrors the decode-ready invariant: the ledger and its identity run one entry past the
     // execution frontier (the sampled-but-unexecuted token), so both are sized by the ledger
@@ -1590,21 +1831,137 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, const ParkedS
         }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
 
-        sequence.execution_frontier = entry.execution_frontier;
-        sequence.ledger_frontier    = entry.ledger_frontier;
-        sequence.text_kv_valid      = entry.execution_frontier;
-        sequence.mtp_kv_valid       = entry.mtp_kv_valid;
-        sequence.ledger             = entry.ledger;
-        sequence.prefix_identity    = entry.prefix_identity;
-        sequence.rope_delta         = entry.rope_delta;
-        sequence.tail_hidden_valid  = entry.tail_hidden_valid;
-        sequence.mtp_draft_count    = entry.mtp_draft_count;
-        sequence.mtp_drafts         = entry.mtp_drafts;
-        // Parking does not mirror the rewrite checkpoint's auxiliary GDN slot, so the restored
-        // conversation resumes from its frontier alone. This costs the checkpoint reuse
-        // opportunity the parked lane had, never correctness.
-        sequence.rewrite_checkpoint = {};
-        sequence.retained           = true;
+        sequence.ledger          = entry.ledger;
+        sequence.prefix_identity = entry.prefix_identity;
+        sequence.rope_delta      = entry.rope_delta;
+        sequence.mtp_draft_count = entry.mtp_draft_count;
+        sequence.mtp_drafts      = entry.mtp_drafts;
+        // The entry owns the history; the lane takes it over (the entry is erased afterwards).
+        sequence.checkpoint_history = std::move(entry.checkpoint_history);
+        if (resume_at_checkpoint) {
+            // Put the lane back at a checkpoint frontier: import the checkpoint's recurrent
+            // state on every rank and its rank-0 hidden into both hidden tensors, so the MTP
+            // bridge (which reads tail_hidden for a parked plan) and an exact-hit sample (which
+            // reads rewrite_checkpoint_hidden) both see the state at the checkpoint. The KV
+            // pages past the checkpoint are released by the caller's trim; the ones before it
+            // were copied along with the rest of the frontier.
+            //
+            // BOTH state slots must hold the checkpoint: the current slot drives the suffix
+            // prefill, and the checkpoint slot is what a later response-checkpoint restore
+            // copies back into the current slot.
+            std::uint32_t frontier          = 0;
+            RewriteCheckpointKind kind      = RewriteCheckpointKind::TurnClosure;
+            HostCheckpoint newest_unselected;
+            bool preserve_newest = false;
+            if (checkpoint_index == 0) {
+                const auto import_checkpoint = [&](LinearAttentionStatePool& state,
+                                                   std::span<const std::byte> image,
+                                                   cudaStream_t stream) {
+                    state.import_slot(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), image,
+                        stream);
+                    state.import_slot(
+                        LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane,
+                                                                        max_concurrency),
+                        image, stream);
+                };
+                import_checkpoint(decoder->linear_attention,
+                                  std::span<const std::byte>(entry.checkpoint_state[0]),
+                                  device.stream);
+                CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data,
+                                           entry.checkpoint_hidden.data(),
+                                           entry.checkpoint_hidden.size(), cudaMemcpyHostToDevice,
+                                           device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, entry.checkpoint_hidden.data(),
+                                           entry.checkpoint_hidden.size(), cudaMemcpyHostToDevice,
+                                           device.stream));
+                for (auto& peer : peers) {
+                    const ScopedDevice scope(peer->device.device);
+                    import_checkpoint(
+                        peer->decoder->linear_attention,
+                        std::span<const std::byte>(entry.checkpoint_state[peer->rank]),
+                        peer->device.stream);
+                    CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+                }
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                frontier = entry.checkpoint_frontier;
+                kind     = entry.checkpoint_kind;
+                sequence.checkpoint_ledger =
+                    entry.checkpoint_ledger.empty() ? entry.ledger : entry.checkpoint_ledger;
+                sequence.checkpoint_identity = entry.checkpoint_ledger.empty()
+                                                   ? entry.prefix_identity
+                                                   : entry.checkpoint_identity;
+            } else {
+                // A historical boundary of the entry. The entry's current checkpoint is newer
+                // and belongs to the branch that produced it, so it is kept in the history.
+                HostCheckpoint& selected = sequence.checkpoint_history[checkpoint_index - 1];
+                import_checkpoint_state(sequence, selected, /*into_current=*/true);
+                CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, selected.hidden.data(),
+                                           selected.hidden.size(), cudaMemcpyHostToDevice,
+                                           device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                frontier = selected.frontier;
+                kind     = selected.kind;
+                if (entry.checkpoint_valid) {
+                    newest_unselected.kind     = entry.checkpoint_kind;
+                    newest_unselected.frontier = entry.checkpoint_frontier;
+                    newest_unselected.ledger =
+                        entry.checkpoint_ledger.empty() ? entry.ledger : entry.checkpoint_ledger;
+                    newest_unselected.identity = entry.checkpoint_ledger.empty()
+                                                     ? entry.prefix_identity
+                                                     : entry.checkpoint_identity;
+                    newest_unselected.state = std::move(entry.checkpoint_state);
+                    newest_unselected.hidden = std::move(entry.checkpoint_hidden);
+                    newest_unselected.bytes +=
+                        newest_unselected.ledger.size() * sizeof(TokenId) +
+                        newest_unselected.identity.bytes();
+                    for (const auto& image : newest_unselected.state) {
+                        newest_unselected.bytes += image.size();
+                    }
+                    newest_unselected.bytes += newest_unselected.hidden.size();
+                    preserve_newest = true;
+                }
+            }
+            if (preserve_newest) {
+                push_host_checkpoint(sequence.checkpoint_history, std::move(newest_unselected));
+            }
+            sequence.execution_frontier = frontier;
+            sequence.ledger_frontier    = entry.ledger_frontier;
+            sequence.text_kv_valid      = frontier;
+            sequence.mtp_kv_valid       = frontier == 0 ? 0 : frontier - 1;
+            sequence.tail_hidden_valid  = true;
+            sequence.rewrite_checkpoint =
+                RewriteCheckpoint{.valid = true, .kind = kind, .frontier = frontier};
+        } else {
+            sequence.execution_frontier = entry.execution_frontier;
+            sequence.ledger_frontier    = entry.ledger_frontier;
+            sequence.text_kv_valid      = entry.execution_frontier;
+            sequence.mtp_kv_valid       = entry.mtp_kv_valid;
+            sequence.tail_hidden_valid  = entry.tail_hidden_valid;
+            if (entry.checkpoint_valid) {
+                // The current checkpoint is still a valid boundary of this conversation: keep
+                // it usable on the lane, with its own lineage. It is rotated into the host
+                // history only if a later capture (or branch switch) has to overwrite it.
+                HostCheckpoint device;
+                device.kind     = entry.checkpoint_kind;
+                device.frontier = entry.checkpoint_frontier;
+                device.ledger =
+                    entry.checkpoint_ledger.empty() ? entry.ledger : entry.checkpoint_ledger;
+                device.identity = entry.checkpoint_ledger.empty() ? entry.prefix_identity
+                                                                  : entry.checkpoint_identity;
+                device.bytes += device.ledger.size() * sizeof(TokenId) + device.identity.bytes();
+                device.state  = std::move(entry.checkpoint_state);
+                device.hidden = std::move(entry.checkpoint_hidden);
+                for (const auto& image : device.state) { device.bytes += image.size(); }
+                device.bytes += device.hidden.size();
+                import_checkpoint_state(sequence, device, /*into_current=*/false);
+            } else {
+                sequence.rewrite_checkpoint = {};
+                sequence.checkpoint_ledger.clear();
+                sequence.checkpoint_identity.clear();
+            }
+        }
+        sequence.retained = true;
     } catch (...) {
         clear_lane(sequence, requests[sequence.lane]);
         throw;
@@ -2744,6 +3101,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
+            // Provenance for this boundary: the prompt lineage it was captured from. The ledger
+            // already includes the freshly sampled token; selection only reads [0, frontier).
+            sequence.checkpoint_ledger   = sequence.ledger;
+            sequence.checkpoint_identity = sequence.prefix_identity;
         }
 
         staged.prompt.release_all_media_payloads();

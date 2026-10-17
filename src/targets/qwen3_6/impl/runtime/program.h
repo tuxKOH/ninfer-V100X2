@@ -81,6 +81,13 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     // store when the plan is executed rather than carried as a pointer, which an intervening
     // park could invalidate.
     std::uint64_t parked_id = 0;
+    // True when the parked entry is resumed at its rewrite-checkpoint frontier rather than its
+    // execution frontier: the replay diverged inside the last response, so only the checkpoint
+    // prefix is reusable and `reuse_base` names that frontier.
+    bool parked_checkpoint = false;
+    // Which retained checkpoint a checkpoint restore resumes from: 0 is the current one, i+1 is
+    // history[i]. Used for both resident lanes and parked entries.
+    std::uint32_t checkpoint_index = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -182,6 +189,13 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+    // Token/position lineage the current device checkpoint was captured from. Selection and
+    // rotation must use this, not the lane's live ledger, which may have moved to another branch.
+    std::vector<TokenId> checkpoint_ledger;
+    ResidentPrefixIdentity checkpoint_identity;
+    // Older rewrite-checkpoint boundaries of this conversation, newest-first. Kept host-side so
+    // a stale or forked replay can resume at one of them without growing device memory.
+    std::vector<HostCheckpoint> checkpoint_history;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
 };
@@ -285,13 +299,18 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    // A cancelled decode stops at a resolved round boundary, so its lane holds exactly the state
+    // a completed turn leaves behind. Keeps that state for the conversation's next request when
+    // it is decode-ready; otherwise clears the lane like abort_lane.
+    void retain_cancelled_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // Copies a retained lane's complete continuation state to the park store and clears the lane,
     // returning true when it was parked. Best-effort and infallible by contract: a lane that
     // cannot be parked (parking disabled, RAM KV, Vision, or no room left in the store) is
     // reported false and left untouched, so the caller can fall back to dropping it.
-    [[nodiscard]] bool park_retained_lane(std::uint32_t lane) noexcept;
+    // `protect_id` names a stored entry the insert must not evict (the plan's restore target).
+    [[nodiscard]] bool park_retained_lane(std::uint32_t lane, std::uint64_t protect_id = 0) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -511,9 +530,26 @@ private:
                                  std::uint32_t backend_tokens = 0);
     // Materializes a parked conversation into an empty lane: reserves the KV bundle, copies the
     // parked pages and GDN slot back on every rank, and restores the ledger, identity and
-    // frontiers, so the resident reuse path can resume from the parked frontier unchanged.
-    void restore_parked_lane(SequenceState& sequence, const ParkedSequence& entry,
-                             std::uint32_t text_pages, std::uint32_t backend_pages);
+    // frontiers, so the resident reuse path can resume from the parked frontier unchanged. With
+    // `resume_at_checkpoint` the lane is put back at the entry's rewrite-checkpoint frontier
+    // instead: the checkpoint's GDN slot and hidden are materialized and the checkpoint becomes
+    // the lane's current one, so the existing checkpoint-restore path can re-prefill the suffix.
+    void restore_parked_lane(SequenceState& sequence, ParkedSequence& entry,
+                             std::uint32_t text_pages, std::uint32_t backend_pages,
+                             bool resume_at_checkpoint, std::uint32_t checkpoint_index);
+    // Copies a checkpoint's per-rank recurrent slot and rank-0 hidden from host. `into_current`
+    // also materializes it into the running slot (a parked restore); otherwise only the
+    // checkpoint slot is written and the resident checkpoint path copies it forward.
+    void import_checkpoint_state(SequenceState& sequence, const HostCheckpoint& checkpoint,
+                                 bool into_current);
+    [[nodiscard]] HostCheckpoint export_checkpoint(SequenceState& sequence);
+    // Moves the lane's current checkpoint into its host history, if one is valid.
+    void rotate_device_checkpoint(SequenceState& sequence);
+    // Resolves a plan that resumes from a historical boundary: preserves the current device
+    // checkpoint, imports the selected one, and (when the request will capture a new checkpoint)
+    // keeps the selected boundary in the history too.
+    void restore_historical_checkpoint(SequenceState& sequence, std::uint32_t checkpoint_index,
+                                       bool preserve);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);

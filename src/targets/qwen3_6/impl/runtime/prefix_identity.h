@@ -23,6 +23,14 @@ public:
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
 
+    // True when the first `count` identity entries are identical. Used to tell whether two
+    // retained checkpoints at the same frontier describe the same token/position lineage.
+    [[nodiscard]] bool same_prefix(const ResidentPrefixIdentity& other,
+                                   std::size_t count) const noexcept;
+
+    // Approximate heap size of the metadata, for host budget accounting.
+    [[nodiscard]] std::size_t bytes() const noexcept;
+
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
