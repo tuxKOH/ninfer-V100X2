@@ -354,6 +354,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
+    std::optional<RewriteCheckpointByteSpec> prefix_checkpoint;
 
     int image_count = 0;
     int video_count = 0;
@@ -363,6 +364,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (is_instruction_role(message.role)) { validate_instruction_message(message); }
         const std::string content = trim_ascii_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (options.shared_prefix_checkpoint && !prefix_checkpoint && i == message_begin &&
+            !rendered.empty()) {
+            // The static leading block (tool definitions, system/instruction messages) is where
+            // agent sessions agree before their conversations diverge. The next bytes are the
+            // fixed "<|im_start|>" opener, so the cut cannot retokenize.
+            prefix_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        }
         if (options.message_boundary_checkpoint && !stable_checkpoint && i > message_begin &&
             i + 1 == messages.size()) {
             // The boundary before the final message is the last one a client can rewrite away
@@ -467,7 +476,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
     return RenderedChat{.text                = std::move(rendered),
                         .rewrite_checkpoint  = rewrite_checkpoint,
-                        .stable_checkpoint   = stable_checkpoint};
+                        .stable_checkpoint   = stable_checkpoint,
+                        .prefix_checkpoint   = prefix_checkpoint};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

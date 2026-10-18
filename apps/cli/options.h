@@ -45,6 +45,7 @@ struct Options {
     VisionDevice vision_device = VisionDevice::Gpu;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool message_boundary_checkpoints = false;
+    bool shared_prefix_checkpoints = false;
     bool use_cuda_graph = true;
 
     bool raw_output      = false;

@@ -130,7 +130,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu]\n"
-           "       [--vision-max-tokens N] [--boundary-checkpoints]\n"
+           "       [--vision-max-tokens N] [--boundary-checkpoints] [--shared-prefix]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -142,6 +142,7 @@ std::string usage_text(const char* argv0) {
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--boundary-checkpoints retains a reusable checkpoint at the last stable message boundary.\n"
+           "--shared-prefix retains one after the static leading system/tools block for cross-session reuse.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
            "independently of text context; smaller budgets reduce reserved Vision memory.\n"
            "--kv-capacity auto leaves " +
@@ -269,6 +270,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--boundary-checkpoints") {
             options.message_boundary_checkpoints = true;
+        } else if (arg == "--shared-prefix") {
+            options.shared_prefix_checkpoints = true;
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens");
         } else if (arg == "--no-cuda-graph") {

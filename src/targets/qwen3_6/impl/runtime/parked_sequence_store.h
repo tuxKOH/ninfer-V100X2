@@ -127,6 +127,9 @@ struct ParkedSequence {
     // conversation can match one of these when it no longer matches the current checkpoint.
     std::vector<HostCheckpoint> checkpoint_history;
 
+    // The shared leading-block checkpoint, pinned outside the ring (see SequenceState).
+    HostCheckpoint shared_prefix;
+
     std::size_t bytes       = 0;
     std::uint64_t last_used = 0;
 };
@@ -137,6 +140,8 @@ struct ParkedCheckpointMatch {
     const ParkedSequence* entry = nullptr;
     std::uint32_t frontier      = 0;
     std::uint32_t checkpoint_index = 0;
+    // The match is the entry's pinned shared prefix rather than its current/historical boundary.
+    bool shared_prefix = false;
 };
 
 /**
@@ -246,7 +251,8 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
     const PreparedPromptData& prompt) const {
     std::optional<ParkedCheckpointMatch> best;
     const auto consider = [&](const ParkedSequence& entry, std::uint32_t frontier,
-                              std::uint32_t index, const std::vector<TokenId>& ledger,
+                              std::uint32_t index, bool shared,
+                              const std::vector<TokenId>& ledger,
                               const ResidentPrefixIdentity& identity) {
         if (frontier == 0 || frontier > entry.execution_frontier ||
             frontier > ledger.size() || frontier > prompt.token_ids.size()) {
@@ -263,23 +269,31 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
                      (frontier == best->frontier && entry.last_used <= best->entry->last_used))) {
             return;
         }
-        best = ParkedCheckpointMatch{&entry, frontier, index};
+        best = ParkedCheckpointMatch{&entry, frontier, index, shared};
     };
     for (const std::unique_ptr<ParkedSequence>& entry : entries_) {
         // A checkpoint's own lineage decides whether it is valid for this prompt. Only legacy
         // entries without provenance fall back to the entry ledger.
         if (entry->checkpoint_valid) {
             const bool own = !entry->checkpoint_ledger.empty();
-            consider(*entry, entry->checkpoint_frontier, 0,
+            consider(*entry, entry->checkpoint_frontier, 0, false,
                      own ? entry->checkpoint_ledger : entry->ledger,
                      own ? entry->checkpoint_identity : entry->prefix_identity);
         }
         for (std::size_t i = 0; i < entry->checkpoint_history.size(); ++i) {
             const HostCheckpoint& checkpoint = entry->checkpoint_history[i];
             const bool own                   = !checkpoint.ledger.empty();
-            consider(*entry, checkpoint.frontier, static_cast<std::uint32_t>(i + 1),
+            consider(*entry, checkpoint.frontier, static_cast<std::uint32_t>(i + 1), false,
                      own ? checkpoint.ledger : entry->ledger,
                      own ? checkpoint.identity : entry->prefix_identity);
+        }
+        // The pinned shared leading-block boundary survives ring rotation and is offered to any
+        // conversation that shares the block.
+        if (entry->shared_prefix.frontier != 0) {
+            const bool own = !entry->shared_prefix.ledger.empty();
+            consider(*entry, entry->shared_prefix.frontier, 0, true,
+                     own ? entry->shared_prefix.ledger : entry->ledger,
+                     own ? entry->shared_prefix.identity : entry->prefix_identity);
         }
     }
     return best;

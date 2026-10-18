@@ -125,7 +125,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
-           "[--boundary-checkpoints] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--boundary-checkpoints] [--shared-prefix] "
+           "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -360,6 +361,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--boundary-checkpoints") {
             options.message_boundary_checkpoints = true;
+        } else if (arg == "--shared-prefix") {
+            options.shared_prefix_checkpoints = true;
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--vision-max-tokens"), "vision-max-tokens"));

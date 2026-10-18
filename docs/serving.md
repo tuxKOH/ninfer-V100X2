@@ -599,6 +599,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` retains the backbone on host and reserves no Vision device scratch | `gpu` |
 | `--boundary-checkpoints` | capture an extra reusable checkpoint at the last stable message boundary, so a rewritten or dropped final message resumes from the common prefix | off |
+| `--shared-prefix` | capture a reusable checkpoint after the static leading system/tools block, so any session sharing that block restores the prefilled prefix | off |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -745,6 +746,14 @@ interrupted tool result can shrink or disappear. Such a replay matches neither t
 frontier nor the response checkpoint, which both sit after the rewritten message; the boundary
 checkpoint turns the full re-prefill into a suffix prefill from the common message prefix. The
 capture costs one extra checkpoint copy per request and one extra prefix tokenization.
+
+`--shared-prefix` adds a boundary after the static leading block: tool definitions and
+instruction/system messages. Agent frontends send that block first and identically across
+sessions, so a checkpoint there lets a *new* conversation restore the prefix the server has
+already prefilled -- from the resident lane, or from a conversation parked in host RAM by
+`--kv-park-bytes`, whose entry carries the checkpoint. The restore uses the ordinary
+checkpoint path: the KV is trimmed to the boundary and the recurrent state is imported, so this
+is exact prefix reuse, not an approximate token match.
 
 Cancellation also feeds the cache. A client disconnect observed at a decode round boundary keeps
 the lane's continuation state, so a retry resumes through the current checkpoint instead of

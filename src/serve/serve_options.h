@@ -68,6 +68,7 @@ struct ServeOptions {
     VisionDevice vision_device = VisionDevice::Gpu;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool message_boundary_checkpoints = false;
+    bool shared_prefix_checkpoints = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

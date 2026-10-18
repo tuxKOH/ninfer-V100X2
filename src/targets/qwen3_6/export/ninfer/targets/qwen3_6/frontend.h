@@ -24,6 +24,8 @@ struct FrontendOptions {
     // Record a reusable checkpoint at the last stable message boundary in addition to the
     // response checkpoint.
     bool message_boundary_checkpoints      = false;
+    // Record a reusable checkpoint after the static leading block, shared across sessions.
+    bool shared_prefix_checkpoints         = false;
 };
 
 struct FrontendResources;

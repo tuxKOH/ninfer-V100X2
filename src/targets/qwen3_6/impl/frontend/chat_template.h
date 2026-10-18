@@ -79,6 +79,11 @@ struct ChatRenderOptions {
     // PromptIdentity::stable_checkpoint). Off by default: it costs one extra prefix
     // tokenization per request.
     bool message_boundary_checkpoint = false;
+    // Records a reusable boundary at the end of the static leading block (tool definitions and
+    // instruction/system messages) before the first conversation message. Agent frontends send
+    // that block first and it is identical across sessions, so a checkpoint there lets a new
+    // conversation restore an already-prefilled prefix. See PromptIdentity::prefix_checkpoint.
+    bool shared_prefix_checkpoint = false;
     std::vector<std::string> tool_jsons;
 };
 
@@ -91,6 +96,7 @@ struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
+    std::optional<RewriteCheckpointByteSpec> prefix_checkpoint;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

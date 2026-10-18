@@ -171,6 +171,10 @@ struct EngineOptions {
     // interrupted tool result) can then resume from the common message prefix instead of
     // re-prefilling the whole prompt.
     bool message_boundary_checkpoints      = false;
+    // Captures a reusable checkpoint after the static leading block (tool definitions and system
+    // messages). Agent sessions share that block, so a new conversation can restore a prefix the
+    // server already prefilled instead of starting from token zero.
+    bool shared_prefix_checkpoints         = false;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };

@@ -744,6 +744,45 @@ int test_stable_checkpoint_trace() {
     return failures;
 }
 
+// The shared-prefix boundary sits after the static leading block (tool definitions and
+// instruction messages) that agent frontends send first, before the first conversation message.
+int test_shared_prefix_checkpoint_trace() {
+    fi::ChatRenderOptions options;
+    options.shared_prefix_checkpoint = true;
+    const fi::ChatMessage system = chat_message(ninfer::ChatRole::System, "static agent prompt");
+    const fi::ChatMessage first  = chat_message(ninfer::ChatRole::User, "one");
+    const fi::ChatMessage second = chat_message(ninfer::ChatRole::User, "two");
+
+    const fi::RenderedChat two_messages = render_chat({system, first, second}, options);
+    // The leading block ends where the first conversation message opens; the renderer cannot be
+    // asked for a system-only conversation because it requires a user query.
+    const std::size_t first_message = two_messages.text.find("<|im_start|>user\n");
+    int failures = check(two_messages.prefix_checkpoint && first_message != std::string::npos &&
+                             two_messages.prefix_checkpoint->offset == first_message &&
+                             two_messages.prefix_checkpoint->kind ==
+                                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
+                         "shared prefix boundary did not stop at the leading block");
+
+    fi::ChatRenderOptions both = options;
+    both.message_boundary_checkpoint = true;
+    const fi::RenderedChat ordered = render_chat({system, first, second}, both);
+    failures += check(ordered.prefix_checkpoint && ordered.stable_checkpoint &&
+                          ordered.rewrite_checkpoint &&
+                          ordered.prefix_checkpoint->offset < ordered.stable_checkpoint->offset &&
+                          ordered.stable_checkpoint->offset < ordered.rewrite_checkpoint->offset,
+                      "shared prefix, stable and response boundaries are not ordered");
+
+    fi::ChatRenderOptions disabled = options;
+    disabled.shared_prefix_checkpoint = false;
+    failures += check(!render_chat({first, second}, disabled).prefix_checkpoint,
+                      "shared prefix boundary was published while the option was off");
+
+    // Without a static leading block there is nothing to share.
+    failures += check(!render_chat({first, second}, options).prefix_checkpoint,
+                      "shared prefix boundary was published without a leading block");
+    return failures;
+}
+
 // The stable offset is recorded against the placeholder form of the rendered chat. Placeholder
 // expansion must move it exactly like the response offset: an unshifted boundary lands inside the
 // expanded image pad run and is not a token prefix.
@@ -1510,6 +1549,7 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_stable_checkpoint_trace();
     failures += test_stable_checkpoint_with_media();
+    failures += test_shared_prefix_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);

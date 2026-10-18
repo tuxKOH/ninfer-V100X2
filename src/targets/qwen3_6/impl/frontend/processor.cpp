@@ -451,6 +451,7 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         };
         shift_boundary(rendered.rewrite_checkpoint);
         shift_boundary(rendered.stable_checkpoint);
+        shift_boundary(rendered.prefix_checkpoint);
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -617,11 +618,19 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     };
     encoded.rewrite_checkpoint = encode_checkpoint(rendered.rewrite_checkpoint);
     encoded.stable_checkpoint  = encode_checkpoint(rendered.stable_checkpoint);
+    encoded.prefix_checkpoint  = encode_checkpoint(rendered.prefix_checkpoint);
     if (encoded.rewrite_checkpoint && encoded.stable_checkpoint &&
         encoded.stable_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier) {
         // The stable boundary precedes the last message, so it must precede the response
         // checkpoint; anything else means the template offsets were mis-assembled.
         throw std::logic_error("stable checkpoint does not precede the rewrite checkpoint");
+    }
+    if (encoded.prefix_checkpoint &&
+        ((encoded.stable_checkpoint &&
+          encoded.prefix_checkpoint->frontier >= encoded.stable_checkpoint->frontier) ||
+         (encoded.rewrite_checkpoint &&
+          encoded.prefix_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier))) {
+        throw std::logic_error("shared prefix checkpoint does not precede later checkpoints");
     }
     return encoded;
 }
@@ -789,6 +798,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.input_ids          = std::move(encoded.input_ids);
     output.rewrite_checkpoint = encoded.rewrite_checkpoint;
     output.stable_checkpoint  = encoded.stable_checkpoint;
+    output.prefix_checkpoint  = encoded.prefix_checkpoint;
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

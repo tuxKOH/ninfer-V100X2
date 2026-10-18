@@ -193,6 +193,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` keeps the backbone in host memory and reserves no Vision GPU scratch | `gpu` |
 | `--boundary-checkpoints` | retain a reusable checkpoint at the last stable message boundary | off |
+| `--shared-prefix` | retain a reusable checkpoint after the static leading system/tools block | off |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

@@ -511,6 +511,7 @@ std::string format_server_start_json(
           {"vision_device", options.vision_device == VisionDevice::Cpu ? "cpu" : "gpu"},
           {"vision_max_tokens", std::min(options.max_context, options.vision_max_tokens)},
           {"message_boundary_checkpoints", options.message_boundary_checkpoints},
+          {"shared_prefix_checkpoints", options.shared_prefix_checkpoints},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
