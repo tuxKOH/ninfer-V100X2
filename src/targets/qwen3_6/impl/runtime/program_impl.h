@@ -1398,6 +1398,15 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
             return false;
         }
 
+        // A lane retained by a cancelled prefill still owns the prompt's eagerly materialized
+        // page extent even though only `execution_frontier` tokens are valid. Parking copies
+        // mapped pages, so leaving the unwritten tail in place both wastes host memory and
+        // produces an image larger than a later, shorter request's entitlement --
+        // attach_from_host rejects that mismatch, and the throw fails the whole engine. Drop the
+        // tail first; the resumed suffix prefill re-materializes it.
+        trim_sequence_kv(sequence, sequence.execution_frontier,
+                         std::min(backend_kv_valid(sequence), sequence.execution_frontier));
+
         // Size the entry before copying anything: an entry that cannot fit must leave the lane
         // exactly as it was, never half-detached.
         const bool checkpoint = sequence.rewrite_checkpoint.valid;

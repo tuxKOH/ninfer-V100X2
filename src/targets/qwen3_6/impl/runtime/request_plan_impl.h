@@ -396,14 +396,34 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // hidden was invalidated (a cancellation during a speculative round) is still useful.
         const std::optional<qwen3_6::detail::ParkedCheckpointMatch> checkpoint_match =
             parked.match_checkpoint(prompt);
+        // A restore materializes the image's pages into the request's own allocation, whose
+        // entitlement is sized from this prompt and output budget. An image produced by an older
+        // layout can exceed it; taking that entry would throw from attach_from_host inside the
+        // worker's execution unit and fail the whole engine, so decline it here and let the
+        // request prefill from its own prefix instead.
+        const auto parked_images_fit = [&](const qwen3_6::detail::ParkedSequence& entry) {
+            for (const auto& image : entry.text) {
+                if (image != nullptr && image->pages() > plan->text_kv_page_entitlement) {
+                    return false;
+                }
+            }
+            for (const auto& image : entry.backend) {
+                if (image != nullptr && image->pages() > plan->backend_kv_page_entitlement) {
+                    return false;
+                }
+            }
+            return true;
+        };
         const bool exact_usable = parked_entry != nullptr &&
                                   (speculative_backend != SpeculativeBackend::Mtp ||
-                                   parked_entry->tail_hidden_valid);
+                                   parked_entry->tail_hidden_valid) &&
+                                  parked_images_fit(*parked_entry);
         const bool checkpoint_usable =
             checkpoint_match.has_value() &&
             (speculative_backend != SpeculativeBackend::Mtp ||
              (decoder->mtp_cache() != nullptr &&
-              checkpoint_match->entry->mtp_kv_valid >= checkpoint_match->frontier - 1));
+              checkpoint_match->entry->mtp_kv_valid >= checkpoint_match->frontier - 1)) &&
+            parked_images_fit(*checkpoint_match->entry);
         if (checkpoint_usable &&
             (!exact_usable || checkpoint_match->frontier > parked_entry->execution_frontier)) {
             parked_entry                 = checkpoint_match->entry;
