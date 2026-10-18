@@ -65,6 +65,8 @@ exclusive. The default speculative and Vision settings produce the smallest resi
 default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
 fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
 context without promising to process images or videos beyond that separate budget.
+`--vision-device cpu` runs the encoder on host threads instead: no Vision weights or scratch are
+uploaded, and only the merged embeddings reach the device.
 TP2 Vision is experimental on the two 16 GB V100 profile. Its visual-prefix bridge integration
 test currently fails on that host; see [test status](../tests/README.md#experimental-tp2-vision-status).
 CLI processes do not share Engine prefix state. For a persistent Vision server, the recommended
@@ -189,6 +191,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` keeps the backbone in host memory and reserves no Vision GPU scratch | `gpu` |
+| `--boundary-checkpoints` | retain a reusable checkpoint at the last stable message boundary | off |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

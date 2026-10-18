@@ -69,6 +69,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint;
     bool allow_prefix_reuse = false;
 };
 
@@ -95,6 +96,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    // An extra capture at the last stable message boundary, when one lies ahead of the reuse
+    // frontier. It lands in the host checkpoint history and lets a client that rewrites or drops
+    // its final message resume from the common message prefix.
+    std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint_capture;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -215,10 +220,17 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
+        // Captured once, at its frontier, into the host checkpoint history; see RequestPlanImpl.
+        std::optional<RewriteCheckpointSpec> stable_checkpoint_capture;
+        bool stable_checkpoint_captured  = false;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
         std::uint32_t initial_mtp_extent = 0;
+        // Column of the last processed token's hidden in the most recent chunk. A cancelled
+        // prefill keeps it so the next request can resume at `cursor` through the ordinary
+        // append path instead of re-prefilling the whole prompt.
+        std::int32_t tail_column         = -1;
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
@@ -303,6 +315,13 @@ public:
     // a completed turn leaves behind. Keeps that state for the conversation's next request when
     // it is decode-ready; otherwise clears the lane like abort_lane.
     void retain_cancelled_lane(std::uint32_t lane) noexcept;
+    // A cancelled staged prefill has already materialized a KV prefix and the hidden state of the
+    // last token it processed. Keeps that prefix as an append frontier (with the hidden as its
+    // MTP bridge input) so the conversation's next request resumes there instead of re-prefilling
+    // everything. Returns false -- and leaves the lane untouched -- when the prefix cannot be
+    // retained exactly (no chunk completed, a Vision consumer span would be split, or the staged
+    // state is inconsistent); the caller then clears the lane as before.
+    [[nodiscard]] bool retain_cancelled_prefill_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // Copies a retained lane's complete continuation state to the park store and clears the lane,
@@ -337,6 +356,8 @@ public:
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
     const bool vision_enabled;
+    // Vision runs on host threads: no device Vision workspace is reserved or validated.
+    const bool vision_cpu;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t gdn_state_bytes;

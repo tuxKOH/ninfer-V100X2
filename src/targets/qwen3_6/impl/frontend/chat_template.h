@@ -75,6 +75,10 @@ struct ChatRenderOptions {
     std::optional<ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     bool add_vision_id = false;
+    // Records a second reusable boundary at the end of the message before the last one (see
+    // PromptIdentity::stable_checkpoint). Off by default: it costs one extra prefix
+    // tokenization per request.
+    bool message_boundary_checkpoint = false;
     std::vector<std::string> tool_jsons;
 };
 
@@ -86,6 +90,7 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

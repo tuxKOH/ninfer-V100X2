@@ -61,7 +61,18 @@ rank; composed embeddings are copied to the peer before split text prefill, and 
 the same three-axis positions and per-request RoPE delta. Vision requests participate in the
 same compact concurrent decode batches as text requests. Vision requires additional startup
 memory; lower the text-only context profile rather than simply appending `--vision` to a
-near-capacity command. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
+near-capacity command. `--vision-device cpu` instead keeps the quantized Vision backbone in host
+memory and runs the 27-layer encoder on host threads (AVX2/FMA, three quarters of the host up to
+24 workers; `NINFER_VISION_CPU_THREADS` overrides). That removes the Vision weights and scratch
+from the device arena and leaves only the merged-output transient, at the cost of roughly two to
+three seconds of CPU time per image after the first. Dequantized weights are cached across
+requests (~1.7 GB of host memory once warm; `NINFER_VISION_CPU_CACHE=0` disables the cache and
+dequantizes per request instead). Host intermediates scale with the visual-token count (about
+0.2 MB per merged token: roughly 150 MB for a typical screenshot, several GB at the 32,768-token
+maximum), so keep `--vision-max-tokens` near what the media actually needs. Prefix reuse is
+unaffected:
+media identity comes from the digest and token spans, not from encoder output bits. On the two
+16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
 `--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
 profile. The 35B-A3B package has no TP2 path, but it can use two GPUs as a single-device compute
@@ -236,10 +247,11 @@ Text and media requests use one complete-prompt context contract. After chat-tem
 media-token expansion, the result must fit Engine `--max-context`. The separately configurable
 `--vision-max-tokens` limits merged visual tokens across the prompt (four raw patches per merged
 token); it defaults to 32,768, and the effective Vision limit is
-`min(--max-context, --vision-max-tokens)`. Both its media-processing allowance and the startup
-Vision scratch/output reservations use this bound. A smaller visual-token budget leaves room for
-long text context on memory-constrained hardware; exceeding the media budget returns an error,
-not a shorter image. There is no fixed image/video item-count limit: item count is admitted
+`min(--max-context, --vision-max-tokens)`. The media-processing allowance and the output transient
+use this bound; the GPU Vision scratch does too unless `--vision-device cpu` keeps the encoder on
+host. A smaller visual-token budget leaves room for long text context on memory-constrained
+hardware; exceeding the media budget returns an error, not a shorter image. There is no fixed
+image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
@@ -585,6 +597,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` retains the backbone on host and reserves no Vision device scratch | `gpu` |
+| `--boundary-checkpoints` | capture an extra reusable checkpoint at the last stable message boundary, so a rewritten or dropped final message resumes from the common prefix | off |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -724,6 +738,22 @@ active slot, serving an unrelated conversation can replace the retained entry; i
 cache of every conversation. Only the current resident frontier and a saved complete turn/response
 checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
 
+With `--boundary-checkpoints`, the Server also retains one boundary at the end of the message
+before the last one. Clients commonly rewrite the final message between requests -- Claude Code
+injects ephemeral `<system-reminder>` user messages and drops them on the next turn, and an
+interrupted tool result can shrink or disappear. Such a replay matches neither the resident
+frontier nor the response checkpoint, which both sit after the rewritten message; the boundary
+checkpoint turns the full re-prefill into a suffix prefill from the common message prefix. The
+capture costs one extra checkpoint copy per request and one extra prefix tokenization.
+
+Cancellation also feeds the cache. A client disconnect observed at a decode round boundary keeps
+the lane's continuation state, so a retry resumes through the current checkpoint instead of
+re-prefilling. A disconnect observed mid-prefill keeps the KV prefix already materialized plus the
+hidden state of its last processed token, but only when the prefix can be truncated exactly: a
+boundary that would split one image's merged consumer span is still discarded. The retried request
+then resumes at that prefix frontier like any appended turn; it does not need to reproduce the
+cancelled request byte for byte, only to share its prefix.
+
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
@@ -735,6 +765,9 @@ could never match and the conversation would fall back to a full reset. A normal
 no longer matches the raw generated tokens replays only that response and its suffix. Stable `false`
 keeps the first assistant opener in the open turn so a newly closed turn can be recomputed without
 its reasoning.
+
+Set `NINFER_REUSE_TRACE=1` to log each plan's lane state and checkpoint decisions to stderr;
+like `NINFER_RAM_KV_TRACE`, it changes no behaviour when unset.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
 bit. An exact current frontier or matching complete checkpoint remains reusable across a mode

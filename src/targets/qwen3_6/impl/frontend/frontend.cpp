@@ -277,12 +277,13 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     return result;
 }
 
-fi::ChatRenderOptions render_options(const PromptOptions& options) {
+fi::ChatRenderOptions render_options(const PromptOptions& options, bool boundary_checkpoints) {
     return fi::ChatRenderOptions{.add_generation_prompt = options.add_generation_prompt,
                                  .enable_thinking       = options.enable_thinking,
                                  .reasoning_effort      = options.reasoning_effort,
                                  .preserve_thinking     = options.preserve_thinking,
                                  .add_vision_id         = options.add_vision_id,
+                                 .message_boundary_checkpoint = boundary_checkpoints,
                                  .tool_jsons            = options.tool_jsons};
 }
 
@@ -635,7 +636,8 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          boundary_checkpoints(options.message_boundary_checkpoints) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -674,6 +676,7 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
+    bool boundary_checkpoints = false;
 };
 
 class OutputSession::Impl {
@@ -940,7 +943,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages), render_options(options), control);
+            processed = processor.process(std::move(messages), render_options(options, impl_->boundary_checkpoints), control);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
@@ -967,9 +970,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.identity.stable_checkpoint  = processed.stable_checkpoint;
     } else {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render_options(options, impl_->boundary_checkpoints));
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.prepare.tokenize_seconds =
@@ -977,6 +981,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "tokenization");
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.identity.stable_checkpoint  = encoded.stable_checkpoint;
         assign_text_positions(result);
         const auto found = retrieval_tokens.empty() ? result.token_ids.end() :
             std::find_end(result.token_ids.begin(), result.token_ids.end(),
@@ -1008,7 +1013,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     }
     if (!has_media) {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render_options(options, impl_->boundary_checkpoints));
         const std::uint32_t count =
             checked_token_count(impl_->tokenizer->encode(rendered.text).size());
         fi::check_preparation_control(control, "tokenization");
@@ -1019,7 +1024,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
+            processor.process(std::move(messages), render_options(options, impl_->boundary_checkpoints), control)
                 .input_ids.size());
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }

@@ -87,6 +87,11 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+enum class VisionDevice : std::uint8_t {
+    Gpu,
+    Cpu,
+};
+
 // Experimental, approximate RAM-KV retrieval. Zero disables it. The window bounds GPU KV
 // residency; the archive retains the original packed KV bytes, not a second quantization.
 struct RamKvOptions {
@@ -153,9 +158,19 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Where the Vision encoder executes. `Gpu` keeps the quantized backbone in the TP device
+    // arena and runs the existing CUDA pipeline. `Cpu` retains the backbone payloads in host
+    // memory, runs the encoder on host threads, and only copies the merged embeddings to the
+    // device, which frees the vision weight and scratch reservations at the cost of CPU speed.
+    VisionDevice vision_device             = VisionDevice::Gpu;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
+    // Captures an extra reusable checkpoint at the end of the message before the last one. A
+    // client that rewrites or drops its final message (ephemeral system-reminders, an
+    // interrupted tool result) can then resume from the common message prefix instead of
+    // re-prefilling the whole prompt.
+    bool message_boundary_checkpoints      = false;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };

@@ -171,6 +171,10 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     void retain_cancelled_lane(std::uint32_t lane) noexcept;
+    // Keeps a cancelled staged prefill's materialized prefix as an append frontier, so the
+    // conversation's next request resumes there. Returns false when the prefix cannot be
+    // retained exactly and the caller should clear the lane.
+    [[nodiscard]] bool retain_cancelled_prefill_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;

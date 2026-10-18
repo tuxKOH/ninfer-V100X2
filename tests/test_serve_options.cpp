@@ -141,6 +141,19 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures += check(configured.vision_max_tokens == 2048,
                       "--vision-max-tokens did not reach serving options");
+    failures += check(defaults.vision_device == ninfer::VisionDevice::Gpu,
+                      "Vision device did not default to the GPU");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-device", "cpu"})
+                              .vision_device == ninfer::VisionDevice::Cpu,
+                      "--vision-device cpu did not reach serving options");
+    bool bad_device_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vision-device", "npu"});
+    } catch (const std::invalid_argument&) { bad_device_rejected = true; }
+    failures += check(bad_device_rejected, "server accepted an unknown Vision device");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("--vision-device") != std::string::npos,
+        "serve help omits --vision-device");
     for (const char* invalid : {"0", "32769"}) {
         bool rejected = false;
         try {

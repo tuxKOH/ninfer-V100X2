@@ -5,11 +5,27 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
+
+inline bool reuse_trace_enabled() {
+    static const bool enabled = std::getenv("NINFER_REUSE_TRACE") != nullptr;
+    return enabled;
+}
+
+template <typename... Args>
+void reuse_trace(const char* format, Args... args) {
+    if (!reuse_trace_enabled()) { return; }
+    std::fprintf(stderr, "[reuse] ");
+    std::fprintf(stderr, format, args...);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
@@ -148,7 +164,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (end > base->summary.prompt_tokens) {
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
-            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+            // The CPU encoder stages its intermediates in host buffers; only the merged output
+            // uses the device transient, which the plan accounts for separately.
+            if (!vision_cpu && schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = end;
@@ -166,10 +184,22 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
+    if (prompt.identity.stable_checkpoint) {
+        const RewriteCheckpointSpec candidate = *prompt.identity.stable_checkpoint;
+        if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
+            throw std::invalid_argument(
+                "stable checkpoint frontier must lie at or inside the prompt frontier");
+        }
+        base->stable_checkpoint = candidate;
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
         (base->rewrite_checkpoint &&
                  base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL) +
+        (base->stable_checkpoint &&
+                 base->stable_checkpoint->frontier < base->summary.prompt_tokens
              ? 1ULL
              : 0ULL);
     base->summary.service_work_quanta =
@@ -196,13 +226,38 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
+    if (reuse_trace_enabled()) {
+        reuse_trace(
+            "plan lane=%u prompt=%zu retained=%d allow=%d reusable=%d exec=%u ledger_frontier=%u "
+            "ledger=%zu text_kv=%u mtp_kv=%u tail_hidden=%d ckpt=%d kind=%d ckpt_frontier=%u "
+            "history=%zu",
+            lane, prompt.token_ids.size(), sequence.retained ? 1 : 0,
+            base.allow_prefix_reuse ? 1 : 0, prompt.identity.reusable ? 1 : 0,
+            sequence.execution_frontier, sequence.ledger_frontier, sequence.ledger.size(),
+            sequence.text_kv_valid, sequence.mtp_kv_valid, sequence.tail_hidden_valid ? 1 : 0,
+            sequence.rewrite_checkpoint.valid ? 1 : 0,
+            static_cast<int>(sequence.rewrite_checkpoint.kind),
+            sequence.rewrite_checkpoint.frontier, sequence.checkpoint_history.size());
+        for (std::size_t h = 0; h < sequence.checkpoint_history.size(); ++h) {
+            const HostCheckpoint& host = sequence.checkpoint_history[h];
+            reuse_trace("  hist[%zu] kind=%d frontier=%u ledger=%zu own=%d", h,
+                        static_cast<int>(host.kind), host.frontier, host.ledger.size(),
+                        host.ledger.empty() ? 0 : 1);
+        }
+    }
+
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
+        const bool append_matches =
+            sequence.execution_frontier != 0 && dflash_append_ready &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
+                                            sequence.execution_frontier);
+        reuse_trace("append_check frontier=%u dflash_ready=%d match=%d",
+                    sequence.execution_frontier, dflash_append_ready ? 1 : 0,
+                    append_matches ? 1 : 0);
+        if (append_matches) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
         } else {
@@ -225,16 +280,23 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                  const std::vector<TokenId>& ledger,
                                                  const qwen3_6::detail::ResidentPrefixIdentity&
                                                      identity) {
-                if (frontier == 0 || frontier > prompt.token_ids.size() ||
-                    frontier <= best_frontier || frontier > ledger.size() ||
-                    frontier > sequence.text_kv_valid) {
-                    return;
+                const bool in_range =
+                    frontier != 0 && frontier <= prompt.token_ids.size() &&
+                    frontier > best_frontier && frontier <= ledger.size() &&
+                    frontier <= sequence.text_kv_valid;
+                bool lane_match = false;
+                bool own_match  = false;
+                if (in_range) {
+                    lane_match = qwen3_6::detail::prefix_matches(
+                        prompt, sequence.ledger, sequence.prefix_identity, frontier);
+                    own_match =
+                        qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier);
                 }
-                if (!qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                     sequence.prefix_identity, frontier) ||
-                    !qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier)) {
-                    return;
-                }
+                reuse_trace(
+                    "  cand index=%u kind=%d frontier=%u in_range=%d lane_match=%d own_match=%d",
+                    index, static_cast<int>(kind), frontier, in_range ? 1 : 0,
+                    lane_match ? 1 : 0, own_match ? 1 : 0);
+                if (!in_range || !lane_match || !own_match) { return; }
                 best_frontier = frontier;
                 best_index    = index;
                 best_kind     = kind;
@@ -307,6 +369,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         } else {
             parked_entry = nullptr;
         }
+        reuse_trace("parked enabled=1 exact_entry=%d match_frontier=%u usable=%d result=%d base=%u",
+                    parked_entry != nullptr ? 1 : 0,
+                    checkpoint_match.has_value() ? checkpoint_match->frontier : 0U,
+                    checkpoint_usable ? 1 : 0, static_cast<int>(plan->reuse), plan->reuse_base);
+    } else if (reuse_trace_enabled() && plan->reuse == ReusePath::FullReset) {
+        reuse_trace("parked skipped enabled=%d allow=%d reusable=%d", parked.enabled() ? 1 : 0,
+                    base.allow_prefix_reuse ? 1 : 0, prompt.identity.reusable ? 1 : 0);
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -339,15 +408,25 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                  const std::vector<TokenId>& ledger,
                                                  const qwen3_6::detail::ResidentPrefixIdentity&
                                                      identity) {
-                if (frontier == 0 || frontier > prompt.token_ids.size() ||
-                    frontier <= best_frontier || frontier > ledger.size() ||
-                    frontier > sequence.text_kv_valid ||
-                    sequence.mtp_kv_valid < frontier - 1 ||
-                    !qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                     sequence.prefix_identity, frontier) ||
-                    !qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier)) {
-                    return;
+                const bool in_range =
+                    frontier != 0 && frontier <= prompt.token_ids.size() &&
+                    frontier > best_frontier && frontier <= ledger.size() &&
+                    frontier <= sequence.text_kv_valid;
+                const bool mtp_ok = in_range && sequence.mtp_kv_valid >= frontier - 1;
+                bool lane_match   = false;
+                bool own_match    = false;
+                if (in_range) {
+                    lane_match = qwen3_6::detail::prefix_matches(
+                        prompt, sequence.ledger, sequence.prefix_identity, frontier);
+                    own_match =
+                        qwen3_6::detail::prefix_matches(prompt, ledger, identity, frontier);
                 }
+                reuse_trace(
+                    "  fallback_cand index=%u kind=%d frontier=%u in_range=%d mtp_ok=%d "
+                    "lane_match=%d own_match=%d",
+                    index, static_cast<int>(kind), frontier, in_range ? 1 : 0, mtp_ok ? 1 : 0,
+                    lane_match ? 1 : 0, own_match ? 1 : 0);
+                if (!mtp_ok || !lane_match || !own_match) { return; }
                 best_frontier = frontier;
                 best_index    = index;
                 best_kind     = kind;
@@ -376,6 +455,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 checkpoint_fallback     = true;
             }
         }
+        reuse_trace(
+            "mtp_gates reuse=%d base=%u append_ready=%d checkpoint_ready=%d parked_ready=%d "
+            "fallback=%d",
+            static_cast<int>(plan->reuse), plan->reuse_base, append_ready ? 1 : 0,
+            checkpoint_ready ? 1 : 0, parked_ready ? 1 : 0, checkpoint_fallback ? 1 : 0);
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
             !parked_ready && !checkpoint_fallback) {
             plan->reuse             = ReusePath::FullReset;
@@ -384,8 +468,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->parked_checkpoint = false;
             plan->checkpoint_index  = 0;
             parked_entry            = nullptr;
+            reuse_trace("mtp_gates demote=full_reset");
         }
     }
+    reuse_trace("chosen reuse=%d base=%u index=%u parked=%llu action=%d",
+                static_cast<int>(plan->reuse), plan->reuse_base, plan->checkpoint_index,
+                static_cast<unsigned long long>(plan->parked_id),
+                static_cast<int>(plan->rewrite_checkpoint_action));
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
@@ -424,6 +513,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // valid hit; do not replay an otherwise reusable prefix merely to materialize an older
         // auxiliary snapshot. A later request can still use the checkpoint currently retained.
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
+    }
+
+    // The stable message boundary is captured in addition to (and before) the response
+    // checkpoint whenever it lies in the prefix this request is about to prefill. A boundary the
+    // selected continuation already covers needs no capture; its state is not snapshotted.
+    if (base.stable_checkpoint && base.stable_checkpoint->frontier > plan->reuse_base &&
+        base.stable_checkpoint->frontier < plan->summary.prompt_tokens &&
+        (!desired || desired->frontier != base.stable_checkpoint->frontier)) {
+        plan->stable_checkpoint_capture = base.stable_checkpoint;
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;

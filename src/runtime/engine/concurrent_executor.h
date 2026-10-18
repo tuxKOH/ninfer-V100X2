@@ -543,7 +543,7 @@ private:
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            instance_.program->abort_lane(lane);
+            instance_.program->retain_cancelled_lane(lane);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
             return true;
@@ -735,7 +735,16 @@ private:
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
             }
-            instance_.program->abort_lane(lane);
+            // A cancelled staged prefill has already materialized a KV prefix, so keep it (with
+            // the hidden state of its last processed token) and let the conversation's retry
+            // resume there instead of re-prefilling the whole prompt. A final step leaves the
+            // same continuation state a resolved round would; a partial one is kept only when it
+            // can be truncated exactly. Everything else is dropped as before.
+            if (step.complete) {
+                instance_.program->retain_cancelled_lane(lane);
+            } else if (!instance_.program->retain_cancelled_prefill_lane(lane)) {
+                instance_.program->abort_lane(lane);
+            }
             complete_cancelled(request);
             remove_completed_slot(lane);
             return;

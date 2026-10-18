@@ -78,6 +78,14 @@ ninfer_add_test(ninfer_artifact_materialization_test
 ninfer_add_test(ninfer_tensor_slice_test
   SOURCES test_tensor_slice.cpp
   LIBRARIES ninfer_artifact)
+# Host-only: pins the CPU Vision dequantizers to the reference decoder for every backbone format,
+# including the FP16 subnormal scales the converter emits for small-magnitude groups.
+ninfer_add_test(ninfer_cpu_vision_dequant_test
+  SOURCES ops/test_cpu_vision_dequant.cpp)
+# Host-only: pins the optimized Vision kernels (AVX2 attention, bias+GELU, blocked GEMM) to their
+# naive definitions.
+ninfer_add_test(ninfer_cpu_vision_kernels_test
+  SOURCES ops/test_cpu_vision_kernels.cpp)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)

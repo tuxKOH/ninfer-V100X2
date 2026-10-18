@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 
+#include "targets/qwen3_6/impl/runtime/cpu_vision.h"
+
 #include "core/device.h"
 #include "core/layout.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -162,7 +164,14 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
     merger_.fc1_bias    = &vision.common.merger_fc1_bias;
     merger_.fc2         = &vision.merger_fc2;
     merger_.fc2_bias    = &vision.merger_fc2_bias;
+    if (weights.features.vision_cpu) {
+        // The backbone payloads were retained on the host by the loader; nothing on the device
+        // is needed beyond the merged-output transient the caller supplies.
+        cpu_encoder_ = std::make_unique<CpuVisionEncoder>(weights);
+    }
 }
+
+VisionContext::~VisionContext() = default;
 
 std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item) {
     return build_workspace_layout(item.patch_count, item.merged_count,
@@ -196,6 +205,12 @@ std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tok
 
 void VisionContext::encode(const VisionItemView& item, Tensor& output,
                            WorkspaceArena& workspace) const {
+    if (cpu_encoder_) {
+        // No device workspace is used (and none was reserved): intermediates live in host
+        // buffers and only the merged output is copied into the caller's transient.
+        cpu_encoder_->encode(item, output, ctx_.stream);
+        return;
+    }
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_6::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;

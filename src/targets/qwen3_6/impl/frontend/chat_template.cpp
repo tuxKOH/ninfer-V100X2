@@ -353,6 +353,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
 
     int image_count = 0;
     int video_count = 0;
@@ -362,6 +363,19 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (is_instruction_role(message.role)) { validate_instruction_message(message); }
         const std::string content = trim_ascii_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (options.message_boundary_checkpoint && !stable_checkpoint && i > message_begin &&
+            i + 1 == messages.size()) {
+            // The boundary before the final message is the last one a client can rewrite away
+            // between requests. A tool group that continues into the final message has not
+            // emitted its closing "<|im_end|>", so a boundary there would sit mid-group and is
+            // skipped. Every other boundary ends on "<|im_end|>\n" and is followed by the fixed
+            // "<|im_start|>" token, which cannot retokenize the cut.
+            if (!(messages[i - 1].role == ChatRole::Tool &&
+                  message.role == ChatRole::Tool)) {
+                stable_checkpoint = RewriteCheckpointByteSpec{
+                    .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+            }
+        }
         if (is_instruction_role(message.role)) {
             rendered += "<|im_start|>system\n";
             rendered += content;
@@ -451,7 +465,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = assistant_frontier};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    return RenderedChat{.text                = std::move(rendered),
+                        .rewrite_checkpoint  = rewrite_checkpoint,
+                        .stable_checkpoint   = stable_checkpoint};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

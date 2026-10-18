@@ -262,7 +262,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_park_bytes            = options_.kv_park_bytes;
     engine_options.volta_long_attention     = options_.volta_long_attention;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.vision_device            = options_.vision_device;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
+    engine_options.message_boundary_checkpoints = options_.message_boundary_checkpoints;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;

@@ -110,6 +110,7 @@ struct ProcessedInput {
     // One immutable row-major [raw_patches, 1536] payload per Vision item.
     std::vector<std::shared_ptr<const qwen3_6::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<RewriteCheckpointSpec> stable_checkpoint;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -118,6 +119,7 @@ struct ProcessedInput {
 struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<RewriteCheckpointSpec> stable_checkpoint;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);

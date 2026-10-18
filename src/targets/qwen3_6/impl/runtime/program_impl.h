@@ -258,6 +258,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      vision_cpu(plan.features.vision_cpu),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       gdn_state_bytes(linear_attention_state_bytes(plan.persistent.decoder.linear_attention)),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -599,6 +600,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    reuse_trace("start_prefill lane=%u prompt=%u reuse=%d base=%u index=%u action=%d retained=%d",
+                lane, prompt_tokens, static_cast<int>(request_plan.reuse),
+                request_plan.reuse_base, request_plan.checkpoint_index,
+                static_cast<int>(request_plan.rewrite_checkpoint_action),
+                sequence.retained ? 1 : 0);
     if (prompt_tokens != request_plan.summary.prompt_tokens ||
         (request_plan.vision.has_value() && !prompt.has_media())) {
         throw std::invalid_argument("request plan does not describe the prepared prompt");
@@ -618,6 +624,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
+    }
+    if (request_plan.stable_checkpoint_capture &&
+        (request_plan.stable_checkpoint_capture->frontier == 0 ||
+         request_plan.stable_checkpoint_capture->frontier > prompt_tokens ||
+         request_plan.stable_checkpoint_capture->frontier <= request_plan.reuse_base ||
+         (request_plan.rewrite_checkpoint_capture &&
+          request_plan.stable_checkpoint_capture->frontier >=
+              request_plan.rewrite_checkpoint_capture->frontier))) {
+        throw std::invalid_argument("planned stable checkpoint capture is invalid");
     }
     // A parked conversation is materialized into the lane before anything below inspects it, so
     // every check sees the same resident state a retained lane presents and the reuse taken from
@@ -899,6 +914,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .vision                     = nullptr,
             .transient                  = transient,
             .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
+            .stable_checkpoint_capture  = request_plan.stable_checkpoint_capture,
             .base                       = base,
             .cursor                     = base,
             .prompt_tokens              = prompt_tokens,
@@ -1109,10 +1125,16 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 // non-speculative path above has no fold to rewind at all, so both are cleared as
                 // before.
                 if (speculative_backend != SpeculativeBackend::Mtp) {
+                    reuse_trace("midround_cancel lane=%u CLEAR backend!=mtp",
+                                lanes[row]);
                     clear_lane(sequence, request);
                     continue;
                 }
                 const PendingCandidate pending = request.pending;
+                reuse_trace("midround_cancel lane=%u KEEP base_E=%u base_S=%u ledger=%zu "
+                            "text_kv=%u mtp_kv=%u",
+                            lanes[row], pending.base_E, pending.base_S, sequence.ledger.size(),
+                            sequence.text_kv_valid, sequence.mtp_kv_valid);
                 request.pending            = {};
                 sequence.text_kv_valid     = pending.base_E;
                 sequence.tail_hidden_valid = false;
@@ -1186,21 +1208,88 @@ void ProgramImplCore::retain_cancelled_lane(std::uint32_t lane) noexcept {
     // Cancellation is sampled at a round boundary, so an Active lane holds exactly the state a
     // terminal round leaves behind -- ledger, frontends, tail hidden, and the rewrite checkpoint
     // of the response in flight. Keeping it turns the conversation's next request into an
-    // append/checkpoint resume instead of a full re-prefill. Anything else (a cancelled staged
-    // prefill, a half-resolved batch) is not continuable and is cleared as before.
-    if (request.lifecycle != Lifecycle::Active || !sequence.kv ||
+    // append/checkpoint resume instead of a full re-prefill. The same holds for a staged prefill
+    // whose final step was cancelled: it leaves a Begin pending at the prompt frontier, which
+    // resolve would have turned into the same continuation state. Anything else (a partly
+    // prefilled lane, a half-resolved batch) is cleared as before.
+    const bool continuable =
+        request.lifecycle == Lifecycle::Active ||
+        (request.lifecycle == Lifecycle::Pending && request.pending.kind == PendingKind::Begin);
+    if (!continuable || !sequence.kv ||
         sequence.execution_frontier == 0 ||
         sequence.text_kv_valid != sequence.execution_frontier ||
         sequence.ledger.size() != sequence.ledger_frontier ||
         sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        reuse_trace("retain_cancelled lane=%u CLEAR lifecycle=%d kv=%d exec=%u text_kv=%u "
+                    "ledger=%zu/%u identity=%zu/%u",
+                    lane, static_cast<int>(request.lifecycle), sequence.kv ? 1 : 0,
+                    sequence.execution_frontier, sequence.text_kv_valid, sequence.ledger.size(),
+                    sequence.ledger_frontier, sequence.prefix_identity.size(),
+                    sequence.ledger_frontier);
         clear_lane(sequence, request);
         return;
     }
+    reuse_trace("retain_cancelled lane=%u KEEP exec=%u ledger=%zu ckpt=%d/%u history=%zu",
+                lane, sequence.execution_frontier, sequence.ledger.size(),
+                sequence.rewrite_checkpoint.valid ? 1 : 0,
+                sequence.rewrite_checkpoint.frontier, sequence.checkpoint_history.size());
     request.pending = {};
     release_sequence_growth_entitlement(sequence);
     unbind_sequence_kv(sequence);
     sequence.retained = true;
     request.lifecycle = Lifecycle::Complete;
+}
+
+bool ProgramImplCore::retain_cancelled_prefill_lane(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return false; }
+    // DFlash keeps its draft context in device state this path does not trim, and RAM KV owns a
+    // host window the prefill is still staging into; both are cleared as before.
+    if (speculative_backend == SpeculativeBackend::DFlash || ram_kv.gpu_tokens != 0) {
+        return false;
+    }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill || !sequence.kv) {
+        return false;
+    }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const std::uint32_t cursor            = staged.cursor;
+    const std::uint32_t prompt_tokens     = staged.prompt_tokens;
+    const std::int32_t tail_column        = staged.tail_column;
+    // A partially prefilled lane is continuable only from a chunk boundary: the KV, ledger and
+    // recurrent state all describe exactly `cursor` tokens, and the last chunk left the hidden of
+    // token cursor-1 in prefill_hidden.
+    if (cursor == 0 || cursor >= prompt_tokens || tail_column < 0 ||
+        sequence.text_kv_valid != cursor) {
+        reuse_trace("retain_prefill lane=%u CLEAR cursor=%u prompt=%u tail_col=%d text_kv=%u",
+                    lane, cursor, prompt_tokens, tail_column, sequence.text_kv_valid);
+        return false;
+    }
+    try {
+        // The MTP bridge of the resumed request consumes the hidden of token cursor-1, exactly as
+        // an appended lane's bridge consumes its retained tail hidden.
+        copy_tail(sequence, prefill_hidden.slice(1, tail_column, 1));
+        sequence.ledger.resize(cursor);
+        // A cursor that divides one Vision item's consumer span would leave media state no later
+        // request can resume from; truncate() throws and the lane is cleared by the caller.
+        sequence.prefix_identity.truncate(cursor);
+    } catch (...) { return false; }
+    sequence.execution_frontier = cursor;
+    sequence.ledger_frontier    = cursor;
+    sequence.text_kv_valid      = cursor;
+    sequence.mtp_kv_valid       = cursor - 1;
+    sequence.mtp_draft_count    = 0;
+    sequence.tail_hidden_valid  = true;
+    sequence.retained           = true;
+    request.prefill.reset();
+    request.pending   = {};
+    request.lifecycle = Lifecycle::Complete;
+    release_sequence_growth_entitlement(sequence);
+    unbind_sequence_kv(sequence);
+    reuse_trace("retain_prefill lane=%u KEEP cursor=%u prompt=%u ckpt=%d/%u history=%zu", lane,
+                cursor, prompt_tokens, sequence.rewrite_checkpoint.valid ? 1 : 0,
+                sequence.rewrite_checkpoint.frontier, sequence.checkpoint_history.size());
+    return true;
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
@@ -1267,6 +1356,9 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                 planned += sequence.kv->backend_peers[peer->rank - 1]->mapped_payload_bytes();
             }
         }
+        reuse_trace("park lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu", lane,
+                    sequence.execution_frontier, planned, parked.budget_bytes(),
+                    planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size());
         if (planned > parked.budget_bytes()) { return false; }
 
         auto entry                = std::make_unique<ParkedSequence>();
@@ -1700,6 +1792,10 @@ void ProgramImplCore::rotate_device_checkpoint(SequenceState& sequence) {
     // cost host memory and a copy per turn.
     if (speculative_backend == SpeculativeBackend::DFlash) { return; }
     if (!sequence.rewrite_checkpoint.valid) { return; }
+    reuse_trace("rotate lane=%u frontier=%u kind=%d history=%zu", sequence.lane,
+                sequence.rewrite_checkpoint.frontier,
+                static_cast<int>(sequence.rewrite_checkpoint.kind),
+                sequence.checkpoint_history.size());
     push_host_checkpoint(sequence.checkpoint_history, export_checkpoint(sequence));
 }
 
@@ -1745,6 +1841,9 @@ void ProgramImplCore::restore_historical_checkpoint(SequenceState& sequence,
     if (checkpoint_index == 0 || checkpoint_index - 1 >= sequence.checkpoint_history.size()) {
         throw std::logic_error("planned historical checkpoint is no longer retained");
     }
+    reuse_trace("restore_hist lane=%u index=%u frontier=%u preserve=%d", sequence.lane,
+                checkpoint_index, sequence.checkpoint_history[checkpoint_index - 1].frontier,
+                preserve ? 1 : 0);
     HostCheckpoint target = std::move(sequence.checkpoint_history[checkpoint_index - 1]);
     sequence.checkpoint_history.erase(
         sequence.checkpoint_history.begin() + static_cast<std::ptrdiff_t>(checkpoint_index - 1));
@@ -2938,8 +3037,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
+            std::uint32_t nominal =
                 std::min(prefill_chunk * pipeline_chunks, staged.prompt_tokens - staged.cursor);
+            // The stable message boundary is captured by the chunk that reaches it. Clamp this
+            // step to that boundary so the response checkpoint keeps its own final chunk: the
+            // scheduler captures at most one frontier per call.
+            const bool capture_stable =
+                staged.stable_checkpoint_capture && !staged.stable_checkpoint_captured &&
+                staged.stable_checkpoint_capture->frontier > staged.cursor &&
+                staged.stable_checkpoint_capture->frontier <= staged.cursor + nominal;
+            if (capture_stable) {
+                nominal = staged.stable_checkpoint_capture->frontier - staged.cursor;
+            }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -2947,10 +3056,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
+            if (capture_stable && sequence.rewrite_checkpoint.valid) {
+                // Preserve the lane's current checkpoint before the capture overwrites the device
+                // slot. The history ring deduplicates a boundary that is already retained.
+                rotate_device_checkpoint(sequence);
+            }
             const std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier =
-                staged.rewrite_checkpoint_capture
-                    ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
-                    : std::nullopt;
+                capture_stable
+                    ? std::optional<std::uint32_t>(
+                          staged.stable_checkpoint_capture->frontier)
+                    : (staged.rewrite_checkpoint_capture
+                           ? std::optional<std::uint32_t>(
+                                 staged.rewrite_checkpoint_capture->frontier)
+                           : std::nullopt);
             // Capture Q once on the final suffix, then replay from the SAME recurrent state
             // with query-selected history. The preview does not sample or publish tokens.
             if (ram_kv.gpu_tokens != 0 && final_candidate && staged.cursor > ram_kv.gpu_tokens) {
@@ -2996,11 +3114,36 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
+            // A Vision consumer span can cap the step before the frontier (TP1/TP2 process one
+            // chunk per unit). The scheduler captures only when a chunk actually ends at the
+            // frontier, so in that case nothing was captured and the next step -- whose window
+            // starts at the Vision boundary -- reaches it instead.
+            if (capture_stable && staged.cursor == staged.stable_checkpoint_capture->frontier) {
+                // The boundary state is now in the device checkpoint slot and hidden buffer.
+                // Publish it with this prompt's lineage and move it into the host ring, where a
+                // diverging replay can restore it.
+                staged.stable_checkpoint_captured = true;
+                sequence.rewrite_checkpoint       = RewriteCheckpoint{
+                    .valid    = true,
+                    .kind     = staged.stable_checkpoint_capture->kind,
+                    .frontier = staged.cursor};
+                sequence.checkpoint_ledger   = sequence.ledger;
+                sequence.checkpoint_identity = sequence.prefix_identity;
+                rotate_device_checkpoint(sequence);
+                reuse_trace("stable_capture lane=%u frontier=%u kind=%d history=%zu",
+                            sequence.lane, staged.cursor,
+                            static_cast<int>(staged.stable_checkpoint_capture->kind),
+                            sequence.checkpoint_history.size());
+            }
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
+                // Kept for retain_cancelled_prefill_lane: when this step's boundary carries a
+                // cancellation, the hidden of the last token this chunk processed is still in
+                // prefill_hidden and becomes the resumed lane's MTP bridge input.
+                staged.tail_column = static_cast<std::int32_t>(result.tail_column);
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{
@@ -3071,7 +3214,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
         sequence.ledger.push_back(host_tokens[0]);
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-        sequence.text_kv_valid = prompt_tokens;
+        sequence.text_kv_valid     = prompt_tokens;
+        // The Begin pending is resolved with these same frontiers; setting them here as well keeps
+        // a cancelled prefill's final step continuable (see retain_cancelled_lane).
+        sequence.execution_frontier = prompt_tokens;
+        sequence.ledger_frontier    = prompt_tokens + 1;
         if (staged.prepare_mtp) {
             if (sequence.mtp_kv_valid != prompt_tokens) {
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
@@ -3101,6 +3248,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
+            reuse_trace("capture lane=%u frontier=%u kind=%d prompt=%u history=%zu", sequence.lane,
+                        frontier, static_cast<int>(rewrite_checkpoint_capture->kind), prompt_tokens,
+                        sequence.checkpoint_history.size());
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
             // Provenance for this boundary: the prompt lineage it was captured from. The ledger

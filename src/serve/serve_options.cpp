@@ -124,7 +124,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
-           "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
+           "[--boundary-checkpoints] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -151,6 +152,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768)\n"
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
+           "       --vision-device cpu runs the Vision encoder on host threads instead of the GPU:\n"
+           "       no Vision weights or scratch are uploaded, at the cost of CPU encode time\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -346,6 +349,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            const std::string value = require_value("--vision-device");
+            if (value == "cpu") {
+                options.vision_device = VisionDevice::Cpu;
+            } else if (value == "gpu") {
+                options.vision_device = VisionDevice::Gpu;
+            } else {
+                throw std::invalid_argument("--vision-device must be gpu or cpu");
+            }
+        } else if (arg == "--boundary-checkpoints") {
+            options.message_boundary_checkpoints = true;
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--vision-max-tokens"), "vision-max-tokens"));

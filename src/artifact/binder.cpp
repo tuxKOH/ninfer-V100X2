@@ -341,6 +341,18 @@ void Binder::retain_on_host(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::retain_tensor_on_host(ObjectHandle handle) {
+    // The materializer's host path copies the object's payload verbatim and does not inspect the
+    // descriptor kind; only the resource-only guard above distinguishes the two entry points.
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(object_name(descriptor(handle))));
+    }
+    (void)descriptor(handle);
+    materialization_.host_objects.push_back(HostMaterialization{handle});
+    planned_[handle.index] = true;
+}
+
 void Binder::validate_only(ObjectHandle handle) {
     const ObjectDescriptor& object = descriptor(handle);
     if (planned_[handle.index]) {

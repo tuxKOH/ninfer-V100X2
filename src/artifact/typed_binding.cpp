@@ -175,6 +175,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
         // Whole tensor on the primary rank. Reuses the storage-mode primitive instead of a
         // second placement entry point.
         binder.materialize_on_device(handle, 0);
+    } else if (placement == TensorPlacement::Host) {
+        binder.retain_tensor_on_host(handle);
     } else {
         binder.validate_only(handle);
     }
@@ -272,6 +274,86 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         return row_scale_weight(materialized, handle, format, rows, columns, device);
     }
     return row_split_weight(materialized, handle, format, rows, columns, device);
+}
+
+Tensor host_materialized_tensor(const MaterializedArtifact& materialized, ObjectHandle handle,
+                                NumericFormat format,
+                                std::initializer_list<std::int32_t> internal_shape) {
+    std::uint64_t elements = 1;
+    for (const std::int32_t extent : internal_shape) {
+        if (extent <= 0) {
+            throw std::invalid_argument(
+                "host_materialized_tensor shape extents must be positive");
+        }
+        elements *= static_cast<std::uint64_t>(extent);
+    }
+    const std::span<const std::byte> bytes    = materialized.resource_bytes(handle);
+    const std::uint64_t required              = elements * dtype_size(dtype_for(format));
+    if (bytes.size() < required) {
+        throw ArtifactError("host-retained object has " + std::to_string(bytes.size()) +
+                            " bytes, but the requested shape needs " +
+                            std::to_string(required));
+    }
+    return Tensor(const_cast<std::byte*>(bytes.data()), dtype_for(format), internal_shape);
+}
+
+Weight host_materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                                NumericFormat format, std::int32_t rows, std::int32_t columns) {
+    const std::span<const std::byte> bytes = materialized.resource_bytes(handle);
+    const std::byte* data                  = bytes.data();
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    Weight out{};
+    if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
+        const std::uint64_t required = static_cast<std::uint64_t>(rows) *
+                                       static_cast<std::uint64_t>(columns) *
+                                       dtype_size(dtype_for(format));
+        if (bytes.size() < required) {
+            throw ArtifactError("host-retained dense weight is smaller than its shape");
+        }
+        out.payload         = data;
+        out.qdata           = data;
+        out.payload_bytes   = required;
+        out.qtype           = qtype_for(format);
+        out.layout          = QuantLayout::Contiguous;
+        out.n               = rows;
+        out.k               = columns;
+        out.ndim            = 2;
+        out.shape[0]        = rows;
+        out.shape[1]        = columns;
+        out.padded_shape[0] = rows;
+        out.padded_shape[1] = columns;
+        return out;
+    }
+    if (storage_layout_for(format) != StorageLayout::RowSplitK128V1) {
+        throw std::invalid_argument(
+            "host_materialized_weight supports dense and row-split formats only");
+    }
+    const RowSplitGeometry geometry = row_split_geometry(format, shape);
+    if (bytes.size() < geometry.encoded_bytes) {
+        throw ArtifactError("host-retained row-split weight is smaller than its geometry");
+    }
+    out.payload          = data;
+    out.payload_bytes    = geometry.encoded_bytes;
+    out.high_plane_bytes = geometry.high_plane_bytes;
+    out.qtype            = qtype_for(format);
+    out.layout           = QuantLayout::RowSplit;
+    out.group_size       = static_cast<std::uint32_t>(geometry.group_size);
+    out.qdata            = data;
+    out.qhigh            = geometry.high_plane_bytes == 0
+                               ? nullptr
+                               : data + geometry.high_plane_offset;
+    out.scales           = data + geometry.scale_plane_offset;
+    out.n                = rows;
+    out.k                = columns;
+    out.group            = static_cast<std::int32_t>(geometry.group_size);
+    out.scale_dtype      = DType::FP16;
+    out.ndim             = 2;
+    out.shape[0]         = rows;
+    out.shape[1]         = columns;
+    out.padded_shape[0]  = rows;
+    out.padded_shape[1]  = static_cast<std::int32_t>(geometry.padded_columns);
+    return out;
 }
 
 } // namespace ninfer::artifact

@@ -73,6 +73,11 @@ struct RewriteCheckpointSpec {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    // An additional reusable boundary at the end of the message before the last one. Clients
+    // truncate or rewrite the final message (ephemeral system-reminders, a dropped tool result),
+    // which makes the response checkpoint above unusable; this boundary still matches the common
+    // message prefix.
+    std::optional<RewriteCheckpointSpec> stable_checkpoint;
 };
 
 struct PrepareStats {

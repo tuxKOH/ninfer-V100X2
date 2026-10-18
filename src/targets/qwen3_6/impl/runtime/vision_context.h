@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -40,9 +41,14 @@ struct VisionScheduleConfig {
     static constexpr float norm_eps          = VisionConfig::norm_epsilon;
 };
 
+class CpuVisionEncoder;
+
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
+    ~VisionContext();
+    VisionContext(const VisionContext&)            = delete;
+    VisionContext& operator=(const VisionContext&) = delete;
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
@@ -81,6 +87,10 @@ private:
     const Tensor* position_embed_   = nullptr;
     std::array<BlockW, VisionScheduleConfig::layers> blocks_{};
     MergerW merger_{};
+    // Non-null when --vision-device cpu: encode() runs on host threads and only the merged
+    // embeddings reach the device. Declared as an opaque pointer so this header does not pull in
+    // the host implementation.
+    std::unique_ptr<CpuVisionEncoder> cpu_encoder_;
 };
 
 struct VisionChunk {

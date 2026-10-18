@@ -129,16 +129,19 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu]\n"
+           "       [--vision-max-tokens N] [--boundary-checkpoints]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--vision-device cpu runs the Vision encoder on host threads and reserves no Vision GPU scratch.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
+           "--boundary-checkpoints retains a reusable checkpoint at the last stable message boundary.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
            "independently of text context; smaller budgets reduce reserved Vision memory.\n"
            "--kv-capacity auto leaves " +
@@ -255,6 +258,17 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            const std::string device = value(arg);
+            if (device == "cpu") {
+                options.vision_device = VisionDevice::Cpu;
+            } else if (device == "gpu") {
+                options.vision_device = VisionDevice::Gpu;
+            } else {
+                throw std::invalid_argument("--vision-device must be gpu or cpu");
+            }
+        } else if (arg == "--boundary-checkpoints") {
+            options.message_boundary_checkpoints = true;
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens");
         } else if (arg == "--no-cuda-graph") {

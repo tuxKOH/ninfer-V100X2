@@ -65,7 +65,9 @@ struct ServeOptions {
     bool volta_long_attention = false;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
+    VisionDevice vision_device = VisionDevice::Gpu;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
+    bool message_boundary_checkpoints = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

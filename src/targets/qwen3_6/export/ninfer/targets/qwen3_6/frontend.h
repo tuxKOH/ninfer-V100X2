@@ -21,6 +21,9 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // Record a reusable checkpoint at the last stable message boundary in addition to the
+    // response checkpoint.
+    bool message_boundary_checkpoints      = false;
 };
 
 struct FrontendResources;

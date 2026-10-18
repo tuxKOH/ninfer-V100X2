@@ -310,9 +310,14 @@ public:
     }
 
     // The fake does not model retained continuation state, so a cancelled lane is cleared for
-    // both entry points; the executor contract only requires that the call is made.
+    // every retention entry point; the executor contract only requires that the call is made.
     void retain_cancelled_lane(std::uint32_t lane) noexcept {
         if (lane < max_concurrency_) { clear(lane); }
+    }
+
+    [[nodiscard]] bool retain_cancelled_prefill_lane(std::uint32_t lane) noexcept {
+        if (lane < max_concurrency_) { clear(lane); }
+        return false;
     }
 
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }

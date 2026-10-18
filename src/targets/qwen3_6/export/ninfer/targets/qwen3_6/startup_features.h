@@ -6,6 +6,8 @@ namespace ninfer::targets::qwen3_6 {
 
 struct StartupFeatures {
     bool vision                    = false;
+    // Vision executes on host threads; the backbone payloads stay in host memory.
+    bool vision_cpu                = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
 
@@ -27,6 +29,7 @@ struct StartupFeatures {
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) noexcept {
     return StartupFeatures{
         .vision        = options.enable_vision,
+        .vision_cpu    = options.enable_vision && options.vision_device == VisionDevice::Cpu,
         .speculative   = options.speculative.backend,
         .proposal_head = options.speculative.proposal_head,
     };

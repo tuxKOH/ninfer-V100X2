@@ -1127,9 +1127,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
 
     const artifact::TensorPlacement vision_placement =
-        features.vision ? (tp == 2 ? artifact::TensorPlacement::PrimaryDevice
-                                   : artifact::TensorPlacement::Device)
-                        : artifact::TensorPlacement::ValidateOnly;
+        !features.vision ? artifact::TensorPlacement::ValidateOnly
+        : features.vision_cpu
+            ? artifact::TensorPlacement::Host
+            : (tp == 2 ? artifact::TensorPlacement::PrimaryDevice
+                       : artifact::TensorPlacement::Device);
     if (ggml_k) {
         binder.validate_unconsumed_matching("vision/gguf/");
     } else if (!native_fp8) {
@@ -1373,13 +1375,22 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
 
     if (plan.features.vision) {
         if (device != 0) { return; }
-        auto& vision  = runtime.vision.emplace();
-        vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 5120, 4608);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {5120});
+        const bool host_vision = plan.features.vision_cpu;
+        auto& vision           = runtime.vision.emplace();
+        vision.common          = qwen3_6::materialize_vision_common(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,
+            host_vision);
+        vision.merger_fc2 =
+            host_vision ? artifact::host_materialized_weight(backing, plan.vision_merger_fc2,
+                                                             NumericFormat::W8G32_F16S, 5120, 4608)
+                        : artifact::materialized_weight(backing, plan.vision_merger_fc2,
+                                                        NumericFormat::W8G32_F16S, 5120, 4608);
+        vision.merger_fc2_bias =
+            host_vision
+                ? artifact::host_materialized_tensor(backing, plan.vision_merger_fc2_bias,
+                                                     NumericFormat::BF16, {5120})
+                : artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
+                                                NumericFormat::BF16, {5120});
     }
 }
 

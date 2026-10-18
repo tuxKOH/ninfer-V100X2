@@ -19,6 +19,9 @@ inline constexpr std::size_t kVirtualStorageDevices = 2;
 enum class TensorPlacement : std::uint8_t {
     Device,
     PrimaryDevice,
+    // Keeps the tensor's payload in host memory instead of uploading it. Used by the CPU Vision
+    // encoder, which must not pay for the backbone in the device arena.
+    Host,
     ValidateOnly,
 };
 
@@ -138,6 +141,10 @@ public:
     void materialize_virtual_rows(ObjectHandle handle,
                                   std::array<SliceRange, kVirtualStorageDevices> ranges);
     void retain_on_host(ObjectHandle handle);
+    // Like retain_on_host, but for a tensor descriptor: the payload is copied into host storage
+    // and no device placement is planned. The caller reads it through
+    // MaterializedArtifact::resource_bytes.
+    void retain_tensor_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     void validate_unconsumed_matching(std::string_view prefix = "");
     MaterializationPlan finish();

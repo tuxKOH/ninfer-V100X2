@@ -706,6 +706,87 @@ int test_rewrite_checkpoint_trace() {
     return failures;
 }
 
+// The optional stable boundary sits at the end of the message before the last one. Clients drop
+// or rewrite that final message (ephemeral reminders, interrupted tool results), so it must be a
+// boundary shared by both renders; a tool group that continues into the final message has no
+// closing marker there and is skipped.
+int test_stable_checkpoint_trace() {
+    fi::ChatRenderOptions options;
+    options.message_boundary_checkpoint = true;
+
+    const fi::ChatMessage question = chat_message(ninfer::ChatRole::User, "one");
+    const fi::ChatMessage follow   = chat_message(ninfer::ChatRole::User, "two");
+    fi::ChatRenderOptions no_generation = options;
+    no_generation.add_generation_prompt = false;
+    const fi::RenderedChat first_only   = render_chat({question}, no_generation);
+    const fi::RenderedChat two_messages = render_chat({question, follow}, options);
+    int failures = check(two_messages.stable_checkpoint &&
+                             two_messages.stable_checkpoint->offset == first_only.text.size() &&
+                             two_messages.stable_checkpoint->kind ==
+                                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
+                         "stable boundary did not stop at the previous message");
+
+    failures += check(two_messages.rewrite_checkpoint && two_messages.stable_checkpoint &&
+                          two_messages.stable_checkpoint->offset <
+                              two_messages.rewrite_checkpoint->offset,
+                      "stable boundary did not precede the response checkpoint");
+
+    fi::ChatRenderOptions disabled = options;
+    disabled.message_boundary_checkpoint = false;
+    failures += check(!render_chat({question, follow}, disabled).stable_checkpoint,
+                      "stable boundary was published while the option was off");
+
+    // Two consecutive tool results: the first has no closing "<|im_end|>", so no boundary.
+    const fi::ChatMessage tool_one = chat_message(ninfer::ChatRole::Tool, "first result");
+    const fi::ChatMessage tool_two = chat_message(ninfer::ChatRole::Tool, "second result");
+    failures += check(!render_chat({question, tool_one, tool_two}, options).stable_checkpoint,
+                      "stable boundary was recorded inside an open tool group");
+    return failures;
+}
+
+// The stable offset is recorded against the placeholder form of the rendered chat. Placeholder
+// expansion must move it exactly like the response offset: an unshifted boundary lands inside the
+// expanded image pad run and is not a token prefix.
+int test_stable_checkpoint_with_media() {
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
+                                                            ninfer::kDefaultMediaLiveBytes);
+    fi::Processor processor(official_tokenizer(), thinking_toggle_template(), fi::ProcessorOptions{},
+                            std::move(cache));
+    fi::ChatMessage with_image;
+    with_image.role = ninfer::ChatRole::User;
+    with_image.parts.push_back(fi::ChatPart::text_part("look"));
+    with_image.parts.push_back(fi::ChatPart::image(fi::MediaData{
+        .bytes       = gradient_ppm(),
+        .media_type  = "image/x-portable-pixmap",
+        .source_name = "stable-boundary.ppm"}));
+    fi::ChatMessage question;
+    question.role = ninfer::ChatRole::User;
+    question.parts.push_back(fi::ChatPart::text_part("now answer"));
+
+    fi::ChatRenderOptions render;
+    render.message_boundary_checkpoint = true;
+    fi::ProcessedInput processed;
+    try {
+        processed = processor.process(std::vector<fi::ChatMessage>{with_image, question}, render);
+    } catch (const std::exception& error) {
+        return check(false, (std::string("media stable-checkpoint preparation failed: ") +
+                             error.what())
+                                .c_str());
+    }
+    int failures = check(processed.rewrite_checkpoint && processed.stable_checkpoint &&
+                             processed.stable_checkpoint->frontier <
+                                 processed.rewrite_checkpoint->frontier &&
+                             processed.rewrite_checkpoint->frontier < processed.input_ids.size(),
+                         "media prompt did not publish ordered stable/response checkpoints");
+    if (processed.stable_checkpoint && !processed.vision_items.empty() &&
+        !processed.vision_items.front().token_spans.empty()) {
+        const fi::TokenSpan& span = processed.vision_items.front().token_spans.back();
+        failures += check(span.begin + span.count <= processed.stable_checkpoint->frontier,
+                          "stable checkpoint boundary divided or preceded the image span");
+    }
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -1427,6 +1508,8 @@ int main() {
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
+    failures += test_stable_checkpoint_trace();
+    failures += test_stable_checkpoint_with_media();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);

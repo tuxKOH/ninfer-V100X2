@@ -627,7 +627,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && !plan.features.vision_cpu) {
+        // The CPU encoder keeps its intermediates on the host, so no device Vision scratch is
+        // reserved at all; only the merged-output transient remains (sized at line ~837).
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(

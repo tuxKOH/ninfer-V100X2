@@ -99,8 +99,11 @@ struct VisionWeights {
 [[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
                                                            artifact::TensorPlacement placement);
 
+// `host` selects the host-retained payloads bound with TensorPlacement::Host; the resulting
+// struct is consumed by the CPU Vision encoder and never by a CUDA kernel.
 [[nodiscard]] VisionCommonWeights materialize_vision_common(
     const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
-    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm);
+    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm,
+    bool host = false);
 
 } // namespace ninfer::targets::qwen3_6
