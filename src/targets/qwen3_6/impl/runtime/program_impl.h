@@ -644,6 +644,21 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
               request_plan.rewrite_checkpoint_capture->frontier))) {
         throw std::invalid_argument("planned stable checkpoint capture is invalid");
     }
+    if (request_plan.tools_checkpoint_capture &&
+        (request_plan.tools_checkpoint_capture->frontier == 0 ||
+         request_plan.tools_checkpoint_capture->frontier > prompt_tokens ||
+         request_plan.tools_checkpoint_capture->frontier <= request_plan.reuse_base ||
+         (request_plan.prefix_checkpoint_capture &&
+          request_plan.tools_checkpoint_capture->frontier >=
+              request_plan.prefix_checkpoint_capture->frontier) ||
+         (request_plan.stable_checkpoint_capture &&
+          request_plan.tools_checkpoint_capture->frontier >=
+              request_plan.stable_checkpoint_capture->frontier) ||
+         (request_plan.rewrite_checkpoint_capture &&
+          request_plan.tools_checkpoint_capture->frontier >=
+              request_plan.rewrite_checkpoint_capture->frontier))) {
+        throw std::invalid_argument("planned tool checkpoint capture is invalid");
+    }
     if (request_plan.prefix_checkpoint_capture &&
         (request_plan.prefix_checkpoint_capture->frontier == 0 ||
          request_plan.prefix_checkpoint_capture->frontier > prompt_tokens ||
@@ -693,20 +708,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence, request_plan.checkpoint_index,
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew);
     }
-    if (request_plan.restore_shared_prefix && speculative_backend == SpeculativeBackend::DFlash) {
+    if (request_plan.restore_shared_prefix != SharedPrefixSlot::None &&
+        speculative_backend == SpeculativeBackend::DFlash) {
         throw std::logic_error("shared prefix checkpoints are unavailable for DFlash");
     }
-    if (request_plan.restore_shared_prefix &&
+    if (request_plan.restore_shared_prefix != SharedPrefixSlot::None &&
         request_plan.reuse != ReusePath::RestoreParkedKv) {
-        // The pinned shared leading boundary lives outside the ring. Preserve the lane's current
-        // checkpoint first, then import the pinned state into the checkpoint slot; the reuse
-        // branch below copies it into the current slot.
-        if (sequence.shared_prefix.frontier == 0 ||
-            sequence.shared_prefix.frontier > sequence.text_kv_valid) {
+        // The pinned shared boundaries live outside the ring. Preserve the lane's current
+        // checkpoint first, then import the selected pinned state into the checkpoint slot; the
+        // reuse branch below copies it into the current slot.
+        HostCheckpoint& pinned = request_plan.restore_shared_prefix == SharedPrefixSlot::Tools
+                                     ? sequence.tools_prefix
+                                     : sequence.shared_prefix;
+        if (pinned.frontier == 0 || pinned.frontier > sequence.text_kv_valid) {
             throw std::logic_error("planned shared prefix checkpoint is unavailable");
         }
         rotate_device_checkpoint(sequence);
-        import_checkpoint_state(sequence, sequence.shared_prefix, /*into_current=*/false);
+        import_checkpoint_state(sequence, pinned, /*into_current=*/false);
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
         sequence.rewrite_checkpoint.valid) {
@@ -954,6 +972,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
             .stable_checkpoint_capture  = request_plan.stable_checkpoint_capture,
             .prefix_checkpoint_capture  = request_plan.prefix_checkpoint_capture,
+            .tools_checkpoint_capture   = request_plan.tools_checkpoint_capture,
             .base                       = base,
             .cursor                     = base,
             .prompt_tokens              = prompt_tokens,
@@ -1392,7 +1411,7 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                        sequence.checkpoint_identity.bytes();
         }
         for (const HostCheckpoint& host : sequence.checkpoint_history) { planned += host.bytes; }
-        planned += sequence.shared_prefix.bytes;
+        planned += sequence.shared_prefix.bytes + sequence.tools_prefix.bytes;
         if (sequence.kv->backend) { planned += sequence.kv->backend->mapped_payload_bytes(); }
         for (auto& peer : peers) {
             planned += sequence.kv->text_peers[peer->rank - 1]->mapped_payload_bytes() +
@@ -1426,6 +1445,7 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         }
         entry->checkpoint_history = sequence.checkpoint_history;
         entry->shared_prefix      = sequence.shared_prefix;
+        entry->tools_prefix       = sequence.tools_prefix;
 
         // One rank's KV payloads and its own GDN slots -- the current slot always, and the
         // checkpoint slot when the lane carries a rewrite checkpoint. The caller has made this
@@ -1497,7 +1517,7 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         bytes += entry->checkpoint_ledger.size() * sizeof(TokenId) +
                  entry->checkpoint_identity.bytes();
         for (const HostCheckpoint& host : entry->checkpoint_history) { bytes += host.bytes; }
-        bytes += entry->shared_prefix.bytes;
+        bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
         entry->bytes = bytes;
 
         if (!parked.insert(std::move(entry), park_clock++, protect_id)) { return false; }
@@ -1538,6 +1558,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.checkpoint_identity.clear();
     sequence.checkpoint_history.clear();
     sequence.shared_prefix           = {};
+    sequence.tools_prefix            = {};
     request.pending                  = {};
 }
 
@@ -1994,7 +2015,7 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                                           std::uint32_t text_pages, std::uint32_t backend_pages,
                                           bool resume_at_checkpoint,
                                           std::uint32_t checkpoint_index,
-                                          bool resume_at_shared_prefix) {
+                                          SharedPrefixSlot resume_at_shared_prefix) {
     if (sequence.kv) { throw std::logic_error("parked restore requires an empty lane"); }
     const bool has_backend = backend_kv_cache() != nullptr;
     if (entry.text.size() != static_cast<std::size_t>(device_count) ||
@@ -2003,14 +2024,16 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         entry.tail_hidden.size() != 1) {
         throw std::logic_error("parked conversation does not describe this engine's rank set");
     }
-    if (resume_at_shared_prefix) {
+    if (resume_at_shared_prefix != SharedPrefixSlot::None) {
         if (speculative_backend == SpeculativeBackend::DFlash) {
             throw std::logic_error("shared prefix checkpoints are unavailable for DFlash");
         }
-        if (entry.shared_prefix.frontier == 0 ||
-            entry.shared_prefix.frontier > entry.execution_frontier ||
-            entry.shared_prefix.state.size() != entry.text.size() ||
-            entry.shared_prefix.hidden.size() !=
+        const HostCheckpoint& pinned = resume_at_shared_prefix == SharedPrefixSlot::Tools
+                                           ? entry.tools_prefix
+                                           : entry.shared_prefix;
+        if (pinned.frontier == 0 || pinned.frontier > entry.execution_frontier ||
+            pinned.state.size() != entry.text.size() ||
+            pinned.hidden.size() !=
                 static_cast<std::size_t>(sequence.rewrite_checkpoint_hidden.bytes())) {
             throw std::logic_error("parked conversation has no restorable shared prefix");
         }
@@ -2084,6 +2107,7 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         // The entry owns the history; the lane takes it over (the entry is erased afterwards).
         sequence.checkpoint_history = std::move(entry.checkpoint_history);
         sequence.shared_prefix      = std::move(entry.shared_prefix);
+        sequence.tools_prefix       = std::move(entry.tools_prefix);
         if (resume_at_checkpoint) {
             // Put the lane back at a checkpoint frontier: import the checkpoint's recurrent
             // state on every rank and its rank-0 hidden into both hidden tensors, so the MTP
@@ -2099,10 +2123,12 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
             RewriteCheckpointKind kind      = RewriteCheckpointKind::TurnClosure;
             HostCheckpoint newest_unselected;
             bool preserve_newest = false;
-            if (resume_at_shared_prefix) {
-                // The parked entry's pinned leading boundary. Its current checkpoint is newer
+            if (resume_at_shared_prefix != SharedPrefixSlot::None) {
+                // The parked entry's selected pinned boundary. Its current checkpoint is newer
                 // and belongs to the branch that produced it, so keep it in the history.
-                HostCheckpoint& selected = sequence.shared_prefix;
+                HostCheckpoint& selected = resume_at_shared_prefix == SharedPrefixSlot::Tools
+                                               ? sequence.tools_prefix
+                                               : sequence.shared_prefix;
                 import_checkpoint_state(sequence, selected, /*into_current=*/true);
                 CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, selected.hidden.data(),
                                            selected.hidden.size(), cudaMemcpyHostToDevice,
@@ -3215,17 +3241,25 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             std::uint32_t nominal =
                 std::min(prefill_chunk * pipeline_chunks, staged.prompt_tokens - staged.cursor);
             // The boundary checkpoints are captured by the chunk that reaches each one, in prompt
-            // order: the shared leading boundary first, then the last stable message boundary.
-            // Clamping this step to that frontier keeps the response checkpoint its own final
-            // chunk, because the scheduler captures at most one frontier per call.
+            // order: the tool anchor first, then the shared leading boundary, then the last stable
+            // message boundary. Clamping this step to that frontier keeps the response checkpoint
+            // its own final chunk, because the scheduler captures at most one frontier per call.
+            enum class BoundarySlot { Tools, Leading, Stable };
             std::optional<RewriteCheckpointSpec>* pending_boundary = nullptr;
             bool* pending_captured                                 = nullptr;
-            if (staged.prefix_checkpoint_capture && !staged.prefix_checkpoint_captured) {
+            BoundarySlot pending_slot                              = BoundarySlot::Stable;
+            if (staged.tools_checkpoint_capture && !staged.tools_checkpoint_captured) {
+                pending_boundary = &staged.tools_checkpoint_capture;
+                pending_captured = &staged.tools_checkpoint_captured;
+                pending_slot     = BoundarySlot::Tools;
+            } else if (staged.prefix_checkpoint_capture && !staged.prefix_checkpoint_captured) {
                 pending_boundary = &staged.prefix_checkpoint_capture;
                 pending_captured = &staged.prefix_checkpoint_captured;
+                pending_slot     = BoundarySlot::Leading;
             } else if (staged.stable_checkpoint_capture && !staged.stable_checkpoint_captured) {
                 pending_boundary = &staged.stable_checkpoint_capture;
                 pending_captured = &staged.stable_checkpoint_captured;
+                pending_slot     = BoundarySlot::Stable;
             }
             const bool capture_boundary =
                 pending_boundary != nullptr && (*pending_boundary)->frontier > staged.cursor &&
@@ -3312,10 +3346,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     .frontier = staged.cursor};
                 sequence.checkpoint_ledger   = sequence.ledger;
                 sequence.checkpoint_identity = sequence.prefix_identity;
-                if (pending_boundary == &staged.prefix_checkpoint_capture) {
-                    // Pin the shared leading boundary outside the ring: every later request
-                    // captures newer boundaries, and the depth-3 ring would evict it within two
+                if (pending_slot == BoundarySlot::Tools) {
+                    // Pin the shared boundaries outside the ring: every later request captures
+                    // newer boundaries, and the depth-3 ring would evict them within two
                     // requests, ending cross-session reuse.
+                    sequence.tools_prefix = export_checkpoint(sequence);
+                } else if (pending_slot == BoundarySlot::Leading) {
                     sequence.shared_prefix = export_checkpoint(sequence);
                 } else {
                     rotate_device_checkpoint(sequence);

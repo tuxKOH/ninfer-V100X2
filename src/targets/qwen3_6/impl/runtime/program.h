@@ -72,6 +72,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint;
     std::optional<qwen3_6::RewriteCheckpointSpec> prefix_checkpoint;
+    std::optional<qwen3_6::RewriteCheckpointSpec> tools_checkpoint;
     bool allow_prefix_reuse = false;
 };
 
@@ -104,8 +105,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint_capture;
     // A capture after the static leading block; shared by every session with that prefix.
     std::optional<qwen3_6::RewriteCheckpointSpec> prefix_checkpoint_capture;
-    // The selected boundary is the lane's pinned shared prefix rather than a ring entry.
-    bool restore_shared_prefix = false;
+    // A capture after the tool definitions, before the volatile leading instruction text.
+    std::optional<qwen3_6::RewriteCheckpointSpec> tools_checkpoint_capture;
+    // The selected boundary is one of the lane's pinned shared prefixes rather than a ring entry.
+    SharedPrefixSlot restore_shared_prefix = SharedPrefixSlot::None;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -210,6 +213,9 @@ struct SequenceState {
     // The shared leading-block boundary, pinned outside the ring: it is identical across agent
     // sessions, so it must survive ring rotation to stay usable by a later conversation.
     HostCheckpoint shared_prefix;
+    // The same for the end of the tool definitions, which precede the leading instruction text
+    // and therefore survive changes in it (environment lines, dates).
+    HostCheckpoint tools_prefix;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
 };
@@ -234,6 +240,8 @@ struct RequestControl {
         bool stable_checkpoint_captured  = false;
         std::optional<RewriteCheckpointSpec> prefix_checkpoint_capture;
         bool prefix_checkpoint_captured  = false;
+        std::optional<RewriteCheckpointSpec> tools_checkpoint_capture;
+        bool tools_checkpoint_captured   = false;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -575,7 +583,7 @@ private:
     void restore_parked_lane(SequenceState& sequence, ParkedSequence& entry,
                              std::uint32_t text_pages, std::uint32_t backend_pages,
                              bool resume_at_checkpoint, std::uint32_t checkpoint_index,
-                             bool resume_at_shared_prefix = false);
+                             SharedPrefixSlot resume_at_shared_prefix = SharedPrefixSlot::None);
     // Copies a checkpoint's per-rank recurrent slot and rank-0 hidden from host. `into_current`
     // also materializes it into the running slot (a parked restore); otherwise only the
     // checkpoint slot is written and the resident checkpoint path copies it forward.

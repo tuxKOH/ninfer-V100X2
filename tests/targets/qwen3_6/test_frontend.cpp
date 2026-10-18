@@ -741,6 +741,18 @@ int test_stable_checkpoint_trace() {
     const fi::ChatMessage tool_two = chat_message(ninfer::ChatRole::Tool, "second result");
     failures += check(!render_chat({question, tool_one, tool_two}, options).stable_checkpoint,
                       "stable boundary was recorded inside an open tool group");
+
+    // The conversation ends in a tool result, but with preserve-thinking off the response
+    // checkpoint stops at the assistant turn that issued the call. The stable cut lies after
+    // that checkpoint, so it must be dropped rather than violate the ordering invariant.
+    fi::ChatMessage calling = chat_message(ninfer::ChatRole::Assistant, "");
+    calling.tool_calls.push_back({.id = "call", .name = "f", .arguments_json = "{}"});
+    fi::ChatRenderOptions preserve_off = options;
+    preserve_off.preserve_thinking     = false;
+    const fi::RenderedChat tool_tail   = render_chat(
+        {question, calling, chat_message(ninfer::ChatRole::Tool, "result")}, preserve_off);
+    failures += check(tool_tail.rewrite_checkpoint && !tool_tail.stable_checkpoint,
+                      "stable boundary was kept after an earlier response checkpoint");
     return failures;
 }
 
@@ -780,6 +792,47 @@ int test_shared_prefix_checkpoint_trace() {
     // Without a static leading block there is nothing to share.
     failures += check(!render_chat({first, second}, options).prefix_checkpoint,
                       "shared prefix boundary was published without a leading block");
+    return failures;
+}
+
+// The tool anchor sits at the end of the tool definitions, before the leading instruction text
+// that follows them. That is the boundary that survives a changed environment line in the system
+// prompt, which invalidates the later shared-prefix boundary.
+int test_tools_checkpoint_trace() {
+    fi::ChatRenderOptions options;
+    options.shared_prefix_checkpoint = true;
+    options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{}}}})");
+    const fi::ChatMessage system = chat_message(ninfer::ChatRole::System, "static agent prompt");
+    const fi::ChatMessage first  = chat_message(ninfer::ChatRole::User, "one");
+    const fi::ChatMessage second = chat_message(ninfer::ChatRole::User, "two");
+
+    const fi::RenderedChat rendered = render_chat({system, first, second}, options);
+    int failures = check(rendered.tools_checkpoint && rendered.prefix_checkpoint &&
+                             rendered.tools_checkpoint->kind ==
+                                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
+                         "tool anchor was not recorded");
+    if (rendered.tools_checkpoint) {
+        const std::size_t cut = rendered.tools_checkpoint->offset;
+        failures += check(cut >= 12 && rendered.text.compare(cut - 12, 12, "</IMPORTANT>") == 0,
+                          "tool anchor does not end at the tool instructions");
+        const std::size_t instruction = rendered.text.find("static agent prompt", cut);
+        failures += check(instruction != std::string::npos && instruction > cut,
+                          "tool anchor is not before the leading instruction text");
+        failures += check(rendered.prefix_checkpoint &&
+                              cut < rendered.prefix_checkpoint->offset,
+                          "tool anchor does not precede the shared prefix boundary");
+    }
+
+    // Without tool definitions there is nothing to anchor.
+    fi::ChatRenderOptions no_tools;
+    no_tools.shared_prefix_checkpoint = true;
+    failures += check(!render_chat({system, first, second}, no_tools).tools_checkpoint,
+                      "tool anchor was recorded without tools");
+    fi::ChatRenderOptions disabled = options;
+    disabled.shared_prefix_checkpoint = false;
+    failures += check(!render_chat({system, first, second}, disabled).tools_checkpoint,
+                      "tool anchor was published while the option was off");
     return failures;
 }
 
@@ -1550,6 +1603,7 @@ int main() {
     failures += test_stable_checkpoint_trace();
     failures += test_stable_checkpoint_with_media();
     failures += test_shared_prefix_checkpoint_trace();
+    failures += test_tools_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);

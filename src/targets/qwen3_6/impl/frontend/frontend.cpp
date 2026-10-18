@@ -976,6 +976,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.stable_checkpoint  = processed.stable_checkpoint;
         result.identity.prefix_checkpoint  = processed.prefix_checkpoint;
+        result.identity.tools_checkpoint   = processed.tools_checkpoint;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, impl_->boundary_checkpoints, impl_->shared_prefix_checkpoints));
@@ -988,6 +989,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.stable_checkpoint  = encoded.stable_checkpoint;
         result.identity.prefix_checkpoint  = encoded.prefix_checkpoint;
+        result.identity.tools_checkpoint   = encoded.tools_checkpoint;
         assign_text_positions(result);
         const auto found = retrieval_tokens.empty() ? result.token_ids.end() :
             std::find_end(result.token_ids.begin(), result.token_ids.end(),

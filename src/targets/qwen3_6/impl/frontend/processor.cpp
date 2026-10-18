@@ -452,6 +452,7 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         shift_boundary(rendered.rewrite_checkpoint);
         shift_boundary(rendered.stable_checkpoint);
         shift_boundary(rendered.prefix_checkpoint);
+        shift_boundary(rendered.tools_checkpoint);
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -597,28 +598,41 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     EncodedChat encoded;
     encoded.input_ids = tokenizer.encode(rendered.text);
     // A checkpoint offset must tokenize as an exact token prefix of the full chat: matching KV
-    // tokens alone never authorize a resume.
-    const auto encode_checkpoint = [&](const std::optional<RewriteCheckpointByteSpec>& spec)
-        -> std::optional<RewriteCheckpointSpec> {
+    // tokens alone never authorize a resume. The tool-definitions anchor is optional -- it sits
+    // in fixed instruction text and may tokenize mid-token -- so it walks back over a few fixed
+    // ASCII bytes and is dropped when no exact prefix exists, rather than failing the request.
+    const auto encode_checkpoint = [&](const std::optional<RewriteCheckpointByteSpec>& spec,
+                                       bool optional) -> std::optional<RewriteCheckpointSpec> {
         if (!spec) { return std::nullopt; }
         if (spec->offset > rendered.text.size()) {
+            if (optional) { return std::nullopt; }
             throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
         }
-        const std::vector<int> prefix =
-            tokenizer.encode(std::string_view(rendered.text).substr(0, spec->offset));
-        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
-            throw std::logic_error("rewrite checkpoint is not an exact token prefix");
+        const std::size_t max_trim = optional ? 4 : 0;
+        for (std::size_t trim = 0; trim <= max_trim && trim <= spec->offset; ++trim) {
+            const std::size_t offset = spec->offset - trim;
+            if (trim != 0 && static_cast<unsigned char>(rendered.text[offset]) >= 0x80U) {
+                break;
+            }
+            const std::vector<int> prefix =
+                tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
+            if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
+                !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+                continue;
+            }
+            if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
+            }
+            return RewriteCheckpointSpec{.kind     = spec->kind,
+                                         .frontier = static_cast<std::uint32_t>(prefix.size())};
         }
-        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
-        }
-        return RewriteCheckpointSpec{.kind     = spec->kind,
-                                     .frontier = static_cast<std::uint32_t>(prefix.size())};
+        if (optional) { return std::nullopt; }
+        throw std::logic_error("rewrite checkpoint is not an exact token prefix");
     };
-    encoded.rewrite_checkpoint = encode_checkpoint(rendered.rewrite_checkpoint);
-    encoded.stable_checkpoint  = encode_checkpoint(rendered.stable_checkpoint);
-    encoded.prefix_checkpoint  = encode_checkpoint(rendered.prefix_checkpoint);
+    encoded.rewrite_checkpoint = encode_checkpoint(rendered.rewrite_checkpoint, false);
+    encoded.stable_checkpoint  = encode_checkpoint(rendered.stable_checkpoint, false);
+    encoded.prefix_checkpoint  = encode_checkpoint(rendered.prefix_checkpoint, false);
+    encoded.tools_checkpoint   = encode_checkpoint(rendered.tools_checkpoint, true);
     if (encoded.rewrite_checkpoint && encoded.stable_checkpoint &&
         encoded.stable_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier) {
         // The stable boundary precedes the last message, so it must precede the response
@@ -631,6 +645,15 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
          (encoded.rewrite_checkpoint &&
           encoded.prefix_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier))) {
         throw std::logic_error("shared prefix checkpoint does not precede later checkpoints");
+    }
+    if (encoded.tools_checkpoint &&
+        ((encoded.prefix_checkpoint &&
+          encoded.tools_checkpoint->frontier >= encoded.prefix_checkpoint->frontier) ||
+         (encoded.stable_checkpoint &&
+          encoded.tools_checkpoint->frontier >= encoded.stable_checkpoint->frontier) ||
+         (encoded.rewrite_checkpoint &&
+          encoded.tools_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier))) {
+        throw std::logic_error("tool checkpoint does not precede later checkpoints");
     }
     return encoded;
 }
@@ -799,6 +822,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_checkpoint = encoded.rewrite_checkpoint;
     output.stable_checkpoint  = encoded.stable_checkpoint;
     output.prefix_checkpoint  = encoded.prefix_checkpoint;
+    output.tools_checkpoint   = encoded.tools_checkpoint;
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

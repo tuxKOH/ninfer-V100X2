@@ -112,6 +112,7 @@ struct ProcessedInput {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointSpec> stable_checkpoint;
     std::optional<RewriteCheckpointSpec> prefix_checkpoint;
+    std::optional<RewriteCheckpointSpec> tools_checkpoint;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -122,6 +123,7 @@ struct EncodedChat {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointSpec> stable_checkpoint;
     std::optional<RewriteCheckpointSpec> prefix_checkpoint;
+    std::optional<RewriteCheckpointSpec> tools_checkpoint;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);

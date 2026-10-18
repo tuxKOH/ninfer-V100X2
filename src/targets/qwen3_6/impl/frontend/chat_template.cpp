@@ -204,7 +204,8 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
 
 std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
                                       const std::string& leading_instruction,
-                                      std::string_view reasoning_instructions) {
+                                      std::string_view reasoning_instructions,
+                                      std::size_t* tools_end) {
     std::string rendered;
     rendered += "<|im_start|>system\n";
     if (!reasoning_instructions.empty()) {
@@ -218,6 +219,10 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
     }
     rendered += "\n</tools>";
     rendered += std::string(kToolInstructions);
+    // The tool definitions end here. What follows is the leading instruction (the client's system
+    // text), which may carry volatile environment lines; an anchor before it stays reusable when
+    // those change. The processor drops the anchor if the cut retokenizes.
+    if (tools_end != nullptr) { *tools_end = rendered.size(); }
     if (!leading_instruction.empty()) {
         rendered += "\n\n";
         rendered += leading_instruction;
@@ -330,10 +335,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     std::string rendered;
+    std::optional<RewriteCheckpointByteSpec> tools_checkpoint;
     const bool has_tools = !options.tool_jsons.empty();
     if (has_tools) {
+        std::size_t tools_end = 0;
         rendered += render_tools_system_block(options.tool_jsons, leading_instruction,
-                                              reasoning_instructions);
+                                              reasoning_instructions, &tools_end);
+        if (options.shared_prefix_checkpoint) {
+            tools_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = tools_end};
+        }
     } else if (message_begin == 1) {
         if (!effort_template || !leading_instruction.empty() || !reasoning_instructions.empty()) {
             rendered += "<|im_start|>system\n";
@@ -372,13 +383,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             prefix_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
-        if (options.message_boundary_checkpoint && !stable_checkpoint && i > message_begin &&
-            i + 1 == messages.size()) {
+        if (options.message_boundary_checkpoint && !stable_checkpoint && !rewrite_checkpoint &&
+            i > message_begin && i + 1 == messages.size()) {
             // The boundary before the final message is the last one a client can rewrite away
             // between requests. A tool group that continues into the final message has not
             // emitted its closing "<|im_end|>", so a boundary there would sit mid-group and is
             // skipped. Every other boundary ends on "<|im_end|>\n" and is followed by the fixed
-            // "<|im_start|>" token, which cannot retokenize the cut.
+            // "<|im_start|>" token, which cannot retokenize the cut. A response checkpoint
+            // already recorded at an earlier assistant turn (preserve-thinking off, last message
+            // a tool result) lies before this cut, so the boundary cannot precede it and is
+            // dropped instead of failing the ordering validation.
             if (!(messages[i - 1].role == ChatRole::Tool &&
                   message.role == ChatRole::Tool)) {
                 stable_checkpoint = RewriteCheckpointByteSpec{
@@ -477,7 +491,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     return RenderedChat{.text                = std::move(rendered),
                         .rewrite_checkpoint  = rewrite_checkpoint,
                         .stable_checkpoint   = stable_checkpoint,
-                        .prefix_checkpoint   = prefix_checkpoint};
+                        .prefix_checkpoint   = prefix_checkpoint,
+                        .tools_checkpoint    = tools_checkpoint};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

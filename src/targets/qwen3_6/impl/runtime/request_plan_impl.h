@@ -202,6 +202,17 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->prefix_checkpoint = candidate;
     }
+    if (prompt.identity.tools_checkpoint) {
+        const RewriteCheckpointSpec candidate = *prompt.identity.tools_checkpoint;
+        if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
+            throw std::invalid_argument(
+                "tool checkpoint frontier must lie at or inside the prompt frontier");
+        }
+        if (base->prefix_checkpoint && candidate.frontier >= base->prefix_checkpoint->frontier) {
+            throw std::invalid_argument("tool checkpoint must precede the shared prefix");
+        }
+        base->tools_checkpoint = candidate;
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
         (base->rewrite_checkpoint &&
@@ -214,6 +225,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              : 0ULL) +
         (speculative_backend != SpeculativeBackend::DFlash && base->prefix_checkpoint &&
                  base->prefix_checkpoint->frontier < base->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL) +
+        (speculative_backend != SpeculativeBackend::DFlash && base->tools_checkpoint &&
+                 base->tools_checkpoint->frontier < base->summary.prompt_tokens
              ? 1ULL
              : 0ULL);
     base->summary.service_work_quanta =
@@ -283,7 +298,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             std::uint32_t best_frontier = 0;
             std::uint32_t best_index    = 0;  // 0 = no checkpoint selected
             RewriteCheckpointKind best_kind = RewriteCheckpointKind::TurnClosure;
-            bool best_shared = false;
+            SharedPrefixSlot best_shared = SharedPrefixSlot::None;
             // Two independent checks are required. (1) The lane's own ledger/KV must contain
             // this prompt prefix -- otherwise the resident KV pages the resume would read were
             // produced for a different branch. (2) The checkpoint's OWN lineage must contain it
@@ -291,7 +306,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // (branches share a prefix only up to their fork). The checkpoint frontier must also
             // still be materialized: a branch switch trims the KV to an older boundary.
             const auto consider_checkpoint = [&](RewriteCheckpointKind kind, std::uint32_t frontier,
-                                                 std::uint32_t index, bool shared,
+                                                 std::uint32_t index, SharedPrefixSlot shared,
                                                  const std::vector<TokenId>& ledger,
                                                  const qwen3_6::detail::ResidentPrefixIdentity&
                                                      identity) {
@@ -320,21 +335,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             if (sequence.rewrite_checkpoint.valid) {
                 const bool own = !sequence.checkpoint_ledger.empty();
                 consider_checkpoint(
-                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0, false,
+                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0,
+                    SharedPrefixSlot::None,
                     own ? sequence.checkpoint_ledger : sequence.ledger,
                     own ? sequence.checkpoint_identity : sequence.prefix_identity);
             }
-            // The pinned shared leading-block boundary is offered to any conversation whose
-            // prompt starts with the same static block, not only to the conversation that
-            // captured it. DFlash keeps its draft context on the device and the host checkpoint
-            // does not mirror it, so it is excluded exactly like the ring entries.
-            if (speculative_backend != SpeculativeBackend::DFlash &&
-                sequence.shared_prefix.frontier != 0) {
-                const bool own = !sequence.shared_prefix.ledger.empty();
-                consider_checkpoint(
-                    sequence.shared_prefix.kind, sequence.shared_prefix.frontier, 0, true,
-                    own ? sequence.shared_prefix.ledger : sequence.ledger,
-                    own ? sequence.shared_prefix.identity : sequence.prefix_identity);
+            // The pinned shared boundaries are offered to any conversation whose prompt starts
+            // with the same static block, not only to the conversation that captured them. The
+            // tool anchor survives a changed instruction text; the full leading block is the
+            // longer prefix when both match. DFlash keeps its draft context on the device and the
+            // host checkpoint does not mirror it, so it is excluded exactly like the ring entries.
+            const auto consider_shared = [&](const HostCheckpoint& pinned, SharedPrefixSlot slot) {
+                if (pinned.frontier == 0) { return; }
+                const bool own = !pinned.ledger.empty();
+                consider_checkpoint(pinned.kind, pinned.frontier, 0, slot,
+                                    own ? pinned.ledger : sequence.ledger,
+                                    own ? pinned.identity : sequence.prefix_identity);
+            };
+            if (speculative_backend != SpeculativeBackend::DFlash) {
+                consider_shared(sequence.tools_prefix, SharedPrefixSlot::Tools);
+                consider_shared(sequence.shared_prefix, SharedPrefixSlot::Leading);
             }
             // DFlash keeps its checkpoint state in its own context, so the host history (which
             // mirrors only the recurrent slot and hidden) cannot restore it.
@@ -343,7 +363,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                     const HostCheckpoint& host = sequence.checkpoint_history[i];
                     const bool own             = !host.ledger.empty();
                     consider_checkpoint(host.kind, host.frontier,
-                                        static_cast<std::uint32_t>(i + 1), false,
+                                        static_cast<std::uint32_t>(i + 1),
+                                        SharedPrefixSlot::None,
                                         own ? host.ledger : sequence.ledger,
                                         own ? host.identity : sequence.prefix_identity);
                 }
@@ -391,7 +412,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->parked_id              = parked_entry->id;
             plan->parked_checkpoint      = true;
             plan->checkpoint_index       = checkpoint_match->checkpoint_index;
-            plan->restore_shared_prefix  = checkpoint_match->shared_prefix;
+            plan->restore_shared_prefix  = checkpoint_match->shared;
         } else if (exact_usable) {
             plan->reuse      = ReusePath::RestoreParkedKv;
             plan->reuse_base = parked_entry->execution_frontier;
@@ -433,9 +454,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             std::uint32_t best_frontier = 0;
             std::uint32_t best_index    = 0;
             RewriteCheckpointKind best_kind = RewriteCheckpointKind::TurnClosure;
-            bool best_shared = false;
+            SharedPrefixSlot best_shared = SharedPrefixSlot::None;
             const auto consider_checkpoint = [&](RewriteCheckpointKind kind, std::uint32_t frontier,
-                                                 std::uint32_t index, bool shared,
+                                                 std::uint32_t index, SharedPrefixSlot shared,
                                                  const std::vector<TokenId>& ledger,
                                                  const qwen3_6::detail::ResidentPrefixIdentity&
                                                      identity) {
@@ -466,23 +487,28 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             if (sequence.rewrite_checkpoint.valid) {
                 const bool own = !sequence.checkpoint_ledger.empty();
                 consider_checkpoint(
-                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0, false,
+                    sequence.rewrite_checkpoint.kind, sequence.rewrite_checkpoint.frontier, 0,
+                    SharedPrefixSlot::None,
                     own ? sequence.checkpoint_ledger : sequence.ledger,
                     own ? sequence.checkpoint_identity : sequence.prefix_identity);
             }
-            if (speculative_backend != SpeculativeBackend::DFlash &&
-                sequence.shared_prefix.frontier != 0) {
-                const bool own = !sequence.shared_prefix.ledger.empty();
-                consider_checkpoint(
-                    sequence.shared_prefix.kind, sequence.shared_prefix.frontier, 0, true,
-                    own ? sequence.shared_prefix.ledger : sequence.ledger,
-                    own ? sequence.shared_prefix.identity : sequence.prefix_identity);
+            const auto consider_shared = [&](const HostCheckpoint& pinned, SharedPrefixSlot slot) {
+                if (pinned.frontier == 0) { return; }
+                const bool own = !pinned.ledger.empty();
+                consider_checkpoint(pinned.kind, pinned.frontier, 0, slot,
+                                    own ? pinned.ledger : sequence.ledger,
+                                    own ? pinned.identity : sequence.prefix_identity);
+            };
+            if (speculative_backend != SpeculativeBackend::DFlash) {
+                consider_shared(sequence.tools_prefix, SharedPrefixSlot::Tools);
+                consider_shared(sequence.shared_prefix, SharedPrefixSlot::Leading);
             }
             for (std::size_t i = 0; i < sequence.checkpoint_history.size(); ++i) {
                 const HostCheckpoint& host = sequence.checkpoint_history[i];
                 const bool own             = !host.ledger.empty();
                 consider_checkpoint(host.kind, host.frontier, static_cast<std::uint32_t>(i + 1),
-                                    false, own ? host.ledger : sequence.ledger,
+                                    SharedPrefixSlot::None,
+                                    own ? host.ledger : sequence.ledger,
                                     own ? host.identity : sequence.prefix_identity);
             }
             if (best_frontier != 0) {
@@ -564,7 +590,20 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         (!desired || desired->frontier != base.stable_checkpoint->frontier)) {
         plan->stable_checkpoint_capture = base.stable_checkpoint;
     }
-    // The shared leading boundary is captured first when this request prefills it and pinned for
+    // The tool anchor is captured before the shared leading boundary. Its state is pinned for the
+    // lane (and any parked entry) exactly like the leading boundary, and it stays reusable when
+    // the instruction text after the tool definitions changes.
+    if (speculative_backend != SpeculativeBackend::DFlash && base.tools_checkpoint &&
+        base.tools_checkpoint->frontier > plan->reuse_base &&
+        base.tools_checkpoint->frontier < plan->summary.prompt_tokens &&
+        (!desired || desired->frontier != base.tools_checkpoint->frontier) &&
+        (!base.prefix_checkpoint ||
+         base.tools_checkpoint->frontier < base.prefix_checkpoint->frontier) &&
+        (!base.stable_checkpoint ||
+         base.tools_checkpoint->frontier < base.stable_checkpoint->frontier)) {
+        plan->tools_checkpoint_capture = base.tools_checkpoint;
+    }
+    // The shared leading boundary is captured next when this request prefills it and pinned for
     // the lane (and any parked entry), where any other conversation with the same static leading
     // block can match it. DFlash has no host-mirrored draft context, so it never participates.
     if (speculative_backend != SpeculativeBackend::DFlash && base.prefix_checkpoint &&
@@ -635,6 +674,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
              : 0ULL) +
         (plan->prefix_checkpoint_capture &&
                  plan->prefix_checkpoint_capture->frontier < plan->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL) +
+        (plan->tools_checkpoint_capture &&
+                 plan->tools_checkpoint_capture->frontier < plan->summary.prompt_tokens
              ? 1ULL
              : 0ULL);
     plan->summary.service_work_quanta =

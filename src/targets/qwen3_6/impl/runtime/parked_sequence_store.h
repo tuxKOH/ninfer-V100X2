@@ -129,10 +129,16 @@ struct ParkedSequence {
 
     // The shared leading-block checkpoint, pinned outside the ring (see SequenceState).
     HostCheckpoint shared_prefix;
+    // The tool-definitions anchor, pinned the same way.
+    HostCheckpoint tools_prefix;
 
     std::size_t bytes       = 0;
     std::uint64_t last_used = 0;
 };
+
+// Which pinned cross-conversation boundary a plan resumes: the end of the tool definitions or the
+// end of the whole static leading block. Both live outside the checkpoint ring.
+enum class SharedPrefixSlot : std::uint8_t { None = 0, Tools = 1, Leading = 2 };
 
 // Which retained boundary a parked conversation can be resumed from. `checkpoint_index` 0 is
 // the entry's current checkpoint, i+1 is checkpoint_history[i].
@@ -140,8 +146,8 @@ struct ParkedCheckpointMatch {
     const ParkedSequence* entry = nullptr;
     std::uint32_t frontier      = 0;
     std::uint32_t checkpoint_index = 0;
-    // The match is the entry's pinned shared prefix rather than its current/historical boundary.
-    bool shared_prefix = false;
+    // The match is one of the entry's pinned shared prefixes rather than a current/historical one.
+    SharedPrefixSlot shared = SharedPrefixSlot::None;
 };
 
 /**
@@ -251,7 +257,7 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
     const PreparedPromptData& prompt) const {
     std::optional<ParkedCheckpointMatch> best;
     const auto consider = [&](const ParkedSequence& entry, std::uint32_t frontier,
-                              std::uint32_t index, bool shared,
+                              std::uint32_t index, SharedPrefixSlot shared,
                               const std::vector<TokenId>& ledger,
                               const ResidentPrefixIdentity& identity) {
         if (frontier == 0 || frontier > entry.execution_frontier ||
@@ -276,25 +282,27 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
         // entries without provenance fall back to the entry ledger.
         if (entry->checkpoint_valid) {
             const bool own = !entry->checkpoint_ledger.empty();
-            consider(*entry, entry->checkpoint_frontier, 0, false,
+            consider(*entry, entry->checkpoint_frontier, 0, SharedPrefixSlot::None,
                      own ? entry->checkpoint_ledger : entry->ledger,
                      own ? entry->checkpoint_identity : entry->prefix_identity);
         }
         for (std::size_t i = 0; i < entry->checkpoint_history.size(); ++i) {
             const HostCheckpoint& checkpoint = entry->checkpoint_history[i];
             const bool own                   = !checkpoint.ledger.empty();
-            consider(*entry, checkpoint.frontier, static_cast<std::uint32_t>(i + 1), false,
-                     own ? checkpoint.ledger : entry->ledger,
+            consider(*entry, checkpoint.frontier, static_cast<std::uint32_t>(i + 1),
+                     SharedPrefixSlot::None, own ? checkpoint.ledger : entry->ledger,
                      own ? checkpoint.identity : entry->prefix_identity);
         }
-        // The pinned shared leading-block boundary survives ring rotation and is offered to any
-        // conversation that shares the block.
-        if (entry->shared_prefix.frontier != 0) {
-            const bool own = !entry->shared_prefix.ledger.empty();
-            consider(*entry, entry->shared_prefix.frontier, 0, true,
-                     own ? entry->shared_prefix.ledger : entry->ledger,
-                     own ? entry->shared_prefix.identity : entry->prefix_identity);
-        }
+        // The pinned shared boundaries survive ring rotation and are offered to any conversation
+        // that shares the block. The tool anchor stays valid when the instruction text changes.
+        const auto consider_shared = [&](const HostCheckpoint& pinned, SharedPrefixSlot slot) {
+            if (pinned.frontier == 0) { return; }
+            const bool own = !pinned.ledger.empty();
+            consider(*entry, pinned.frontier, 0, slot, own ? pinned.ledger : entry->ledger,
+                     own ? pinned.identity : entry->prefix_identity);
+        };
+        consider_shared(entry->tools_prefix, SharedPrefixSlot::Tools);
+        consider_shared(entry->shared_prefix, SharedPrefixSlot::Leading);
     }
     return best;
 }

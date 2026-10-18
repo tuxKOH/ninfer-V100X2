@@ -82,6 +82,10 @@ struct PromptIdentity {
     // messages) that agent frontends send first. It is shared by every session with that block,
     // so a new conversation can restore an already-prefilled KV prefix.
     std::optional<RewriteCheckpointSpec> prefix_checkpoint;
+    // The same idea one step earlier: the end of the tool definitions, before the instruction
+    // text. System text often carries per-request environment lines, which invalidate the
+    // prefix boundary above but leave the tool block reusable.
+    std::optional<RewriteCheckpointSpec> tools_checkpoint;
 };
 
 struct PrepareStats {
