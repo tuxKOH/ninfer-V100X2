@@ -328,14 +328,18 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           runtime::TransientRegion transient,
+                                           VisionSwapHooks swap)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+      context_(device, model), swap_(swap) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
+    }
+    if (swap_.evict != nullptr && (swap_.restore == nullptr || model.features.vision_cpu)) {
+        throw std::invalid_argument("Vision scratch swapping requires GPU Vision");
     }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
@@ -404,9 +408,38 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         }
         timers_.emplace_back(device_);
         timers_.back().start();
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
+        if (swap_.evict == nullptr) {
+            context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
+            workspace_.reset();
+        } else {
+            // Borrow this rank's runtime arena for the scratch: the hook copies the shortfall
+            // to host memory if the request does not already fit. The scratch is freed before
+            // the evicted bytes are restored, which is what makes the memory available again.
+            const std::size_t needed = VisionContext::workspace_bytes(control);
+            swap_.evict(swap_.self, needed);
+            std::optional<DeviceBuffer> scratch;
+            std::optional<WorkspaceArena> scratch_arena;
+            try {
+                scratch.emplace(needed);
+                scratch_arena.emplace(DeviceSpan{scratch->p, scratch->bytes});
+                context_.encode(VisionItemView{payload->span(), &control}, output,
+                                *scratch_arena);
+            } catch (...) {
+                scratch_arena.reset();
+                scratch.reset();
+                try {
+                    swap_.restore(swap_.self);
+                } catch (...) {
+                    // The request is already failing; leaving the arena evicted is the only
+                    // remaining option and the hook has logged the driver error.
+                }
+                throw;
+            }
+            scratch_arena.reset();
+            scratch.reset();
+            swap_.restore(swap_.self);
+        }
         timers_.back().record_stop();
-        workspace_.reset();
         active_item_ = active->item_index;
         encoded_payloads_pending_release_.push_back(active->item_index);
     }

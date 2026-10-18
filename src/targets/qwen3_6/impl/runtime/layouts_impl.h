@@ -627,9 +627,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision && !plan.features.vision_cpu) {
+    if (plan.features.vision && !plan.features.vision_cpu &&
+        !plan.features.vision_kv_swap) {
         // The CPU encoder keeps its intermediates on the host, so no device Vision scratch is
-        // reserved at all; only the merged-output transient remains (sized at line ~837).
+        // reserved at all; only the merged-output transient remains (sized at line ~837). The
+        // swap mode likewise reserves none: each encode allocates its scratch on demand after
+        // evicting resident runtime state to host memory, leaving this budget to KV capacity.
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
@@ -763,6 +766,11 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
+    }
+    if (options.vision_kv_swap &&
+        (!options.enable_vision || options.vision_device != VisionDevice::Gpu)) {
+        throw std::invalid_argument(
+            "vision KV swap requires Vision on the GPU (--vision --vision-device gpu)");
     }
     if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
         throw std::invalid_argument("tensor-parallel width must be 1, 2 or 4");

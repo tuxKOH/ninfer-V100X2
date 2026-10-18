@@ -8,6 +8,8 @@ struct StartupFeatures {
     bool vision                    = false;
     // Vision executes on host threads; the backbone payloads stay in host memory.
     bool vision_cpu                = false;
+    // GPU Vision scratch is demand-allocated per image; startup reserves none.
+    bool vision_kv_swap            = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
 
@@ -28,10 +30,12 @@ struct StartupFeatures {
 
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) noexcept {
     return StartupFeatures{
-        .vision        = options.enable_vision,
-        .vision_cpu    = options.enable_vision && options.vision_device == VisionDevice::Cpu,
-        .speculative   = options.speculative.backend,
-        .proposal_head = options.speculative.proposal_head,
+        .vision         = options.enable_vision,
+        .vision_cpu     = options.enable_vision && options.vision_device == VisionDevice::Cpu,
+        .vision_kv_swap = options.enable_vision &&
+                          options.vision_device == VisionDevice::Gpu && options.vision_kv_swap,
+        .speculative    = options.speculative.backend,
+        .proposal_head  = options.speculative.proposal_head,
     };
 }
 

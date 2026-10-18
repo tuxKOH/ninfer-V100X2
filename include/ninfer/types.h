@@ -166,6 +166,14 @@ struct EngineOptions {
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
+    // GPU Vision normally carries its full encode scratch in the startup workspace reservation.
+    // With this set, that reservation is skipped (the memory goes to KV/runtime capacity
+    // instead) and each image's encode allocates its scratch on demand. To make room, the
+    // persistent runtime arena -- this rank's KV and per-lane state, including other resident
+    // lanes -- is temporarily copied to host memory and released, then restored afterwards.
+    // Each image therefore pays a host round trip of roughly the requested scratch size.
+    // Requires enable_vision with VisionDevice::Gpu.
+    bool vision_kv_swap                    = false;
     // Captures an extra reusable checkpoint at the end of the message before the last one. A
     // client that rewrites or drops its final message (ephemeral system-reminders, an
     // interrupted tool result) can then resume from the common message prefix instead of

@@ -1,5 +1,6 @@
 #include "core/arena.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -7,12 +8,37 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer {
 namespace {
 
+// Physical-memory unit the relocatable arena unmaps at a time. Anything at least the driver's
+// allocation granularity works; 64 MiB keeps the handle count modest for a multi-GiB KV arena
+// while bounding the copy overshoot of one eviction.
+constexpr std::size_t kRelocationChunkBytes = 64ULL << 20;
+
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
+}
+
+std::string driver_error_message(const char* prefix, CUresult result) {
+    const char* name    = nullptr;
+    const char* message = nullptr;
+    (void)cuGetErrorName(result, &name);
+    (void)cuGetErrorString(result, &message);
+    return std::string(prefix) + ": " + (name != nullptr ? name : "CUDA_ERROR_UNKNOWN") + ": " +
+           (message != nullptr ? message : "unknown driver error");
+}
+
+void driver_check(CUresult result, const char* operation) {
+    if (result != CUDA_SUCCESS) { throw std::runtime_error(driver_error_message(operation, result)); }
+}
+
+void log_driver_error(const char* operation, CUresult result) noexcept {
+    if (result != CUDA_SUCCESS) {
+        std::fprintf(stderr, "%s\n", driver_error_message(operation, result).c_str());
+    }
 }
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -147,6 +173,145 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     off_  = 0;
 }
 
+struct DeviceArena::Relocation {
+    struct Chunk {
+        CUdeviceptr address = 0;
+        CUmemGenericAllocationHandle handle = 0;
+        bool mapped = false;
+    };
+    struct Evicted {
+        std::size_t chunk       = 0;
+        std::size_t host_offset = 0;
+    };
+
+    int device               = 0;
+    CUmemAllocationProp prop{};
+    // The local device plus every device that can reach this one. Tensor-parallel allreduce
+    // pulls through peer copies, and a VMM mapping is invisible to those unless the peer's
+    // location is granted here; cudaDeviceEnablePeerAccess only covers cudaMalloc memory.
+    std::vector<CUmemAccessDesc> access;
+    std::size_t chunk_bytes  = 0;
+    std::size_t virtual_bytes = 0;
+    CUdeviceptr base         = 0;
+    std::vector<Chunk> chunks;
+    std::vector<Evicted> evicted;
+    std::size_t mapped = 0;
+
+    ~Relocation() { release_all(); }
+
+    void release_all() noexcept {
+        for (Chunk& chunk : chunks) {
+            if (!chunk.mapped) { continue; }
+            log_driver_error("cuMemUnmap", cuMemUnmap(chunk.address, chunk_bytes));
+            log_driver_error("cuMemRelease", cuMemRelease(chunk.handle));
+            chunk.mapped = false;
+            chunk.handle = 0;
+        }
+        if (base != 0) {
+            log_driver_error("cuMemAddressFree", cuMemAddressFree(base, virtual_bytes));
+            base = 0;
+        }
+        mapped = 0;
+        evicted.clear();
+    }
+
+    void require_current_device() const {
+        int current = -1;
+        const cudaError_t err = cudaGetDevice(&current);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaGetDevice failed", err));
+        }
+        if (current != device) {
+            throw std::logic_error("relocatable DeviceArena used from a different device");
+        }
+    }
+
+    void map_chunk(Chunk& chunk) {
+        driver_check(cuMemCreate(&chunk.handle, chunk_bytes, &prop, 0), "cuMemCreate");
+        const CUresult status = cuMemMap(chunk.address, chunk_bytes, 0, chunk.handle, 0);
+        if (status != CUDA_SUCCESS) {
+            (void)cuMemRelease(chunk.handle);
+            chunk.handle = 0;
+            throw std::runtime_error(driver_error_message("cuMemMap", status));
+        }
+        const CUresult access_status = cuMemSetAccess(chunk.address, chunk_bytes, access.data(),
+                                                      access.size());
+        if (access_status != CUDA_SUCCESS) {
+            (void)cuMemUnmap(chunk.address, chunk_bytes);
+            (void)cuMemRelease(chunk.handle);
+            chunk.handle = 0;
+            throw std::runtime_error(driver_error_message("cuMemSetAccess", access_status));
+        }
+        chunk.mapped = true;
+        ++mapped;
+    }
+};
+
+DeviceArena::DeviceArena(std::size_t capacity_bytes, RelocatableTag) {
+    if (capacity_bytes == 0) {
+        throw std::invalid_argument("DeviceArena capacity must be nonzero");
+    }
+    auto relocation = std::make_unique<Relocation>();
+    int device      = 0;
+    const cudaError_t device_err = cudaGetDevice(&device);
+    if (device_err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaGetDevice failed", device_err));
+    }
+    relocation->device = device;
+
+    driver_check(cuInit(0), "cuInit");
+    relocation->prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    relocation->prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    relocation->prop.location.id   = device;
+    {
+        CUmemAccessDesc local{};
+        local.location = relocation->prop.location;
+        local.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        relocation->access.push_back(local);
+    }
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) == cudaSuccess) {
+        for (int other = 0; other < device_count; ++other) {
+            if (other == device) { continue; }
+            int can_access = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, other, device) == cudaSuccess &&
+                can_access != 0) {
+                CUmemAccessDesc peer{};
+                peer.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                peer.location.id   = other;
+                peer.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                relocation->access.push_back(peer);
+            }
+        }
+    }
+    std::size_t granularity        = 0;
+    driver_check(cuMemGetAllocationGranularity(&granularity, &relocation->prop,
+                                               CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                 "cuMemGetAllocationGranularity");
+    const std::size_t chunk_bytes =
+        (kRelocationChunkBytes + granularity - 1) / granularity * granularity;
+    if (capacity_bytes > std::numeric_limits<std::size_t>::max() - (chunk_bytes - 1)) {
+        throw std::overflow_error("relocatable arena address size overflows size_t");
+    }
+    const std::size_t virtual_bytes =
+        (capacity_bytes + chunk_bytes - 1) / chunk_bytes * chunk_bytes;
+    relocation->chunk_bytes   = chunk_bytes;
+    relocation->virtual_bytes = virtual_bytes;
+    driver_check(cuMemAddressReserve(&relocation->base, virtual_bytes, 0, 0, 0),
+                 "cuMemAddressReserve");
+    relocation->chunks.resize(virtual_bytes / chunk_bytes);
+    for (std::size_t i = 0; i < relocation->chunks.size(); ++i) {
+        Relocation::Chunk& chunk = relocation->chunks[i];
+        chunk.address            = relocation->base + i * chunk_bytes;
+        relocation->map_chunk(chunk);
+    }
+
+    cap_        = capacity_bytes;
+    base_       = reinterpret_cast<void*>(relocation->base);
+    off_        = 0;
+    relocation_ = std::move(relocation);
+}
+
 DeviceArena::DeviceArena(DeviceSpan storage)
     : base_(storage.data), cap_(storage.bytes), owns_(false) {
     if (base_ == nullptr || cap_ == 0) {
@@ -155,12 +320,12 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) { free_device(base_); }
+    if (owns_ && relocation_ == nullptr) { free_device(base_); }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_) {
+      owns_(other.owns_), relocation_(std::move(other.relocation_)) {
     other.base_ = nullptr;
     other.cap_  = 0;
     other.off_  = 0;
@@ -171,12 +336,16 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) { free_device(base_); }
-    base_ = other.base_;
-    cap_  = other.cap_;
-    off_  = other.off_;
-    peak_ = other.peak_;
-    owns_ = other.owns_;
+    // A relocatable base is a reserved virtual address owned by its Relocation, not a
+    // cudaMalloc block; releasing it through cudaFree would be an invalid free.
+    if (owns_ && relocation_ == nullptr) { free_device(base_); }
+    relocation_.reset();
+    base_       = other.base_;
+    cap_        = other.cap_;
+    off_        = other.off_;
+    peak_       = other.peak_;
+    owns_       = other.owns_;
+    relocation_ = std::move(other.relocation_);
 
     other.base_ = nullptr;
     other.cap_  = 0;
@@ -184,6 +353,107 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     other.peak_ = 0;
     other.owns_ = true;
     return *this;
+}
+
+std::size_t DeviceArena::relocation_span(std::size_t bytes) const {
+    if (relocation_ == nullptr || bytes == 0) { return 0; }
+    const std::size_t chunk_bytes = relocation_->chunk_bytes;
+    const std::size_t count       = (bytes + chunk_bytes - 1) / chunk_bytes;
+    if (count > relocation_->chunks.size()) {
+        throw std::length_error("relocatable arena cannot release that many bytes");
+    }
+    return count * chunk_bytes;
+}
+
+std::size_t DeviceArena::evict_to_host(std::size_t bytes, void* host) {
+    if (relocation_ == nullptr) { throw std::logic_error("DeviceArena is not relocatable"); }
+    Relocation& relocation = *relocation_;
+    if (bytes == 0) { return 0; }
+    if (host == nullptr) { throw std::invalid_argument("DeviceArena eviction needs host storage"); }
+    if (!relocation.evicted.empty()) {
+        throw std::logic_error("relocatable DeviceArena is already evicted");
+    }
+    relocation.require_current_device();
+
+    const std::size_t span  = relocation_span(bytes);
+    const std::size_t count = span / relocation.chunk_bytes;
+    if (count > relocation.mapped) {
+        throw std::logic_error("relocatable arena has too little mapped memory to evict");
+    }
+
+    std::size_t offset = 0;
+    for (std::size_t index = relocation.chunks.size();
+         index-- > 0 && relocation.evicted.size() < count;) {
+        Relocation::Chunk& chunk = relocation.chunks[index];
+        if (!chunk.mapped) { continue; }
+        const cudaError_t copy = cudaMemcpy(static_cast<unsigned char*>(host) + offset,
+                                            reinterpret_cast<void*>(chunk.address),
+                                            relocation.chunk_bytes, cudaMemcpyDeviceToHost);
+        if (copy != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("arena eviction copy failed", copy));
+        }
+        driver_check(cuMemUnmap(chunk.address, relocation.chunk_bytes), "cuMemUnmap");
+        driver_check(cuMemRelease(chunk.handle), "cuMemRelease");
+        chunk.mapped = false;
+        chunk.handle = 0;
+        --relocation.mapped;
+        relocation.evicted.push_back(Relocation::Evicted{index, offset});
+        offset += relocation.chunk_bytes;
+    }
+    if (offset != span) {
+        // Unreachable: `count` mapped chunks were checked above.
+        throw std::logic_error("relocatable arena released a short span");
+    }
+    return offset;
+}
+
+std::size_t DeviceArena::evicted_bytes() const noexcept {
+    if (relocation_ == nullptr) { return 0; }
+    return relocation_->evicted.size() * relocation_->chunk_bytes;
+}
+
+void DeviceArena::restore_from_host(const void* host, std::size_t bytes) {
+    if (relocation_ == nullptr) { throw std::logic_error("DeviceArena is not relocatable"); }
+    Relocation& relocation = *relocation_;
+    if (relocation.evicted.empty()) {
+        if (bytes != 0) {
+            throw std::invalid_argument("relocatable arena has nothing to restore");
+        }
+        return;
+    }
+    if (host == nullptr) { throw std::invalid_argument("DeviceArena restore needs host storage"); }
+    if (bytes != relocation.evicted.size() * relocation.chunk_bytes) {
+        throw std::invalid_argument("relocatable arena restore span is inconsistent");
+    }
+    relocation.require_current_device();
+
+    std::size_t done = 0;
+    try {
+        for (; done < relocation.evicted.size(); ++done) {
+            const Relocation::Evicted& entry = relocation.evicted[done];
+            Relocation::Chunk& chunk         = relocation.chunks[entry.chunk];
+            if (chunk.mapped) { throw std::logic_error("relocatable arena chunk is already mapped"); }
+            relocation.map_chunk(chunk);
+            const cudaError_t copy = cudaMemcpy(
+                reinterpret_cast<void*>(chunk.address),
+                static_cast<const unsigned char*>(host) + entry.host_offset,
+                relocation.chunk_bytes, cudaMemcpyHostToDevice);
+            if (copy != cudaSuccess) {
+                // Return the chunk to the evicted state so a retry sees a coherent arena.
+                log_driver_error("cuMemUnmap", cuMemUnmap(chunk.address, relocation.chunk_bytes));
+                log_driver_error("cuMemRelease", cuMemRelease(chunk.handle));
+                chunk.mapped = false;
+                chunk.handle = 0;
+                --relocation.mapped;
+                throw std::runtime_error(cuda_error_message("arena restore copy failed", copy));
+            }
+        }
+    } catch (...) {
+        relocation.evicted.erase(relocation.evicted.begin(),
+                                 relocation.evicted.begin() + static_cast<std::ptrdiff_t>(done));
+        throw;
+    }
+    relocation.evicted.clear();
 }
 
 DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {

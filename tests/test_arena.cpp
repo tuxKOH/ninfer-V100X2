@@ -191,5 +191,92 @@ int main() {
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
 
+    // Relocatable arena: the virtual address stays valid while the physical chunks are released
+    // and remapped, which is what the Vision scratch swap relies on.
+    {
+        ninfer::DeviceArena relocatable(3ULL << 20, ninfer::DeviceArena::RelocatableTag{});
+        failures += expect_size(relocatable.capacity(), 3ULL << 20, "relocatable arena capacity");
+        if (!relocatable.relocatable()) {
+            ++failures;
+            std::cerr << "relocatable arena does not report relocatable\n";
+        }
+        failures += expect_size(relocatable.relocation_span(0), 0, "relocation span of zero");
+        ninfer::DeviceArena plain(1024);
+        failures += expect_size(plain.relocation_span(4096), 0,
+                                "non-relocatable arena relocation span");
+        failures += expect_throws<std::logic_error>(
+            [&] { (void)plain.evict_to_host(1, pinned.data()); },
+            "non-relocatable arena eviction");
+
+        ninfer::Tensor payload = relocatable.alloc(ninfer::DType::U8, {4096});
+        std::array<std::uint8_t, 4096> pattern{};
+        for (std::size_t i = 0; i < pattern.size(); ++i) {
+            pattern[i] = static_cast<std::uint8_t>(i * 37U);
+        }
+        CUDA_CHECK(
+            cudaMemcpy(payload.data, pattern.data(), pattern.size(), cudaMemcpyHostToDevice));
+        const std::size_t span = relocatable.relocation_span(payload.bytes());
+        if (span < payload.bytes()) {
+            ++failures;
+            std::cerr << "relocation span is smaller than the request\n";
+        }
+        ninfer::PinnedHostBuffer staging(span);
+        std::size_t free_before = 0;
+        std::size_t free_after  = 0;
+        std::size_t device_total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_before, &device_total));
+        const std::size_t evicted = relocatable.evict_to_host(payload.bytes(), staging.data());
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &device_total));
+        // The released chunks must actually return to the device allocator.
+        if (free_after < free_before || free_after - free_before + (1ULL << 20) < span) {
+            ++failures;
+            std::cerr << "relocatable arena eviction did not release device memory\n";
+        }
+        failures += expect_size(evicted, span, "relocatable arena eviction bytes");
+        failures += expect_size(relocatable.evicted_bytes(), span,
+                                "relocatable arena pending bytes");
+        {
+            // The released physical memory must be allocatable by a temporary peak.
+            ninfer::DeviceBuffer borrowed(span);
+            CUDA_CHECK(cudaMemset(borrowed.p, 0x11, borrowed.bytes));
+        }
+        relocatable.restore_from_host(staging.data(), evicted);
+        failures += expect_size(relocatable.evicted_bytes(), 0,
+                                "relocatable arena restored bytes");
+        std::array<std::uint8_t, 4096> round_trip{};
+        CUDA_CHECK(cudaMemcpy(round_trip.data(), payload.data, round_trip.size(),
+                              cudaMemcpyDeviceToHost));
+        if (round_trip != pattern) {
+            ++failures;
+            std::cerr << "relocatable arena round trip changed payload\n";
+        }
+
+        // Move assignment replaces a live arena; a relocatable base is a reserved VA and must
+        // not be passed to cudaFree.
+        CUDA_CHECK(cudaGetLastError());
+        ninfer::DeviceArena target(1024);
+        target = std::move(relocatable);
+        if (cudaGetLastError() != cudaSuccess) {
+            ++failures;
+            std::cerr << "relocatable arena move assignment raised a CUDA error\n";
+        }
+        if (!target.relocatable()) {
+            ++failures;
+            std::cerr << "move-assigned relocatable arena lost its mode\n";
+        }
+        ninfer::Tensor marker = target.alloc(ninfer::DType::U8, {16});
+        CUDA_CHECK(cudaMemset(marker.data, 0x5a, marker.bytes()));
+        std::array<std::uint8_t, 16> marker_host{};
+        CUDA_CHECK(cudaMemcpy(marker_host.data(), marker.data, marker_host.size(),
+                              cudaMemcpyDeviceToHost));
+        for (const std::uint8_t value : marker_host) {
+            if (value != 0x5a) {
+                ++failures;
+                std::cerr << "move-assigned relocatable arena is not usable\n";
+                break;
+            }
+        }
+    }
+
     return failures == 0 ? 0 : fail("arena test failed");
 }

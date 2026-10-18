@@ -317,6 +317,7 @@ int main(int argc, char** argv) {
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.vision_device   = cli.vision_device;
         engine_options.vision_max_tokens = cli.vision_max_tokens;
+        engine_options.vision_kv_swap    = cli.vision_kv_swap;
         engine_options.message_boundary_checkpoints = cli.message_boundary_checkpoints;
         engine_options.shared_prefix_checkpoints = cli.shared_prefix_checkpoints;
         engine_options.use_cuda_graph = cli.use_cuda_graph;

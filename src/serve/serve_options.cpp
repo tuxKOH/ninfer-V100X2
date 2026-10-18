@@ -125,7 +125,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
-           "[--boundary-checkpoints] [--shared-prefix] "
+           "[--vision-kv-swap] [--boundary-checkpoints] [--shared-prefix] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -155,6 +155,8 @@ std::string serve_usage_text(const char* argv0) {
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
            "       --vision-device cpu runs the Vision encoder on host threads instead of the GPU:\n"
            "       no Vision weights or scratch are uploaded, at the cost of CPU encode time\n"
+           "       --vision-kv-swap keeps GPU Vision but reserves no startup scratch: each image's\n"
+           "       encode swaps this rank's runtime KV/state to host RAM and restores it afterwards\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -359,6 +361,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--vision-device must be gpu or cpu");
             }
+        } else if (arg == "--vision-kv-swap") {
+            options.vision_kv_swap = true;
         } else if (arg == "--boundary-checkpoints") {
             options.message_boundary_checkpoints = true;
         } else if (arg == "--shared-prefix") {
@@ -445,6 +449,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    }
+    if (options.vision_kv_swap &&
+        (!options.enable_vision || options.vision_device != VisionDevice::Gpu)) {
+        throw std::invalid_argument("--vision-kv-swap requires --vision --vision-device gpu");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

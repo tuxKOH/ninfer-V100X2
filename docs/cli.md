@@ -66,7 +66,10 @@ default `32768`) and startup Vision reservations; the prepared text-plus-media p
 fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
 context without promising to process images or videos beyond that separate budget.
 `--vision-device cpu` runs the encoder on host threads instead: no Vision weights or scratch are
-uploaded, and only the merged embeddings reach the device.
+uploaded, and only the merged embeddings reach the device. `--vision-kv-swap` keeps GPU Vision but
+reserves no startup scratch: each image's encode borrows the device memory by copying this rank's
+runtime KV and per-lane state to host RAM and restoring it afterwards, so the startup budget goes
+to KV capacity at the cost of one host round trip per image.
 TP2 Vision is experimental on the two 16 GB V100 profile. Its visual-prefix bridge integration
 test currently fails on that host; see [test status](../tests/README.md#experimental-tp2-vision-status).
 CLI processes do not share Engine prefix state. For a persistent Vision server, the recommended
@@ -192,6 +195,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` keeps the backbone in host memory and reserves no Vision GPU scratch | `gpu` |
+| `--vision-kv-swap` | GPU Vision without a startup scratch reservation; each encode swaps this rank's runtime KV/state to host RAM | off |
 | `--boundary-checkpoints` | retain a reusable checkpoint at the last stable message boundary | off |
 | `--shared-prefix` | retain a reusable checkpoint after the static leading system/tools block | off |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |

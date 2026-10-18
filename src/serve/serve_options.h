@@ -67,6 +67,8 @@ struct ServeOptions {
     bool enable_vision      = false;
     VisionDevice vision_device = VisionDevice::Gpu;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
+    // GPU Vision scratch is allocated per image by swapping this rank's runtime arena to host.
+    bool vision_kv_swap = false;
     bool message_boundary_checkpoints = false;
     bool shared_prefix_checkpoints = false;
     bool use_cuda_graph     = true;

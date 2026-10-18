@@ -28,6 +28,16 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// The primary rank's persistent arena is the Vision scratch donor when vision_kv_swap is on:
+// it must hand chunks back to the device between encodes. Peer ranks never encode, so they keep
+// the plain cudaMalloc backing.
+DeviceArena make_persistent_arena(const SequencePlanImpl& plan) {
+    if (plan.features.vision_kv_swap) {
+        return DeviceArena(plan.persistent.bytes, DeviceArena::RelocatableTag{});
+    }
+    return DeviceArena(plan.persistent.bytes);
+}
+
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);
@@ -258,11 +268,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      vision_cpu(plan.features.vision_cpu),
+      vision_cpu(plan.features.vision_cpu), vision_kv_swap(plan.features.vision_kv_swap),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       gdn_state_bytes(linear_attention_state_bytes(plan.persistent.decoder.linear_attention)),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      persistent(make_persistent_arena(plan)), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       rope_mode(plan.rope_mode), effective_max_context(plan.effective_max_context),
       yarn_mscale(plan.rope_mode == RopeMode::Yarn
@@ -956,8 +966,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
+            VisionSwapHooks swap;
+            if (vision_kv_swap) {
+                swap.self    = this;
+                swap.evict   = &ProgramImplCore::vision_swap_evict_hook;
+                swap.restore = &ProgramImplCore::vision_swap_restore_hook;
+            }
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+                device, model, work, staged.prompt, *staged.vision_plan, staged.transient, swap);
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
@@ -1717,6 +1733,89 @@ void ProgramImplCore::refresh_ram_kv(SequenceState& sequence, std::uint32_t fron
         std::fprintf(stderr, "RAM_KV_RETRIEVAL frontier=%u blocks=%zu query=%zu:%zu\n",
             frontier, combined.size(), sequence.ram_query.begin, sequence.ram_query.count);
     }
+}
+
+void ProgramImplCore::vision_swap_evict_hook(void* self, std::size_t bytes) {
+    static_cast<ProgramImplCore*>(self)->evict_vision_workspace(bytes);
+}
+
+void ProgramImplCore::vision_swap_restore_hook(void* self) {
+    static_cast<ProgramImplCore*>(self)->restore_vision_workspace();
+}
+
+void ProgramImplCore::evict_vision_workspace(std::size_t bytes) {
+    if (!vision_kv_swap || !persistent.relocatable()) {
+        throw std::logic_error("Vision scratch swap requires a relocatable persistent arena");
+    }
+    if (vision_swap_bytes_ != 0 || vision_swap_host_.has_value()) {
+        throw std::logic_error("Vision scratch swap is already in progress");
+    }
+    // Nothing may be in flight while the arena's virtual addresses are unmapped. The executor
+    // serializes Program calls, so this covers every lane, not just the one encoding.
+    for (auto& peer : peers) { peer->device.synchronize(); }
+    device.synchronize();
+
+    const ScopedDevice scope(device.device);
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    // Leave the device some slack for allocator bookkeeping instead of sizing the scratch to the
+    // last free byte; below this the arena donates whole chunks.
+    constexpr std::size_t kAllocationMargin = 16ULL << 20;
+    if (free_bytes >= bytes + kAllocationMargin) {
+        if (std::getenv("NINFER_VISION_SWAP_TRACE")) {
+            std::fprintf(stderr, "VISION_SWAP skip needed=%zu free=%zu\n", bytes, free_bytes);
+        }
+        return;
+    }
+
+    // Only the shortfall leaves the device. The caller allocates exactly `bytes` afterwards,
+    // which keeps the margin free, and freeing that scratch recovers more than this span, so
+    // the restore below always has the physical memory it needs.
+    const std::size_t deficit = bytes + kAllocationMargin - free_bytes;
+    const std::size_t span    = persistent.relocation_span(deficit);
+    std::optional<PinnedHostBuffer> host;
+    try {
+        host.emplace(span);
+        const std::size_t evicted = persistent.evict_to_host(deficit, host->data());
+        if (evicted != span) {
+            throw std::logic_error("Vision scratch swap released an inconsistent span");
+        }
+        vision_swap_host_ = std::move(host);
+        vision_swap_bytes_ = evicted;
+    } catch (...) {
+        // Some chunks may already have been released and staged in `host`; put them back so the
+        // arena stays usable for every other lane before the request fails.
+        try {
+            const std::size_t pending = persistent.evicted_bytes();
+            if (pending != 0 && host.has_value()) {
+                persistent.restore_from_host(host->data(), pending);
+            }
+        } catch (...) {
+            // The arena logs driver failures; nothing further can be recovered here.
+        }
+        vision_swap_host_.reset();
+        vision_swap_bytes_ = 0;
+        throw;
+    }
+    if (std::getenv("NINFER_VISION_SWAP_TRACE")) {
+        std::fprintf(stderr, "VISION_SWAP evict needed=%zu free=%zu evicted=%zu\n", bytes,
+                     free_bytes, vision_swap_bytes_);
+    }
+}
+
+void ProgramImplCore::restore_vision_workspace() {
+    if (vision_swap_bytes_ == 0) { return; }
+    if (!vision_swap_host_.has_value()) {
+        throw std::logic_error("Vision scratch swap lost its host image");
+    }
+    const ScopedDevice scope(device.device);
+    persistent.restore_from_host(vision_swap_host_->data(), vision_swap_bytes_);
+    if (std::getenv("NINFER_VISION_SWAP_TRACE")) {
+        std::fprintf(stderr, "VISION_SWAP restore bytes=%zu\n", vision_swap_bytes_);
+    }
+    vision_swap_host_.reset();
+    vision_swap_bytes_ = 0;
 }
 
 void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

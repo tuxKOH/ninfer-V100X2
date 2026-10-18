@@ -143,6 +143,22 @@ int main() {
                       "--vision-max-tokens did not reach serving options");
     failures += check(defaults.vision_device == ninfer::VisionDevice::Gpu,
                       "Vision device did not default to the GPU");
+    failures += check(!defaults.vision_kv_swap, "Vision KV swap is enabled by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-device", "gpu",
+                             "--vision-kv-swap"})
+                          .vision_kv_swap,
+                      "--vision-kv-swap did not reach serving options");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-device", "cpu",
+                         "--vision-kv-swap"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "CPU Vision accepted --vision-kv-swap");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("--vision-kv-swap") !=
+                          std::string::npos,
+                      "serve help omits --vision-kv-swap");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-device", "cpu"})
                               .vision_device == ninfer::VisionDevice::Cpu,
                       "--vision-device cpu did not reach serving options");

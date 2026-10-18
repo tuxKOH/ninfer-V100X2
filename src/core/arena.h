@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 
 namespace ninfer {
 
@@ -59,7 +60,14 @@ public:
         std::size_t saved_offset_ = 0;
     };
 
+    // Selects a relocatable backing: virtual address space is reserved once and physical memory
+    // is mapped in fixed-size chunks that can be unmapped and released while the virtual
+    // addresses stay valid. Callers use this when a temporary peak (e.g. demand-allocated GPU
+    // Vision scratch) may need to borrow this arena's device memory and give it back.
+    struct RelocatableTag {};
+
     explicit DeviceArena(std::size_t capacity_bytes);
+    DeviceArena(std::size_t capacity_bytes, RelocatableTag);
     // Non-owning arena over an already allocated device region.
     explicit DeviceArena(DeviceSpan storage);
     ~DeviceArena();
@@ -80,12 +88,28 @@ public:
     std::size_t peak_used() const noexcept;
     void reset_peak() noexcept;
 
+    [[nodiscard]] bool relocatable() const noexcept { return relocation_ != nullptr; }
+    // Bytes an eviction of `bytes` releases, rounded up to whole chunks; zero when the arena is
+    // not relocatable. The caller stages this many bytes on the host.
+    [[nodiscard]] std::size_t relocation_span(std::size_t bytes) const;
+    // Copies the highest mapped chunks (relocation_span(bytes) in total) to `host` and releases
+    // their physical memory. Requires an unswapped relocatable arena and `host` with room for
+    // the whole span. All device work touching this arena must already be complete.
+    std::size_t evict_to_host(std::size_t bytes, void* host);
+    // Re-creates and remaps every evicted chunk and copies its contents back from `host`.
+    void restore_from_host(const void* host, std::size_t bytes);
+    // Bytes currently unmapped and awaiting restore; zero when nothing was evicted.
+    [[nodiscard]] std::size_t evicted_bytes() const noexcept;
+
 private:
+    struct Relocation;
+
     void* base_       = nullptr;
     std::size_t cap_  = 0;
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
     bool owns_        = true;
+    std::unique_ptr<Relocation> relocation_;
 };
 
 class PinnedHostBuffer {

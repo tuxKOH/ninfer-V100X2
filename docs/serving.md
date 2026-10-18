@@ -69,8 +69,17 @@ three seconds of CPU time per image after the first. Dequantized weights are cac
 requests (~1.7 GB of host memory once warm; `NINFER_VISION_CPU_CACHE=0` disables the cache and
 dequantizes per request instead). Host intermediates scale with the visual-token count (about
 0.2 MB per merged token: roughly 150 MB for a typical screenshot, several GB at the 32,768-token
-maximum), so keep `--vision-max-tokens` near what the media actually needs. Prefix reuse is
-unaffected:
+maximum), so keep `--vision-max-tokens` near what the media actually needs. `--vision-kv-swap` is
+the third placement: GPU Vision with no startup scratch reservation. Each image's encode allocates
+its scratch on demand; to make room, the primary rank copies its persistent runtime arena (KV and
+per-lane state) to host memory, releases those device pages, runs the encode, and restores them.
+The startup budget the scratch would have occupied goes to KV capacity instead, and each image
+pays a host round trip for the shortfall that does not fit in free device memory; the host needs
+pinned room for that span on top of `--kv-park-bytes`. The donor is this rank's runtime arena, so
+at most that much memory can be evicted; a request whose shortfall exceeds it is rejected rather
+than over-committing. `NINFER_VISION_SWAP_TRACE=1` logs each eviction and restore to stderr.
+`--vision-device cpu` remains the option that also removes the Vision weights from the device.
+Prefix reuse is unaffected:
 media identity comes from the digest and token spans, not from encoder output bits. On the two
 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
@@ -249,7 +258,8 @@ media-token expansion, the result must fit Engine `--max-context`. The separatel
 token); it defaults to 32,768, and the effective Vision limit is
 `min(--max-context, --vision-max-tokens)`. The media-processing allowance and the output transient
 use this bound; the GPU Vision scratch does too unless `--vision-device cpu` keeps the encoder on
-host. A smaller visual-token budget leaves room for long text context on memory-constrained
+host or `--vision-kv-swap` allocates the scratch on demand instead of reserving it at startup.
+A smaller visual-token budget leaves room for long text context on memory-constrained
 hardware; exceeding the media budget returns an error, not a shorter image. There is no fixed
 image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
@@ -598,6 +608,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` retains the backbone on host and reserves no Vision device scratch | `gpu` |
+| `--vision-kv-swap` | GPU Vision without a startup scratch reservation: each image's encode swaps this rank's runtime KV/state to host memory and restores it afterwards | off |
 | `--boundary-checkpoints` | capture an extra reusable checkpoint at the last stable message boundary, so a rewritten or dropped final message resumes from the common prefix | off |
 | `--shared-prefix` | capture a reusable checkpoint after the static leading system/tools block, so any session sharing that block restores the prefilled prefix | off |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |

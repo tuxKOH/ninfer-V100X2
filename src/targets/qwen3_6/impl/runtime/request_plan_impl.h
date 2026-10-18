@@ -165,8 +165,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
             // The CPU encoder stages its intermediates in host buffers; only the merged output
-            // uses the device transient, which the plan accounts for separately.
-            if (!vision_cpu && schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+            // uses the device transient, which the plan accounts for separately. The swap mode
+            // allocates the scratch on demand, so the startup workspace is not the envelope.
+            if (!vision_cpu && !vision_kv_swap &&
+                schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = end;

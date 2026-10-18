@@ -18,6 +18,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <array>
 #include <memory>
@@ -368,6 +369,8 @@ public:
     const bool vision_enabled;
     // Vision runs on host threads: no device Vision workspace is reserved or validated.
     const bool vision_cpu;
+    // GPU Vision scratch is demand-allocated per encode by swapping the persistent arena to host.
+    const bool vision_kv_swap;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t gdn_state_bytes;
@@ -427,6 +430,10 @@ public:
     // Conversations whose resident frontier did not fit the KV pool, held in host memory so they
     // can be resumed exactly instead of re-prefilled. Disabled (zero budget) by default.
     ParkedSequenceStore parked;
+    // Host image of the persistent arena chunks evicted for the Vision encode in flight. Empty
+    // outside an encode.
+    std::optional<PinnedHostBuffer> vision_swap_host_;
+    std::size_t vision_swap_bytes_ = 0;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -583,6 +590,13 @@ private:
     void restore_historical_checkpoint(SequenceState& sequence, std::uint32_t checkpoint_index,
                                        bool preserve);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
+    // Demand allocation behind VisionSwapHooks: evicts enough of the persistent arena to host
+    // memory for one Vision encode; restore puts the evicted bytes back. Both no-op unless
+    // vision_kv_swap is on.
+    void evict_vision_workspace(std::size_t bytes);
+    void restore_vision_workspace();
+    static void vision_swap_evict_hook(void* self, std::size_t bytes);
+    static void vision_swap_restore_hook(void* self);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

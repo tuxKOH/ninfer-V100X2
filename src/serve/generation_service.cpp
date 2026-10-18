@@ -264,6 +264,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_device            = options_.vision_device;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
+    engine_options.vision_kv_swap           = options_.vision_kv_swap;
     engine_options.message_boundary_checkpoints = options_.message_boundary_checkpoints;
     engine_options.shared_prefix_checkpoints = options_.shared_prefix_checkpoints;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;

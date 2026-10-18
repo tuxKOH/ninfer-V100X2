@@ -130,7 +130,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu]\n"
-           "       [--vision-max-tokens N] [--boundary-checkpoints] [--shared-prefix]\n"
+           "       [--vision-max-tokens N] [--vision-kv-swap] [--boundary-checkpoints] [--shared-prefix]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -138,6 +138,8 @@ std::string usage_text(const char* argv0) {
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--vision-device cpu runs the Vision encoder on host threads and reserves no Vision GPU scratch.\n"
+           "--vision-kv-swap keeps GPU Vision without a startup scratch reservation: each image's\n"
+           "encode swaps this rank's KV/state to host RAM and restores it afterwards.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
@@ -268,6 +270,8 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--vision-device must be gpu or cpu");
             }
+        } else if (arg == "--vision-kv-swap") {
+            options.vision_kv_swap = true;
         } else if (arg == "--boundary-checkpoints") {
             options.message_boundary_checkpoints = true;
         } else if (arg == "--shared-prefix") {

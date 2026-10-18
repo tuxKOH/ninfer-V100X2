@@ -104,6 +104,8 @@ void check_documented() {
           "--ignore-eos is missing from the CLI usage text");
     check(usage.find("--vision-max-tokens") != std::string::npos,
           "--vision-max-tokens is missing from the CLI usage text");
+    check(usage.find("--vision-kv-swap") != std::string::npos,
+          "--vision-kv-swap is missing from the CLI usage text");
 }
 
 void check_vision_budget() {
@@ -111,6 +113,8 @@ void check_vision_budget() {
           "CLI Vision token budget default changed");
     check(parse_cli(with({"--vision", "--vision-max-tokens", "2048"})).vision_max_tokens == 2048,
           "CLI Vision token budget was not parsed");
+    check(parse_cli(with({"--vision", "--vision-kv-swap"})).vision_kv_swap,
+          "CLI did not parse --vision-kv-swap");
     for (const std::string& invalid : {"0", "32769"}) {
         bool rejected = false;
         try {
