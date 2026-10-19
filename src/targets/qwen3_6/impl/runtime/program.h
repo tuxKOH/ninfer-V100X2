@@ -235,6 +235,12 @@ struct SequenceState {
     // The same for the end of the tool definitions, which precede the leading instruction text
     // and therefore survive changes in it (environment lines, dates).
     HostCheckpoint tools_prefix;
+    // The boundary this lane last resumed from when a request had to restart mid-conversation
+    // (a rewrite, a fork, a lagging replay). Two branches of one conversation share tokens up to
+    // their fork, and this boundary is the branch's return point; it lives outside the
+    // depth-limited histories because the captures made while re-prefilling the new branch would
+    // evict it first.
+    HostCheckpoint resume_anchor;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
 };
@@ -644,6 +650,9 @@ private:
     // capture site so a later request's plan can never select an entry that a subsequent pin
     // evicts before the restore runs.
     void pin_response_checkpoint(SequenceState& sequence);
+    // Retains the boundary a request resumed from, so a return to the branch it replaced can
+    // restore it even after the depth-limited histories have rotated it out.
+    static void pin_resume_anchor(SequenceState& sequence, const HostCheckpoint& checkpoint);
     void write_shared_prefix(SequenceState& sequence, const HostCheckpoint& pinned, bool tools);
     // Writes an entry to the spill directory and replaces it with a metadata-only index entry.
     // Returns nullptr on success; on failure it returns the still-intact entry so the caller can

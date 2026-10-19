@@ -46,6 +46,7 @@ int main() {
     entry.long_range_history.push_back(checkpoint);
     entry.shared_prefix = checkpoint;
     entry.tools_prefix  = checkpoint;
+    entry.resume_anchor = checkpoint;
     entry.bytes         = 123;
 
     const std::string path =
@@ -73,6 +74,8 @@ int main() {
               "long-range history");
         check(read.boundary_history[0].hidden == checkpoint.hidden, "boundary hidden");
         check(read.shared_prefix.frontier == 40 && read.tools_prefix.frontier == 40, "pinned");
+        check(read.resume_anchor.frontier == 40 && read.resume_anchor.hidden == checkpoint.hidden,
+              "resume anchor");
     }
 
     // The directory key must distinguish equal-length prefixes with different tokens: two system
@@ -120,7 +123,8 @@ int main() {
             d::read_sequence_images(partial_path, geometry, {}, {});
         std::filesystem::remove(partial_path);
         return read.size() == 1 && read.front()->tools_prefix.frontier == (tools ? 40 : 0) &&
-               read.front()->shared_prefix.frontier == (leading ? 40 : 0);
+               read.front()->shared_prefix.frontier == (leading ? 40 : 0) &&
+               read.front()->resume_anchor.frontier == 0;
     };
     check(roundtrip_pinned(false, false), "entry with no pinned boundary round-trips");
     check(roundtrip_pinned(true, false), "entry with only the tool anchor round-trips");
@@ -150,7 +154,8 @@ int main() {
         check(meta->boundary_history.size() == 1 &&
                   meta->response_history.size() == 1 &&
                   meta->long_range_history.size() == 1 &&
-                  meta->shared_prefix.frontier == 40 && meta->tools_prefix.frontier == 40,
+                  meta->shared_prefix.frontier == 40 && meta->tools_prefix.frontier == 40 &&
+                  meta->resume_anchor.frontier == 40,
               "metadata sidecar checkpoints");
         d::SequenceImageGeometry wrong = meta_geometry;
         wrong.slot_bytes = 16;
@@ -160,6 +165,66 @@ int main() {
         } catch (const std::exception&) { rejected = true; }
         check(rejected, "metadata sidecar accepted a foreign geometry");
         std::filesystem::remove(meta_path);
+    }
+
+    // Images and sidecars written before the resume anchor existed stay readable. With an empty
+    // anchor the trailer is exactly one zero presence byte, so dropping it and rewriting the
+    // version field reproduces the older layouts from the current writer.
+    {
+        d::ParkedSequence plain;
+        plain.execution_frontier = 40;
+        plain.ledger_frontier    = 40;
+        plain.ledger             = entry.ledger;
+        plain.prefix_identity    = entry.prefix_identity;
+        plain.tail_hidden.push_back(std::vector<std::byte>(8, std::byte{0x11}));
+        const std::string current_path =
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v4.img").string();
+        d::write_sequence_image(plain, current_path);
+
+        const auto rewrite_version = [&](const std::string& from, const std::string& to,
+                                         std::uint32_t version) {
+            std::ifstream in(from, std::ios::binary);
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+            bytes.pop_back();
+            std::memcpy(bytes.data() + 4, &version, sizeof(version));
+            std::ofstream out(to, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        };
+
+        const std::string v3_path =
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v3.img").string();
+        rewrite_version(current_path, v3_path, 3);
+        std::vector<std::unique_ptr<d::ParkedSequence>> v3 =
+            d::read_sequence_images(v3_path, geometry, {}, {});
+        check(v3.size() == 1 && v3.front()->execution_frontier == 40 &&
+                  v3.front()->resume_anchor.frontier == 0,
+              "v3 image without a resume anchor remains readable");
+
+        d::SequenceImageGeometry legacy_geometry = geometry;
+        legacy_geometry.rank_count              = 2;
+        legacy_geometry.slot_bytes              = 8;
+        legacy_geometry.text_plane_count        = 2;
+        legacy_geometry.backend_plane_count     = 2;
+        plain.text_pages    = {3, 3};
+        plain.backend_pages = {4, 4};
+        plain.bytes         = 123;
+        const std::string meta_v2_path =
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v2.img.meta").string();
+        d::write_sequence_metadata(plain, 123, legacy_geometry, meta_v2_path);
+        const std::string meta_v1_path =
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v1.img.meta").string();
+        rewrite_version(meta_v2_path, meta_v1_path, 1);
+        std::unique_ptr<d::ParkedSequence> legacy_meta =
+            d::read_sequence_metadata(meta_v1_path, legacy_geometry);
+        check(legacy_meta->execution_frontier == 40 && legacy_meta->text_pages == plain.text_pages &&
+                  legacy_meta->resume_anchor.frontier == 0,
+              "v1 metadata sidecar without a resume anchor remains readable");
+
+        std::filesystem::remove(current_path);
+        std::filesystem::remove(v3_path);
+        std::filesystem::remove(meta_v1_path);
+        std::filesystem::remove(meta_v2_path);
     }
 
     // Truncation is rejected rather than partially applied.

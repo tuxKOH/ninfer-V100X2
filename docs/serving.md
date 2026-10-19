@@ -780,6 +780,13 @@ per-rank recurrent-state copy (about 150 MB per boundary on the 27B TP2 profile,
 the lane), so the depth is a memory/latency trade: eight boundaries cover roughly four turns of
 rewritten assistant messages.
 
+The boundary a request resumes from is also pinned independently of that depth. When two branches
+of one conversation share a prefix and a single lane alternates between them, the fork point is
+the oldest entry the boundary history holds, so the captures made while re-prefilling one branch
+would evict it first. Keeping it costs one more checkpoint and lets the other branch return to
+the fork instead of falling back to the leading block; it is copied into parked entries and
+persisted with them.
+
 `--shared-prefix-dir DIR` keeps *every distinct* shared prefix instead of one: each captured
 leading block or tool anchor is keyed by its frontier and a content fingerprint of its lineage, so
 a changed system text persists as a separate image rather than replacing the previous one. Every

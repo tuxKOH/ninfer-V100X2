@@ -756,6 +756,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             pinned = &sequence.tools_prefix;
         } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::Leading) {
             pinned = &sequence.shared_prefix;
+        } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::Anchor) {
+            pinned = &sequence.resume_anchor;
         } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::Response) {
             for (HostCheckpoint& checkpoint : sequence.response_history) {
                 if (checkpoint.frontier == request_plan.reuse_base) { pinned = &checkpoint; break; }
@@ -772,6 +774,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (pinned == nullptr || pinned->frontier == 0 || pinned->frontier > sequence.text_kv_valid) {
             throw std::logic_error("planned pinned checkpoint is unavailable");
         }
+        pin_resume_anchor(sequence, *pinned);
         rotate_device_checkpoint(sequence);
         import_checkpoint_state(sequence, *pinned, /*into_current=*/false);
     }
@@ -858,6 +861,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.boundary_history.clear();
             sequence.response_history.clear();
             sequence.long_range_history.clear();
+            sequence.resume_anchor = {};
             sequence.rewrite_checkpoint = {};
             sequence.checkpoint_ledger.clear();
             sequence.checkpoint_identity.clear();
@@ -1829,6 +1833,19 @@ void ProgramImplCore::enforce_prefix_dir_cap() {
     }
 }
 
+void ProgramImplCore::pin_resume_anchor(SequenceState& sequence,
+                                        const HostCheckpoint& checkpoint) {
+    if (checkpoint.frontier == 0) { return; }
+    // The boundary a request resumed from is where two branches of one conversation fork, so it
+    // is the return point for the branch this request replaced. It is also the *oldest* entry
+    // the depth-limited histories hold, which means the captures made while re-prefilling this
+    // request would evict it first -- and with it the only cheap way back.
+    if (same_checkpoint_boundary(sequence.resume_anchor, checkpoint)) { return; }
+    sequence.resume_anchor = checkpoint;
+    reuse_trace("resume_anchor lane=%u frontier=%u kind=%d", sequence.lane, checkpoint.frontier,
+                static_cast<int>(checkpoint.kind));
+}
+
 void ProgramImplCore::pin_response_checkpoint(SequenceState& sequence) {
     if (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0) {
         return;
@@ -2194,7 +2211,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         for (const HostCheckpoint& boundary : sequence.boundary_history) { planned += boundary.bytes; }
         for (const HostCheckpoint& response : sequence.response_history) { planned += response.bytes; }
         for (const HostCheckpoint& checkpoint : sequence.long_range_history) { planned += checkpoint.bytes; }
-        planned += sequence.shared_prefix.bytes + sequence.tools_prefix.bytes;
+        planned += sequence.shared_prefix.bytes + sequence.tools_prefix.bytes +
+                   sequence.resume_anchor.bytes;
         if (sequence.kv->backend) { planned += sequence.kv->backend->mapped_payload_bytes(); }
         for (auto& peer : peers) {
             planned += sequence.kv->text_peers[peer->rank - 1]->mapped_payload_bytes() +
@@ -2235,6 +2253,7 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         entry->long_range_history = sequence.long_range_history;
         entry->shared_prefix      = sequence.shared_prefix;
         entry->tools_prefix       = sequence.tools_prefix;
+        entry->resume_anchor      = sequence.resume_anchor;
 
         // One rank's KV payloads and its own GDN slots -- the current slot always, and the
         // checkpoint slot when the lane carries a rewrite checkpoint. The caller has made this
@@ -2309,7 +2328,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         for (const HostCheckpoint& boundary : entry->boundary_history) { bytes += boundary.bytes; }
         for (const HostCheckpoint& response : entry->response_history) { bytes += response.bytes; }
         for (const HostCheckpoint& checkpoint : entry->long_range_history) { bytes += checkpoint.bytes; }
-        bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
+        bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes +
+                 entry->resume_anchor.bytes;
         entry->bytes = bytes;
 
         // A lightweight copy of the matching metadata, so superseded entries can be pruned after
@@ -2397,6 +2417,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.long_range_history.clear();
     sequence.shared_prefix           = {};
     sequence.tools_prefix            = {};
+    sequence.resume_anchor           = {};
     request.pending                  = {};
 }
 
@@ -2838,6 +2859,7 @@ void ProgramImplCore::restore_historical_checkpoint(SequenceState& sequence,
     HostCheckpoint target = std::move(sequence.checkpoint_history[checkpoint_index - 1]);
     sequence.checkpoint_history.erase(
         sequence.checkpoint_history.begin() + static_cast<std::ptrdiff_t>(checkpoint_index - 1));
+    pin_resume_anchor(sequence, target);
     // The lane's current checkpoint is newer than the one this request resumes from; keep it for
     // a future continuation of the branch that produced it.
     rotate_device_checkpoint(sequence);
@@ -2872,6 +2894,8 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
             pinned = &entry.tools_prefix;
         } else if (resume_at_shared_prefix == SharedPrefixSlot::Leading) {
             pinned = &entry.shared_prefix;
+        } else if (resume_at_shared_prefix == SharedPrefixSlot::Anchor) {
+            pinned = &entry.resume_anchor;
         } else if (resume_at_shared_prefix == SharedPrefixSlot::Response) {
             for (const HostCheckpoint& checkpoint : entry.response_history) {
                 if (checkpoint.frontier == resume_frontier) { pinned = &checkpoint; break; }
@@ -2966,6 +2990,7 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         sequence.long_range_history = std::move(entry.long_range_history);
         sequence.shared_prefix      = std::move(entry.shared_prefix);
         sequence.tools_prefix       = std::move(entry.tools_prefix);
+        sequence.resume_anchor      = std::move(entry.resume_anchor);
         if (resume_at_checkpoint) {
             // Put the lane back at a checkpoint frontier: import the checkpoint's recurrent
             // state on every rank and its rank-0 hidden into both hidden tensors, so the MTP
@@ -2989,6 +3014,8 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                     selected_ptr = &sequence.tools_prefix;
                 } else if (resume_at_shared_prefix == SharedPrefixSlot::Leading) {
                     selected_ptr = &sequence.shared_prefix;
+                } else if (resume_at_shared_prefix == SharedPrefixSlot::Anchor) {
+                    selected_ptr = &sequence.resume_anchor;
                 } else if (resume_at_shared_prefix == SharedPrefixSlot::Response) {
                     for (HostCheckpoint& checkpoint : sequence.response_history) {
                         if (checkpoint.frontier == resume_frontier) {
@@ -3015,6 +3042,7 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                     throw std::logic_error("parked pinned boundary is unavailable");
                 }
                 HostCheckpoint& selected = *selected_ptr;
+                pin_resume_anchor(sequence, selected);
                 import_checkpoint_state(sequence, selected, /*into_current=*/true);
                 CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, selected.hidden.data(),
                                            selected.hidden.size(), cudaMemcpyHostToDevice,
@@ -3042,6 +3070,19 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                     preserve_newest = true;
                 }
             } else if (checkpoint_index == 0) {
+                HostCheckpoint anchor;
+                anchor.kind     = entry.checkpoint_kind;
+                anchor.frontier = entry.checkpoint_frontier;
+                anchor.ledger =
+                    entry.checkpoint_ledger.empty() ? entry.ledger : entry.checkpoint_ledger;
+                anchor.identity = entry.checkpoint_ledger.empty() ? entry.prefix_identity
+                                                                  : entry.checkpoint_identity;
+                anchor.state    = entry.checkpoint_state;
+                anchor.hidden   = entry.checkpoint_hidden;
+                anchor.bytes    = anchor.ledger.size() * sizeof(TokenId) + anchor.identity.bytes() +
+                               anchor.hidden.size();
+                for (const auto& image : anchor.state) { anchor.bytes += image.size(); }
+                pin_resume_anchor(sequence, anchor);
                 const auto import_checkpoint = [&](LinearAttentionStatePool& state,
                                                    std::span<const std::byte> image,
                                                    cudaStream_t stream) {
@@ -3083,6 +3124,7 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                 // A historical boundary of the entry. The entry's current checkpoint is newer
                 // and belongs to the branch that produced it, so it is kept in the history.
                 HostCheckpoint& selected = sequence.checkpoint_history[checkpoint_index - 1];
+                pin_resume_anchor(sequence, selected);
                 import_checkpoint_state(sequence, selected, /*into_current=*/true);
                 CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, selected.hidden.data(),
                                            selected.hidden.size(), cudaMemcpyHostToDevice,

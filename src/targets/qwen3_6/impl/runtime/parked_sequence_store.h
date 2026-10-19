@@ -171,6 +171,9 @@ struct ParkedSequence {
     HostCheckpoint shared_prefix;
     // The tool-definitions anchor, pinned the same way.
     HostCheckpoint tools_prefix;
+    // The boundary this conversation last resumed from mid-stream; the fork point another branch
+    // can return to (see SequenceState::resume_anchor).
+    HostCheckpoint resume_anchor;
 
     // Payload location. A spilled or preloaded entry keeps only the matching metadata in RAM and
     // streams its images back when a request selects it; `bytes` still reports the full payload.
@@ -201,6 +204,7 @@ inline std::size_t sequence_metadata_bytes(const ParkedSequence& entry) noexcept
     for (const HostCheckpoint& checkpoint : entry.long_range_history) { add(checkpoint); }
     add(entry.shared_prefix);
     add(entry.tools_prefix);
+    add(entry.resume_anchor);
     return bytes;
 }
 
@@ -233,6 +237,8 @@ inline void strip_sequence_payload(ParkedSequence& entry) {
     entry.shared_prefix.hidden.clear();
     entry.tools_prefix.state.clear();
     entry.tools_prefix.hidden.clear();
+    entry.resume_anchor.state.clear();
+    entry.resume_anchor.hidden.clear();
 }
 
 // Which pinned cross-conversation boundary a plan resumes: the end of the tool definitions or the
@@ -244,6 +250,7 @@ enum class SharedPrefixSlot : std::uint8_t {
     Message   = 3,
     Response  = 4,
     LongRange = 5,
+    Anchor    = 6,
 };
 
 // Which retained boundary a parked conversation can be resumed from. `checkpoint_index` 0 is
@@ -419,6 +426,7 @@ inline std::optional<ParkedCheckpointMatch> match_parked_checkpoints(
         };
         consider_shared(entry->tools_prefix, SharedPrefixSlot::Tools);
         consider_shared(entry->shared_prefix, SharedPrefixSlot::Leading);
+        consider_shared(entry->resume_anchor, SharedPrefixSlot::Anchor);
         for (const HostCheckpoint& boundary : entry->boundary_history) {
             consider_shared(boundary, SharedPrefixSlot::Message);
         }

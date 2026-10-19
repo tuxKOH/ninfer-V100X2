@@ -27,7 +27,8 @@
 namespace ninfer::targets::qwen3_6::detail {
 
 inline constexpr std::uint32_t kSequenceImageMagic   = 0x3147514eU;  // 'NQG1'
-inline constexpr std::uint32_t kSequenceImageVersion = 3U;  // v3 adds long-range checkpoints
+// v3 added long-range checkpoints; v4 adds the pinned resume anchor.
+inline constexpr std::uint32_t kSequenceImageVersion = 4U;
 
 // Per-rank geometry the image must match. Values come from the live decoder state, so a file
 // written by a different model, quantization, TP width or page layout is refused.
@@ -196,6 +197,7 @@ inline void write_entry(std::ostream& out, const ParkedSequence& entry) {
         write_history(entry.long_range_history);
         write_optional_checkpoint(out, entry.shared_prefix);
         write_optional_checkpoint(out, entry.tools_prefix);
+        write_optional_checkpoint(out, entry.resume_anchor);
 }
 
 } // namespace sequence_image_io_detail
@@ -341,6 +343,7 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
     };
     read_optional(entry->shared_prefix);
     read_optional(entry->tools_prefix);
+    if (version >= 4) { read_optional(entry->resume_anchor); }
 
     std::size_t bytes = 0;
     for (const auto& image : entry->text) { bytes += image->bytes(); }
@@ -354,7 +357,8 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
     for (const HostCheckpoint& checkpoint : entry->boundary_history) { bytes += checkpoint.bytes; }
     for (const HostCheckpoint& checkpoint : entry->response_history) { bytes += checkpoint.bytes; }
     for (const HostCheckpoint& checkpoint : entry->long_range_history) { bytes += checkpoint.bytes; }
-    bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
+    bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes +
+             entry->resume_anchor.bytes;
     entry->bytes = bytes;
     return entry;
 }
@@ -393,7 +397,8 @@ inline std::vector<std::unique_ptr<ParkedSequence>> read_sequence_images(
 // reading the payloads. Written after the image, removed with it.
 
 inline constexpr std::uint32_t kSequenceMetaMagic   = 0x314d514eU;  // 'NQM1'
-inline constexpr std::uint32_t kSequenceMetaVersion = 1U;
+// v2 adds the pinned resume anchor; v1 sidecars remain readable.
+inline constexpr std::uint32_t kSequenceMetaVersion = 2U;
 
 namespace sequence_image_io_detail {
 
@@ -488,6 +493,10 @@ inline void write_sequence_metadata(const ParkedSequence& entry, std::size_t pay
         if (entry.tools_prefix.frontier != 0) {
             sequence_image_io_detail::write_meta_checkpoint(out, entry.tools_prefix);
         }
+        put_scalar<std::uint8_t>(out, entry.resume_anchor.frontier != 0 ? 1U : 0U);
+        if (entry.resume_anchor.frontier != 0) {
+            sequence_image_io_detail::write_meta_checkpoint(out, entry.resume_anchor);
+        }
         out.flush();
         if (!out) {
             throw std::runtime_error("sequence metadata write failed: " + path);
@@ -509,7 +518,8 @@ inline std::unique_ptr<ParkedSequence> read_sequence_metadata(
     if (get_scalar<std::uint32_t>(in) != kSequenceMetaMagic) {
         throw std::runtime_error("not sequence metadata: " + path);
     }
-    if (get_scalar<std::uint32_t>(in) != kSequenceMetaVersion) {
+    const std::uint32_t meta_version = get_scalar<std::uint32_t>(in);
+    if (meta_version == 0 || meta_version > kSequenceMetaVersion) {
         throw std::runtime_error("unsupported sequence metadata version: " + path);
     }
     constexpr std::size_t kMaximumSize = std::numeric_limits<std::size_t>::max();
@@ -560,6 +570,9 @@ inline std::unique_ptr<ParkedSequence> read_sequence_metadata(
     }
     if (get_scalar<std::uint8_t>(in) != 0) {
         sequence_image_io_detail::read_meta_checkpoint(in, entry->tools_prefix);
+    }
+    if (meta_version >= 2 && get_scalar<std::uint8_t>(in) != 0) {
+        sequence_image_io_detail::read_meta_checkpoint(in, entry->resume_anchor);
     }
     if (in.peek() != std::char_traits<char>::eof()) {
         throw std::runtime_error("sequence metadata has trailing data: " + path);

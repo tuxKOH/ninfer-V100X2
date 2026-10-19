@@ -375,6 +375,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             if (speculative_backend != SpeculativeBackend::DFlash) {
                 consider_shared(sequence.tools_prefix, SharedPrefixSlot::Tools);
                 consider_shared(sequence.shared_prefix, SharedPrefixSlot::Leading);
+                // The boundary the lane last resumed from: the fork point another branch returns
+                // to, kept outside the depth-limited histories.
+                consider_shared(sequence.resume_anchor, SharedPrefixSlot::Anchor);
                 // Recent message boundaries, pinned outside the ring: a client that rewrote an
                 // assistant message a few turns back resumes at the last boundary before it.
                 for (const HostCheckpoint& boundary : sequence.boundary_history) {
@@ -615,6 +618,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             if (speculative_backend != SpeculativeBackend::DFlash) {
                 consider_shared(sequence.tools_prefix, SharedPrefixSlot::Tools);
                 consider_shared(sequence.shared_prefix, SharedPrefixSlot::Leading);
+                // The boundary the lane last resumed from: the fork point another branch returns
+                // to, kept outside the depth-limited histories.
+                consider_shared(sequence.resume_anchor, SharedPrefixSlot::Anchor);
                 // Recent message boundaries, pinned outside the ring: a client that rewrote an
                 // assistant message a few turns back resumes at the last boundary before it.
                 for (const HostCheckpoint& boundary : sequence.boundary_history) {
