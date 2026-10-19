@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <array>
 #include <memory>
 #include <optional>
@@ -60,6 +61,8 @@ enum class MtpBridgeMode : std::uint8_t {
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
+
+struct SequenceImageGeometry;
 
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
@@ -450,6 +453,18 @@ public:
     // Conversations whose resident frontier did not fit the KV pool, held in host memory so they
     // can be resumed exactly instead of re-prefilled. Disabled (zero budget) by default.
     ParkedSequenceStore parked;
+    // Disk-backed tier: metadata-only entries whose KV/state payload lives in a file. Pinned
+    // entries were loaded from the shared-prefix file; the rest are spilled parked conversations.
+    std::vector<std::unique_ptr<ParkedSequence>> disk_entries;
+    std::uint64_t next_disk_entry = 1;
+    std::uint64_t disk_spilled_bytes = 0;
+    // Paths and budget for the disk tier; see EngineOptions.
+    const std::string shared_prefix_save_path;
+    const std::string shared_prefix_load_path;
+    const std::string park_spill_dir;
+    const std::uint64_t park_spill_bytes;
+    bool saved_tools_prefix    = false;
+    bool saved_leading_prefix  = false;
     // Host image of the persistent arena chunks evicted for the Vision encode in flight. Empty
     // outside an encode.
     std::optional<PinnedHostBuffer> vision_swap_host_;
@@ -592,6 +607,21 @@ private:
     // `resume_at_checkpoint` the lane is put back at the entry's rewrite-checkpoint frontier
     // instead: the checkpoint's GDN slot and hidden are materialized and the checkpoint becomes
     // the lane's current one, so the existing checkpoint-restore path can re-prefill the suffix.
+    // Disk tier.
+    [[nodiscard]] SequenceImageGeometry image_geometry() const;
+    [[nodiscard]] std::vector<const ParkedSequence*> parked_candidates() const;
+    [[nodiscard]] const ParkedSequence* find_disk_entry(std::uint64_t id) const noexcept;
+    static bool is_disk_entry_id(std::uint64_t id) noexcept;
+    void load_shared_prefix_entries();
+    void write_shared_prefix(SequenceState& sequence, const HostCheckpoint& pinned, bool tools);
+    // Writes an entry to the spill directory and replaces it with a metadata-only index entry.
+    // Returns nullptr on success; on failure it returns the still-intact entry so the caller can
+    // reinsert or drop it deliberately.
+    std::unique_ptr<ParkedSequence> spill_entry(std::unique_ptr<ParkedSequence> entry);
+    void enforce_disk_budget();
+    void restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
+                            std::uint32_t text_pages, std::uint32_t backend_pages,
+                            const RequestPlanImpl& plan);
     void restore_parked_lane(SequenceState& sequence, ParkedSequence& entry,
                              std::uint32_t text_pages, std::uint32_t backend_pages,
                              bool resume_at_checkpoint, std::uint32_t checkpoint_index,

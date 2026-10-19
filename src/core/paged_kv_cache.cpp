@@ -506,6 +506,37 @@ void PagedKVAllocation::release() noexcept {
     pool_             = nullptr;
 }
 
+std::unique_ptr<PagedKVImage> PagedKVImage::from_host(PagedKVPool& pool, std::uint32_t pages,
+                                                      std::vector<std::size_t> plane_page_bytes,
+                                                      std::vector<unsigned char> data) {
+    if (pages == 0 || pages > pool.logical_page_capacity()) {
+        throw std::invalid_argument("Paged KV image page count is outside the pool");
+    }
+    if (plane_page_bytes.size() != pool.plane_count()) {
+        throw std::invalid_argument("Paged KV image plane count does not match the pool");
+    }
+    std::size_t expected = 0;
+    std::vector<std::size_t> offsets;
+    offsets.reserve(plane_page_bytes.size());
+    for (std::size_t p = 0; p < plane_page_bytes.size(); ++p) {
+        if (plane_page_bytes[p] != static_cast<std::size_t>(pool.plane(p).nb[3])) {
+            throw std::invalid_argument("Paged KV image plane geometry does not match the pool");
+        }
+        offsets.push_back(expected);
+        expected += plane_page_bytes[p] * pages;
+    }
+    if (data.size() != expected) {
+        throw std::invalid_argument("Paged KV image payload size does not match its geometry");
+    }
+    auto image               = std::make_unique<PagedKVImage>();
+    image->pool_             = &pool;
+    image->pages_            = pages;
+    image->plane_offsets_    = std::move(offsets);
+    image->plane_page_bytes_ = std::move(plane_page_bytes);
+    image->data_             = std::move(data);
+    return image;
+}
+
 PagedKVImage::PagedKVImage() noexcept = default;
 
 PagedKVImage::~PagedKVImage() = default;
@@ -567,6 +598,43 @@ std::unique_ptr<PagedKVImage> PagedKVAllocation::detach_to_host(cudaStream_t str
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     release();
+    return image;
+}
+
+std::unique_ptr<PagedKVImage> PagedKVAllocation::copy_to_host(std::uint32_t pages,
+                                                              cudaStream_t stream) const {
+    if (!valid() || ram_) {
+        throw std::logic_error("Paged KV snapshot requires a live device allocation");
+    }
+    if (pages == 0 || pages > mapped_page_count()) {
+        throw std::invalid_argument("Paged KV snapshot extent exceeds the mapped pages");
+    }
+    auto image         = std::make_unique<PagedKVImage>();
+    image->pool_       = pool_;
+    image->pages_      = pages;
+    std::size_t offset = 0;
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        const std::size_t page_bytes = static_cast<std::size_t>(pool_->plane(p).nb[3]);
+        image->plane_page_bytes_.push_back(page_bytes);
+        image->plane_offsets_.push_back(offset);
+        offset += page_bytes * pages;
+    }
+    image->data_.resize(offset);
+    for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+        const Tensor& plane          = pool_->plane(p);
+        const std::size_t page_bytes = image->plane_page_bytes_[p];
+        unsigned char* host          = image->data_.data() + image->plane_offsets_[p];
+        for (std::uint32_t page = 0; page < pages; ++page) {
+            const std::int32_t id = page_ids_[page];
+            if (id < 0) { throw std::logic_error("Paged KV snapshot found an unmapped page"); }
+            CUDA_CHECK(cudaMemcpyAsync(
+                host + static_cast<std::size_t>(page) * page_bytes,
+                static_cast<const unsigned char*>(plane.data) +
+                    static_cast<std::size_t>(id) * page_bytes,
+                page_bytes, cudaMemcpyDeviceToHost, stream));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     return image;
 }
 

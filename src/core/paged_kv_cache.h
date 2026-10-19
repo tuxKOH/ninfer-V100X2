@@ -199,6 +199,11 @@ public:
     // retrieval window are a different (single-request) host scheme. The caller must have made
     // this pool's device current, since the payload copies are issued on it.
     [[nodiscard]] std::unique_ptr<PagedKVImage> detach_to_host(cudaStream_t stream = nullptr);
+    // Copies the first `pages` logical pages to host WITHOUT releasing them, for persisting a
+    // snapshot of a live allocation (the shared-prefix file). `pages` may not exceed the mapped
+    // count. The allocation keeps every mapped page and its table binding.
+    [[nodiscard]] std::unique_ptr<PagedKVImage> copy_to_host(std::uint32_t pages,
+                                                             cudaStream_t stream = nullptr) const;
     // Restores a detached image into this allocation, which must be freshly reserved in the
     // image's own pool with at least image.pages() of entitlement and no mapped pages yet.
     void attach_from_host(const PagedKVImage& image, cudaStream_t stream = nullptr);
@@ -256,6 +261,14 @@ public:
     [[nodiscard]] const std::vector<std::size_t>& plane_page_bytes() const noexcept {
         return plane_page_bytes_;
     }
+    // Plane-major payload bytes, exactly what detach_to_host() copied out.
+    [[nodiscard]] const std::vector<unsigned char>& payload() const noexcept { return data_; }
+
+    // Rebuilds an image from host bytes written by detach_to_host() and persisted outside the
+    // process (or loaded at startup). `plane_page_bytes` must match the pool's plane geometry.
+    static std::unique_ptr<PagedKVImage> from_host(PagedKVPool& pool, std::uint32_t pages,
+                                                   std::vector<std::size_t> plane_page_bytes,
+                                                   std::vector<unsigned char> data);
 
 private:
     friend class PagedKVAllocation;

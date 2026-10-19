@@ -1,0 +1,131 @@
+// The disk-backed shared prefix and the RAM-to-disk spill tier share one image format. This
+// round-trips the metadata and checkpoint lineage and checks that truncated or mismatched files
+// are rejected before any device state is touched. No device or pool is needed: the KV payloads
+// are absent here, matching the metadata-only shape the disk index keeps in RAM.
+#include "targets/qwen3_6/impl/runtime/sequence_image_io.h"
+
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+namespace d = ninfer::targets::qwen3_6::detail;
+
+int failures = 0;
+void check(bool condition, const char* what) {
+    if (!condition) {
+        std::cerr << "FAIL: " << what << "\n";
+        ++failures;
+    }
+}
+
+int main() {
+    d::ParkedSequence entry;
+    entry.execution_frontier = 40;
+    entry.ledger_frontier    = 40;
+    entry.mtp_kv_valid       = 40;
+    entry.rope_delta         = 0;
+    entry.tail_hidden_valid  = true;
+    entry.tail_hidden.push_back(std::vector<std::byte>(8, std::byte{0x11}));
+    entry.ledger.assign(40, 7);
+    ninfer::targets::qwen3_6::PreparedPromptData prompt;
+    prompt.token_ids.assign(40, 7);
+    prompt.token_types.assign(40, 0);
+    prompt.positions.assign(40 * 3, 0);
+    entry.prefix_identity.assign(prompt);
+    d::HostCheckpoint checkpoint;
+    checkpoint.kind     = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
+    checkpoint.frontier = 40;
+    checkpoint.ledger   = entry.ledger;
+    checkpoint.identity = entry.prefix_identity;
+    checkpoint.hidden.assign(8, std::byte{0x3c});
+    entry.boundary_history.push_back(checkpoint);
+    entry.shared_prefix = checkpoint;
+    entry.tools_prefix  = checkpoint;
+    entry.bytes         = 123;
+
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "ninfer_sequence_image_test.img").string();
+    d::SequenceImageGeometry geometry;  // zero ranks: no KV payloads
+    geometry.hidden_bytes = 8;         // matches the fixture's checkpoint hidden
+    d::write_sequence_image(entry, path);
+
+    std::vector<std::unique_ptr<d::ParkedSequence>> loaded =
+        d::read_sequence_images(path, geometry, nullptr, nullptr);
+    check(loaded.size() == 1, "one entry survives the round trip");
+    if (!loaded.empty()) {
+        d::ParkedSequence& read = *loaded.front();
+        check(read.execution_frontier == 40 && read.ledger_frontier == 40, "frontiers");
+        check(read.mtp_kv_valid == 40 && read.rope_delta == 0, "mtp/rope");
+        check(read.tail_hidden_valid, "tail hidden flag");
+        check(read.ledger == entry.ledger, "ledger");
+        check(read.prefix_identity.size() == entry.prefix_identity.size(), "identity size");
+        check(read.checkpoint_valid == false, "checkpoint flag defaults off");
+        check(read.boundary_history.size() == 1 && read.boundary_history[0].frontier == 40,
+              "boundary history");
+        check(read.boundary_history[0].hidden == checkpoint.hidden, "boundary hidden");
+        check(read.shared_prefix.frontier == 40 && read.tools_prefix.frontier == 40, "pinned");
+    }
+
+    // A pinned boundary is optional. An entry may carry neither (a spilled conversation), only
+    // the tool anchor, or only the leading block; absence must not be confused with a malformed
+    // checkpoint (the reader validates rank/hidden sizes of checkpoints that ARE present).
+    const auto roundtrip_pinned = [&](bool tools, bool leading) {
+        d::ParkedSequence partial;
+        partial.execution_frontier = 40;
+        partial.ledger_frontier    = 40;
+        partial.mtp_kv_valid       = 40;
+        partial.ledger             = entry.ledger;
+        partial.prefix_identity    = entry.prefix_identity;
+        partial.tail_hidden.push_back(std::vector<std::byte>(8, std::byte{0x11}));
+        partial.shared_prefix = leading ? checkpoint : d::HostCheckpoint{};
+        partial.tools_prefix  = tools ? checkpoint : d::HostCheckpoint{};
+        const std::string partial_path =
+            (std::filesystem::temp_directory_path() /
+             ("ninfer_sequence_partial_" + std::to_string(tools) + std::to_string(leading) + ".img"))
+                .string();
+        d::write_sequence_image(partial, partial_path);
+        std::vector<std::unique_ptr<d::ParkedSequence>> read =
+            d::read_sequence_images(partial_path, geometry, nullptr, nullptr);
+        std::filesystem::remove(partial_path);
+        return read.size() == 1 && read.front()->tools_prefix.frontier == (tools ? 40 : 0) &&
+               read.front()->shared_prefix.frontier == (leading ? 40 : 0);
+    };
+    check(roundtrip_pinned(false, false), "entry with no pinned boundary round-trips");
+    check(roundtrip_pinned(true, false), "entry with only the tool anchor round-trips");
+    check(roundtrip_pinned(false, true), "entry with only the leading block round-trips");
+
+    // Truncation is rejected rather than partially applied.
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        std::ofstream out(std::filesystem::temp_directory_path() /
+                              "ninfer_sequence_image_truncated.img",
+                          std::ios::binary);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size() / 2));
+    }
+    bool rejected = false;
+    try {
+        (void)d::read_sequence_images(
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_image_truncated.img")
+                .string(),
+            geometry, nullptr, nullptr);
+    } catch (const std::exception&) { rejected = true; }
+    check(rejected, "truncated image is rejected");
+
+    // A geometry mismatch (rank count) is rejected.
+    d::SequenceImageGeometry wrong_ranks;
+    wrong_ranks.rank_count = 2;
+    wrong_ranks.slot_bytes = 8;
+    rejected               = false;
+    try {
+        (void)d::read_sequence_images(path, wrong_ranks, nullptr, nullptr);
+    } catch (const std::exception&) { rejected = true; }
+    check(rejected, "rank mismatch is rejected");
+
+    if (failures == 0) { std::printf("ok\n"); }
+    return failures == 0 ? 0 : 1;
+}

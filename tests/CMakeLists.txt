@@ -136,6 +136,14 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+# Host-only: the disk image format shared by the persisted shared prefix and the RAM-to-disk spill
+# tier. Round-trips metadata/checkpoints and rejects truncated or geometry-mismatched files.
+ninfer_add_test(ninfer_qwen3_6_sequence_image_test
+  SOURCES targets/qwen3_6/test_sequence_image.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_sequence_image_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 # Host-only: no artifact, no device. YaRN host-side frequency/attention-factor math, family-owned
 # because src/core owns device primitives only and the rope semantics belong to
 # src/targets/qwen3_6; checked against a committed vLLM-reference dump

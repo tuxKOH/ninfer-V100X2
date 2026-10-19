@@ -126,7 +126,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
            "[--vision-kv-swap] [--boundary-checkpoints [--boundary-history N]] "
-           "[--shared-prefix] "
+           "[--shared-prefix [--shared-prefix-save FILE] [--shared-prefix-load FILE]] "
+           "[--kv-park-spill-dir DIR] [--kv-park-spill-bytes N] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -160,6 +161,10 @@ std::string serve_usage_text(const char* argv0) {
            "       encode swaps this rank's runtime KV/state to host RAM and restores it afterwards\n"
            "       --boundary-history N keeps the last N message boundaries (default 1, max 16), so a\n"
            "       client that rewrites an assistant message several turns back still resumes nearby\n"
+           "       --shared-prefix-save FILE persists the shared-prefix resume state after capture;\n"
+           "       --shared-prefix-load FILE restores it at startup instead of re-prefilling the block\n"
+           "       --kv-park-spill-dir DIR spills the least-recently-used parked conversation to disk when\n"
+           "       the host parking budget is exhausted; --kv-park-spill-bytes N bounds that directory\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -377,6 +382,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.message_boundary_checkpoints = true;
         } else if (arg == "--shared-prefix") {
             options.shared_prefix_checkpoints = true;
+        } else if (arg == "--shared-prefix-save") {
+            options.shared_prefix_save_path = require_value("--shared-prefix-save");
+            if (options.shared_prefix_save_path.empty()) {
+                throw std::invalid_argument("--shared-prefix-save must not be empty");
+            }
+            // Saving needs the boundaries to be captured.
+            options.shared_prefix_checkpoints = true;
+        } else if (arg == "--shared-prefix-load") {
+            options.shared_prefix_load_path = require_value("--shared-prefix-load");
+            if (options.shared_prefix_load_path.empty()) {
+                throw std::invalid_argument("--shared-prefix-load must not be empty");
+            }
+            options.shared_prefix_checkpoints = true;
+        } else if (arg == "--kv-park-spill-dir") {
+            options.park_spill_dir = require_value("--kv-park-spill-dir");
+            if (options.park_spill_dir.empty()) {
+                throw std::invalid_argument("--kv-park-spill-dir must not be empty");
+            }
+        } else if (arg == "--kv-park-spill-bytes") {
+            options.park_spill_bytes =
+                parse_u64(require_value("--kv-park-spill-bytes"), "kv-park-spill-bytes");
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--vision-max-tokens"), "vision-max-tokens"));
@@ -435,6 +461,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
+    }
+    if (!options.park_spill_dir.empty() && options.park_spill_bytes == 0 &&
+        options.kv_park_bytes == 0) {
+        throw std::invalid_argument(
+            "--kv-park-spill-dir requires a bound: set --kv-park-spill-bytes or --kv-park-bytes");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&

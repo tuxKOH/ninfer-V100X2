@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/sequence_image_io.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/yarn_rope.h"
@@ -266,6 +267,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
       boundary_history_depth(std::max(1U, plan.boundary_history)),
+      shared_prefix_save_path(plan.shared_prefix_save_path),
+      shared_prefix_load_path(plan.shared_prefix_load_path),
+      park_spill_dir(plan.park_spill_dir),
+      park_spill_bytes(plan.park_spill_bytes),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
@@ -509,6 +514,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    load_shared_prefix_entries();
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -703,15 +709,25 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             // clear_lane is for.
             clear_lane(sequence, requests[lane]);
         }
-        ParkedSequence* parked_entry = parked.find_by_id(target);
-        if (parked_entry == nullptr) {
-            throw std::logic_error("planned parked conversation is no longer stored");
+        ParkedSequence* parked_entry = nullptr;
+        if (is_disk_entry_id(target)) {
+            const ParkedSequence* meta = find_disk_entry(target);
+            if (meta == nullptr) {
+                throw std::logic_error("planned disk-backed conversation is no longer stored");
+            }
+            restore_disk_entry(sequence, *meta, request_plan.text_kv_page_entitlement,
+                               request_plan.backend_kv_page_entitlement, request_plan);
+        } else {
+            parked_entry = parked.find_by_id(target);
+            if (parked_entry == nullptr) {
+                throw std::logic_error("planned parked conversation is no longer stored");
+            }
+            restore_parked_lane(sequence, *parked_entry, request_plan.text_kv_page_entitlement,
+                                request_plan.backend_kv_page_entitlement,
+                                request_plan.parked_checkpoint, request_plan.checkpoint_index,
+                                request_plan.restore_shared_prefix, request_plan.reuse_base);
+            parked.erase(target);
         }
-        restore_parked_lane(sequence, *parked_entry, request_plan.text_kv_page_entitlement,
-                            request_plan.backend_kv_page_entitlement,
-                            request_plan.parked_checkpoint, request_plan.checkpoint_index,
-                            request_plan.restore_shared_prefix, request_plan.reuse_base);
-        parked.erase(target);
         // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
         // one, so the reuse branch below takes both, and the reported path stays truthful.
     }
@@ -1394,9 +1410,281 @@ void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     clear_lane(sequences[lane], requests[lane]);
 }
 
+
+namespace {
+// Disk-backing carve-out from the store's id space.
+constexpr std::uint64_t kDiskEntryIdBase = 1ULL << 62U;
+
+std::uint32_t pages_for_snapshot(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+} // namespace
+
+bool ProgramImplCore::is_disk_entry_id(std::uint64_t id) noexcept {
+    return id >= kDiskEntryIdBase;
+}
+
+const ParkedSequence* ProgramImplCore::find_disk_entry(std::uint64_t id) const noexcept {
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        if (entry->id == id) { return entry.get(); }
+    }
+    return nullptr;
+}
+
+std::vector<const ParkedSequence*> ProgramImplCore::parked_candidates() const {
+    std::vector<const ParkedSequence*> pointers = parked.candidates();
+    pointers.reserve(pointers.size() + disk_entries.size());
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        pointers.push_back(entry.get());
+    }
+    return pointers;
+}
+
+SequenceImageGeometry ProgramImplCore::image_geometry() const {
+    SequenceImageGeometry geometry;
+    geometry.rank_count  = static_cast<std::size_t>(device_count);
+    geometry.slot_bytes  = decoder->linear_attention.slot_image_bytes();
+    geometry.hidden_bytes = static_cast<std::size_t>(sequences[0].rewrite_checkpoint_hidden.bytes());
+    const PagedKVPool& text_pool = decoder->text_kv.pool();
+    geometry.text_plane_count    = text_pool.plane_count();
+    geometry.text_page_capacity  = text_pool.logical_page_capacity();
+    for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+        geometry.text_plane_page_bytes.push_back(
+            static_cast<std::size_t>(text_pool.plane(plane).nb[3]));
+    }
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+        const PagedKVPool& backend_pool = backend->pool();
+        geometry.backend_plane_count    = backend_pool.plane_count();
+        geometry.backend_page_capacity  = backend_pool.logical_page_capacity();
+        for (std::size_t plane = 0; plane < backend_pool.plane_count(); ++plane) {
+            geometry.backend_plane_page_bytes.push_back(
+                static_cast<std::size_t>(backend_pool.plane(plane).nb[3]));
+        }
+    }
+    return geometry;
+}
+
+void ProgramImplCore::load_shared_prefix_entries() {
+    if (shared_prefix_load_path.empty()) { return; }
+    const SequenceImageGeometry geometry = image_geometry();
+    PagedKVPool* backend_pool =
+        backend_kv_cache() != nullptr ? &backend_kv_cache()->pool() : nullptr;
+    const std::vector<std::string> paths{shared_prefix_load_path,
+                                         shared_prefix_load_path + ".tools"};
+    for (const std::string& path : paths) {
+        std::error_code error;
+        if (!std::filesystem::exists(path, error) || error) { continue; }
+        try {
+            std::vector<std::unique_ptr<ParkedSequence>> entries = read_sequence_images(
+                path, geometry, &decoder->text_kv.pool(), backend_pool);
+            for (std::unique_ptr<ParkedSequence>& entry : entries) {
+                for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
+                    entry->text_pages.push_back(image->pages());
+                }
+                for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
+                    entry->backend_pages.push_back(image->pages());
+                }
+                entry->disk_backed = true;
+                entry->disk_path   = path;
+                entry->pinned      = true;
+                entry->id          = kDiskEntryIdBase + next_disk_entry++;
+                strip_sequence_payload(*entry);
+                disk_entries.push_back(std::move(entry));
+            }
+            reuse_trace("disk_prefix_load path=%s entries=%zu", path.c_str(), entries.size());
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[reuse] disk_prefix_load FAILED path=%s: %s\n", path.c_str(),
+                         error.what());
+        }
+    }
+}
+
+void ProgramImplCore::write_shared_prefix(SequenceState& sequence,
+                                          const HostCheckpoint& pinned, bool tools) {
+    if (shared_prefix_save_path.empty()) { return; }
+    if (tools ? saved_tools_prefix : saved_leading_prefix) { return; }
+    try {
+        ParkedSequence entry;
+        const std::uint32_t frontier = pinned.frontier;
+        entry.ledger.assign(sequence.ledger.begin(),
+                            sequence.ledger.begin() + static_cast<std::ptrdiff_t>(frontier));
+        entry.prefix_identity = sequence.prefix_identity;
+        entry.prefix_identity.truncate(frontier);
+        entry.execution_frontier = frontier;
+        entry.ledger_frontier    = frontier;
+        entry.mtp_kv_valid       = std::min(sequence.mtp_kv_valid, frontier);
+        entry.rope_delta         = sequence.rope_delta;
+        entry.tail_hidden_valid  = true;
+        entry.tail_hidden.push_back(pinned.hidden);
+        entry.linear_state = pinned.state;
+        entry.checkpoint_valid    = true;
+        entry.checkpoint_kind     = pinned.kind;
+        entry.checkpoint_frontier = frontier;
+        entry.checkpoint_ledger   = entry.ledger;
+        entry.checkpoint_identity = entry.prefix_identity;
+        entry.checkpoint_state    = pinned.state;
+        entry.checkpoint_hidden   = pinned.hidden;
+        if (tools) {
+            entry.tools_prefix = pinned;
+        } else {
+            entry.shared_prefix = pinned;
+        }
+        // Snapshot only the pages the boundary covers; the rest of the prompt is still being
+        // prefilled and is not part of the reusable prefix.
+        const std::uint32_t pages = pages_for_snapshot(frontier);
+        entry.text.push_back(sequence.kv->text.copy_to_host(pages, device.stream));
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            entry.text.push_back(
+                sequence.kv->text_peers[peer->rank - 1]->copy_to_host(pages, peer->device.stream));
+        }
+        if (sequence.kv->backend && backend_kv_cache() != nullptr) {
+            const std::uint32_t backend_pages =
+                pages_for_snapshot(std::min(entry.mtp_kv_valid, frontier));
+            if (backend_pages != 0) {
+                entry.backend.push_back(
+                    sequence.kv->backend->copy_to_host(backend_pages, device.stream));
+                for (auto& peer : peers) {
+                    const ScopedDevice scope(peer->device.device);
+                    entry.backend.push_back(sequence.kv->backend_peers[peer->rank - 1]->copy_to_host(
+                        backend_pages, peer->device.stream));
+                }
+            }
+        }
+        std::size_t bytes = 0;
+        for (const auto& image : entry.text) { bytes += image->bytes(); }
+        for (const auto& image : entry.backend) { bytes += image->bytes(); }
+        for (const auto& state : entry.linear_state) { bytes += state.size(); }
+        for (const auto& hidden : entry.tail_hidden) { bytes += hidden.size(); }
+        bytes += entry.checkpoint_hidden.size();
+        for (const auto& state : entry.checkpoint_state) { bytes += state.size(); }
+        bytes += entry.checkpoint_ledger.size() * sizeof(TokenId) + entry.checkpoint_identity.bytes();
+        bytes += entry.shared_prefix.bytes + entry.tools_prefix.bytes;
+        entry.bytes = bytes;
+
+        const std::string path = tools ? shared_prefix_save_path + ".tools"
+                                       : shared_prefix_save_path;
+        write_sequence_image(entry, path);
+        (tools ? saved_tools_prefix : saved_leading_prefix) = true;
+        reuse_trace("disk_prefix_save path=%s frontier=%u bytes=%zu", path.c_str(), frontier, bytes);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[reuse] disk_prefix_save FAILED: %s\n", error.what());
+    }
+}
+
+std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
+    std::unique_ptr<ParkedSequence> entry) {
+    if (park_spill_dir.empty() || entry == nullptr) { return entry; }
+    try {
+        std::error_code error;
+        std::filesystem::create_directories(park_spill_dir, error);
+        if (error) { return entry; }
+        const std::filesystem::path path =
+            std::filesystem::path(park_spill_dir) /
+            ("park-" + std::to_string(next_disk_entry) + ".img");
+        write_sequence_image(*entry, path.string());
+        for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
+            entry->text_pages.push_back(image->pages());
+        }
+        for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
+            entry->backend_pages.push_back(image->pages());
+        }
+        entry->disk_backed = true;
+        entry->disk_path   = path.string();
+        entry->pinned      = false;
+        entry->id          = kDiskEntryIdBase + next_disk_entry++;
+        entry->last_used   = park_clock++;
+        const std::size_t metadata = sequence_metadata_bytes(*entry);
+        const std::uint64_t charged = entry->bytes + metadata;
+        strip_sequence_payload(*entry);
+        disk_entries.push_back(std::move(entry));
+        disk_spilled_bytes += charged;
+        enforce_disk_budget();
+        return nullptr;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[reuse] park_spill FAILED: %s\n", error.what());
+        // The entry may have been partially stripped; it is no longer restorable from RAM. Hand
+        // it back (possibly null payloads) so the caller decides, rather than silently dropping
+        // it here.
+        return entry;
+    }
+}
+
+void ProgramImplCore::enforce_disk_budget() {
+    const std::uint64_t budget =
+        park_spill_bytes != 0 ? park_spill_bytes : parked.budget_bytes();
+    if (budget == 0) { return; }
+    while (disk_spilled_bytes > budget) {
+        std::size_t oldest = disk_entries.size();
+        for (std::size_t i = 0; i < disk_entries.size(); ++i) {
+            if (disk_entries[i]->pinned) { continue; }
+            if (oldest == disk_entries.size() ||
+                disk_entries[i]->last_used < disk_entries[oldest]->last_used) {
+                oldest = i;
+            }
+        }
+        if (oldest == disk_entries.size()) { break; }
+        std::error_code error;
+        std::filesystem::remove(disk_entries[oldest]->disk_path, error);
+        disk_spilled_bytes -= disk_entries[oldest]->bytes +
+                              sequence_metadata_bytes(*disk_entries[oldest]);
+        disk_entries.erase(disk_entries.begin() + static_cast<std::ptrdiff_t>(oldest));
+    }
+}
+
+void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
+                                         std::uint32_t text_pages, std::uint32_t backend_pages,
+                                         const RequestPlanImpl& plan) {
+    PagedKVPool* backend_pool =
+        backend_kv_cache() != nullptr ? &backend_kv_cache()->pool() : nullptr;
+    std::unique_ptr<ParkedSequence> loaded;
+    try {
+        loaded = read_sequence_image(meta.disk_path, image_geometry(),
+                                     &decoder->text_kv.pool(), backend_pool);
+    } catch (...) {
+        // Drop a poison index entry so later requests are planned against the remaining state
+        // instead of failing on the same file again.
+        const std::uint64_t id  = meta.id;
+        const std::string path  = meta.disk_path;
+        const std::size_t bytes =
+            meta.bytes + (meta.pinned ? 0 : sequence_metadata_bytes(meta));
+        if (!meta.pinned) {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            disk_spilled_bytes -=
+                std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
+            for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
+                if ((*it)->id == id) {
+                    disk_entries.erase(it);
+                    break;
+                }
+            }
+        }
+        throw;
+    }
+    loaded->id = meta.id;
+    restore_parked_lane(sequence, *loaded, text_pages, backend_pages, plan.parked_checkpoint,
+                        plan.checkpoint_index, plan.restore_shared_prefix, plan.reuse_base);
+    if (!meta.pinned) {
+        const std::uint64_t id   = meta.id;
+        const std::string path   = meta.disk_path;
+        const std::size_t bytes = meta.bytes + sequence_metadata_bytes(meta);
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
+        for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
+            if ((*it)->id == id) {
+                disk_entries.erase(it);
+                break;
+            }
+        }
+    }
+}
+
 bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t protect_id) noexcept {
     try {
-        if (!parked.enabled() || lane >= max_concurrency) { return false; }
+        const bool spill_enabled = !park_spill_dir.empty();
+        if ((!parked.enabled() && !spill_enabled) || lane >= max_concurrency) { return false; }
         SequenceState& sequence = sequences[lane];
         if (!sequence.retained || !sequence.kv) { return false; }
         // Park only what this store can restore bit-exactly. RAM KV keeps its own single-request
@@ -1459,7 +1747,7 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         reuse_trace("park lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu", lane,
                     sequence.execution_frontier, planned, parked.budget_bytes(),
                     planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size());
-        if (planned > parked.budget_bytes()) { return false; }
+        if (!spill_enabled && planned > parked.budget_bytes()) { return false; }
 
         auto entry                = std::make_unique<ParkedSequence>();
         entry->ledger             = sequence.ledger;
@@ -1557,9 +1845,36 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
         entry->bytes = bytes;
 
-        if (!parked.insert(std::move(entry), park_clock++, protect_id)) { return false; }
-        clear_lane(sequence, requests[lane]);
-        return true;
+        // RAM first: make room by spilling the least-recently-used parked conversations, then
+        // insert. `insert` destroys its argument when it refuses, so the space check is made
+        // before the call.
+        if (parked.enabled() && entry->bytes <= parked.budget_bytes()) {
+            if (spill_enabled) {
+                while (parked.used_bytes() + entry->bytes > parked.budget_bytes()) {
+                    std::unique_ptr<ParkedSequence> victim = parked.remove_least_recently_used();
+                    if (victim == nullptr) { break; }
+                    std::unique_ptr<ParkedSequence> failed = spill_entry(std::move(victim));
+                    if (failed != nullptr) {
+                        // Keeping the victim in RAM is better than losing it; the RAM tier can
+                        // still evict it under the usual policy.
+                        (void)parked.insert(std::move(failed), park_clock++, protect_id);
+                        break;
+                    }
+                }
+            }
+            if (parked.used_bytes() + entry->bytes <= parked.budget_bytes() &&
+                parked.insert(std::move(entry), park_clock++, protect_id).has_value()) {
+                clear_lane(sequence, requests[lane]);
+                return true;
+            }
+        }
+        // The conversation is too large for the RAM tier (or the tier is disabled): keep it on
+        // disk when a spill directory is configured.
+        if (spill_enabled && spill_entry(std::move(entry)) == nullptr) {
+            clear_lane(sequence, requests[lane]);
+            return true;
+        }
+        return false;
     } catch (...) {
         // Best-effort by contract. A copy that failed partway has already released some of the
         // lane's pages; the caller's fallback clears the rest, which is exactly what it would have
@@ -3432,8 +3747,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     // newer boundaries, and the depth-3 ring would evict them within two
                     // requests, ending cross-session reuse.
                     sequence.tools_prefix = export_checkpoint(sequence);
+                    write_shared_prefix(sequence, sequence.tools_prefix, /*tools=*/true);
                 } else if (pending_slot == BoundarySlot::Leading) {
                     sequence.shared_prefix = export_checkpoint(sequence);
+                    write_shared_prefix(sequence, sequence.shared_prefix, /*tools=*/false);
                 } else {
                     rotate_device_checkpoint(sequence);
                 }

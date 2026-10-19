@@ -1,6 +1,9 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
+#include "targets/qwen3_6/impl/runtime/image_stream.h"
+
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -179,6 +182,80 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
     return true;
+}
+
+void ResidentPrefixIdentity::save(std::ostream& out) const {
+    using namespace image_stream;
+    // The envelope (magic/version) is written by sequence_image_io.h; this is the payload.
+    put_size(out, token_types_.size());
+    put_bytes(out, token_types_.data(), token_types_.size());
+    for (const auto& positions : positions_) { put_vector<std::int32_t>(out, positions); }
+    put_size(out, vision_items_.size());
+    for (const VisionItem& item : vision_items_) {
+        put_scalar<std::uint8_t>(out, static_cast<std::uint8_t>(item.modality));
+        put_scalar<std::int32_t>(out, item.grid.temporal);
+        put_scalar<std::int32_t>(out, item.grid.height);
+        put_scalar<std::int32_t>(out, item.grid.width);
+        put_size(out, item.patch_begin);
+        put_size(out, item.patch_count);
+        put_bytes(out, item.content_digest.data(), item.content_digest.size());
+        put_size(out, item.timestamps.size());
+        for (const double timestamp : item.timestamps) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &timestamp, sizeof(bits));
+            put_scalar<std::uint64_t>(out, bits);
+        }
+        put_size(out, item.token_spans.size());
+        for (const TokenSpan& span : item.token_spans) {
+            put_size(out, span.begin);
+            put_size(out, span.count);
+        }
+    }
+}
+
+ResidentPrefixIdentity ResidentPrefixIdentity::load(std::istream& in) {
+    using namespace image_stream;
+    constexpr std::size_t kMaximumTokens  = 1U << 20;  // 1,048,576 tokens
+    constexpr std::size_t kMaximumItems   = 8192;
+    constexpr std::size_t kMaximumSpans   = 1U << 20;
+    constexpr std::size_t kMaximumStamps  = 1U << 20;
+    ResidentPrefixIdentity identity;
+    identity.token_types_ = get_vector<std::uint8_t>(in, kMaximumTokens);
+    for (auto& positions : identity.positions_) {
+        positions = get_vector<std::int32_t>(in, kMaximumTokens * 3);
+        if (positions.size() != identity.token_types_.size()) {
+            throw std::runtime_error("sequence image identity positions do not match its tokens");
+        }
+    }
+    const std::size_t items = get_size(in, kMaximumItems);
+    identity.vision_items_.reserve(items);
+    for (std::size_t i = 0; i < items; ++i) {
+        VisionItem item;
+        item.modality      = static_cast<PromptModality>(get_scalar<std::uint8_t>(in));
+        item.grid.temporal = get_scalar<std::int32_t>(in);
+        item.grid.height   = get_scalar<std::int32_t>(in);
+        item.grid.width    = get_scalar<std::int32_t>(in);
+        item.patch_begin   = get_size(in, std::numeric_limits<std::size_t>::max());
+        item.patch_count   = get_size(in, std::numeric_limits<std::size_t>::max());
+        get_bytes(in, item.content_digest.data(), item.content_digest.size());
+        const std::size_t stamps = get_size(in, kMaximumStamps);
+        item.timestamps.reserve(stamps);
+        for (std::size_t s = 0; s < stamps; ++s) {
+            const std::uint64_t bits = get_scalar<std::uint64_t>(in);
+            double timestamp         = 0.0;
+            std::memcpy(&timestamp, &bits, sizeof(timestamp));
+            item.timestamps.push_back(timestamp);
+        }
+        const std::size_t spans = get_size(in, kMaximumSpans);
+        item.token_spans.reserve(spans);
+        for (std::size_t s = 0; s < spans; ++s) {
+            item.token_spans.push_back(
+                TokenSpan{.begin = get_size(in, std::numeric_limits<std::size_t>::max()),
+                          .count = get_size(in, std::numeric_limits<std::size_t>::max())});
+        }
+        identity.vision_items_.push_back(std::move(item));
+    }
+    return identity;
 }
 
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,

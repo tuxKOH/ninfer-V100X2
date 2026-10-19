@@ -72,6 +72,10 @@ struct ServeOptions {
     bool message_boundary_checkpoints = false;
     std::uint32_t boundary_history = 1;
     bool shared_prefix_checkpoints = false;
+    std::string shared_prefix_save_path;
+    std::string shared_prefix_load_path;
+    std::string park_spill_dir;
+    std::uint64_t park_spill_bytes = 0;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

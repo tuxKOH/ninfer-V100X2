@@ -7,12 +7,18 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <istream>
+#include <ostream>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
 
 class ResidentPrefixIdentity {
 public:
+    // Persistence for the disk-backed shared prefix and spilled parked conversations. The format
+    // is the compact in-memory layout, length-prefixed; see sequence_image_io.h for the envelope.
+    void save(std::ostream& out) const;
+    static ResidentPrefixIdentity load(std::istream& in);
     void reserve(std::size_t tokens);
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);

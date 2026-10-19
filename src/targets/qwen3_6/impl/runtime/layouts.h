@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <memory>
 #include <optional>
 
@@ -94,6 +95,10 @@ struct SequencePlanningInputs {
     std::uint64_t kv_park_bytes = 0;
     // Recent message boundaries each lane (or parked entry) pins; see EngineOptions::boundary_history.
     std::uint32_t boundary_history = 1;
+    std::string shared_prefix_save_path;
+    std::string shared_prefix_load_path;
+    std::string park_spill_dir;
+    std::uint64_t park_spill_bytes = 0;
     bool volta_long_attention = false;
 };
 
@@ -129,6 +134,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     RamKvOptions ram_kv;
     std::uint64_t kv_park_bytes = 0;
     std::uint32_t boundary_history = 1;
+    std::string shared_prefix_save_path;
+    std::string shared_prefix_load_path;
+    std::string park_spill_dir;
+    std::uint64_t park_spill_bytes = 0;
     bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

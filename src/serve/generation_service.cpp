@@ -268,6 +268,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.message_boundary_checkpoints = options_.message_boundary_checkpoints;
     engine_options.boundary_history = options_.boundary_history;
     engine_options.shared_prefix_checkpoints = options_.shared_prefix_checkpoints;
+    engine_options.shared_prefix_save_path = options_.shared_prefix_save_path;
+    engine_options.shared_prefix_load_path = options_.shared_prefix_load_path;
+    engine_options.park_spill_dir = options_.park_spill_dir;
+    engine_options.park_spill_bytes = options_.park_spill_bytes;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;

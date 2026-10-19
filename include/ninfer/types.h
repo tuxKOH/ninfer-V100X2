@@ -187,6 +187,15 @@ struct EngineOptions {
     // messages). Agent sessions share that block, so a new conversation can restore a prefix the
     // server already prefilled instead of starting from token zero.
     bool shared_prefix_checkpoints         = false;
+    // Persist the shared-prefix resume state (KV pages, recurrent slots and hidden) to this path
+    // after it is captured, and reload it at startup so a restart does not re-prefill the block.
+    std::string shared_prefix_save_path;
+    std::string shared_prefix_load_path;
+    // Spill parked conversations to this directory when the host parking budget is exhausted.
+    // An empty path disables the disk tier; `park_spill_bytes` bounds it (0 = same as
+    // kv_park_bytes).
+    std::string park_spill_dir;
+    std::uint64_t park_spill_bytes         = 0;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };

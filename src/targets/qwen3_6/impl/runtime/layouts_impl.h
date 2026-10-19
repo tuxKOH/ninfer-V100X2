@@ -831,6 +831,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->ram_kv              = inputs.ram_kv;
     impl->kv_park_bytes       = inputs.kv_park_bytes;
     impl->boundary_history    = inputs.boundary_history;
+    impl->shared_prefix_save_path = inputs.shared_prefix_save_path;
+    impl->shared_prefix_load_path = inputs.shared_prefix_load_path;
+    impl->park_spill_dir      = inputs.park_spill_dir;
+    impl->park_spill_bytes    = inputs.park_spill_bytes;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -969,6 +973,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .ram_kv         = options.ram_kv,
         .kv_park_bytes  = options.kv_park_bytes,
         .boundary_history = options.boundary_history,
+        .shared_prefix_save_path = options.shared_prefix_save_path,
+        .shared_prefix_load_path = options.shared_prefix_load_path,
+        .park_spill_dir = options.park_spill_dir,
+        .park_spill_bytes = options.park_spill_bytes,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

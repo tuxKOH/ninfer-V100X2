@@ -612,6 +612,10 @@ curl http://127.0.0.1:8080/v1/models \
 | `--boundary-checkpoints` | capture reusable checkpoints at recent message boundaries, so a rewritten message resumes from the common prefix | off |
 | `--boundary-history N` | how many recent message boundaries to retain (`1..16`, implies `--boundary-checkpoints`) | `1` |
 | `--shared-prefix` | capture reusable checkpoints after the tool definitions and after the static leading system/tools block, so any session sharing that block restores the prefilled prefix | off |
+| `--shared-prefix-save PATH` | write the shared-prefix resume state (KV pages, recurrent slots, hidden) to PATH after it is captured | unset |
+| `--shared-prefix-load PATH` | load a saved shared prefix at startup; `PATH.tools` is loaded too when present | unset |
+| `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to DIR when the host parking budget is exhausted | unset |
+| `--kv-park-spill-bytes N` | disk budget for spilled conversations; `0` uses `--kv-park-bytes` | `0` |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -762,6 +766,22 @@ depth-3 rewrite-checkpoint ring and rides with a parked conversation. A boundary
 per-rank recurrent-state copy (about 150 MB per boundary on the 27B TP2 profile, released with
 the lane), so the depth is a memory/latency trade: eight boundaries cover roughly four turns of
 rewritten assistant messages.
+
+`--shared-prefix-save PATH` persists that work: after the tool anchor and the leading block are
+captured, their complete resume state -- KV pages for the prefix, every rank's recurrent slot and
+the hidden -- is written to `PATH.tools` and `PATH`. `--shared-prefix-load PATH` loads those files
+at startup as metadata-only disk entries, so the first request after a restart restores the block
+instead of prefilling it. A loaded or spilled entry keeps only its ledger, identity and checkpoint
+lineage in RAM; the payload is read back from disk when a request selects it.
+
+`--kv-park-spill-dir DIR` extends parking beyond host RAM: when a conversation must be parked and
+the `--kv-park-bytes` budget is full, the least-recently-used parked conversation is written to
+`DIR` (one file per conversation) and replaced by a metadata-only index entry, which the planner
+matches exactly like a resident one. `--kv-park-spill-bytes` bounds the directory (payloads plus
+the metadata kept in RAM); entries are removed least-recently-used first. A restored entry's file
+is deleted once its state is back on the device. Spill files belong to the running process: they
+are not reloaded after a restart, and a stale `park-*.img` can be deleted while the server is
+stopped. Choose a filesystem with room for the budget; a 175k-token conversation is roughly 7 GiB.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

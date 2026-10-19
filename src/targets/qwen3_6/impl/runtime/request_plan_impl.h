@@ -411,9 +411,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // entry of this conversation holds its whole history, and the longer resume wins. A tie keeps
     // the resident plan, which needs no host-to-device restore.
     const qwen3_6::detail::ParkedSequence* parked_entry = nullptr;
-    if (base.allow_prefix_reuse && prompt.identity.reusable && parked.enabled() &&
+    if (base.allow_prefix_reuse && prompt.identity.reusable &&
+        (parked.enabled() || !disk_entries.empty()) &&
         speculative_backend != SpeculativeBackend::DFlash) {
-        const qwen3_6::detail::ParkedSequence* exact_entry = parked.match(prompt);
+        const std::vector<const qwen3_6::detail::ParkedSequence*> candidates = parked_candidates();
+        const qwen3_6::detail::ParkedSequence* exact_entry =
+            qwen3_6::detail::match_parked_entries(candidates, prompt);
         // A replay that diverged inside the parked conversation's last response matches no
         // execution frontier, but it still contains a retained checkpoint's prefix. Both
         // frontiers are valid reuse points, so take the longer one: a checkpoint resume only
@@ -421,20 +424,38 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // parked tail hidden under MTP, and a checkpoint resume does not, so an entry whose tail
         // hidden was invalidated (a cancellation during a speculative round) is still useful.
         const std::optional<qwen3_6::detail::ParkedCheckpointMatch> checkpoint_match =
-            parked.match_checkpoint(prompt);
+            qwen3_6::detail::match_parked_checkpoints(candidates, prompt);
         // A restore materializes the image's pages into the request's own allocation, whose
         // entitlement is sized from this prompt and output budget. An image produced by an older
         // layout can exceed it; taking that entry would throw from attach_from_host inside the
         // worker's execution unit and fail the whole engine, so decline it here and let the
         // request prefill from its own prefix instead.
+        // A disk-backed entry keeps only page COUNTS in RAM; a materialized one has the images.
         const auto parked_images_fit = [&](const qwen3_6::detail::ParkedSequence& entry) {
-            for (const auto& image : entry.text) {
-                if (image != nullptr && image->pages() > plan->text_kv_page_entitlement) {
+            // A disk-backed entry is only usable while its file exists; a deleted or manually
+            // removed image must fall back to a normal prefill instead of failing at restore.
+            if (entry.disk_backed) {
+                std::error_code error;
+                if (!std::filesystem::exists(entry.disk_path, error) || error) { return false; }
+            }
+            const auto pages_at = [](const auto& images, const std::vector<std::uint32_t>& disk,
+                                     std::size_t rank) -> std::uint32_t {
+                if (rank < images.size() && images[rank] != nullptr) { return images[rank]->pages(); }
+                return rank < disk.size() ? disk[rank] : 0U;
+            };
+            const std::size_t ranks =
+                std::max(entry.text.size(), entry.text_pages.size());
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                if (pages_at(entry.text, entry.text_pages, rank) >
+                    plan->text_kv_page_entitlement) {
                     return false;
                 }
             }
-            for (const auto& image : entry.backend) {
-                if (image != nullptr && image->pages() > plan->backend_kv_page_entitlement) {
+            const std::size_t backend_ranks =
+                std::max(entry.backend.size(), entry.backend_pages.size());
+            for (std::size_t rank = 0; rank < backend_ranks; ++rank) {
+                if (pages_at(entry.backend, entry.backend_pages, rank) >
+                    plan->backend_kv_page_entitlement) {
                     return false;
                 }
             }

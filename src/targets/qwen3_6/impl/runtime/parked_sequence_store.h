@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -154,9 +155,58 @@ struct ParkedSequence {
     // The tool-definitions anchor, pinned the same way.
     HostCheckpoint tools_prefix;
 
+    // Payload location. A spilled or preloaded entry keeps only the matching metadata in RAM and
+    // streams its images back when a request selects it; `bytes` still reports the full payload.
+    bool disk_backed = false;
+    std::string disk_path;
+    std::vector<std::uint32_t> text_pages;
+    std::vector<std::uint32_t> backend_pages;
+    // Set for entries loaded from disk that must survive eviction (the shared prefix file).
+    bool pinned = false;
+
     std::size_t bytes       = 0;
     std::uint64_t last_used = 0;
 };
+
+// Heap bytes the matcher keeps when an entry is disk-backed. Budgeted with the payload so a pile
+// of small spilled conversations cannot grow host RAM without bound.
+inline std::size_t sequence_metadata_bytes(const ParkedSequence& entry) noexcept {
+    std::size_t bytes = entry.ledger.size() * sizeof(TokenId) + entry.prefix_identity.bytes();
+    const auto add = [&](const HostCheckpoint& checkpoint) {
+        bytes += checkpoint.ledger.size() * sizeof(TokenId) + checkpoint.identity.bytes();
+    };
+    if (entry.checkpoint_valid) {
+        bytes += entry.checkpoint_ledger.size() * sizeof(TokenId) + entry.checkpoint_identity.bytes();
+    }
+    for (const HostCheckpoint& checkpoint : entry.checkpoint_history) { add(checkpoint); }
+    for (const HostCheckpoint& checkpoint : entry.boundary_history) { add(checkpoint); }
+    add(entry.shared_prefix);
+    add(entry.tools_prefix);
+    return bytes;
+}
+
+// Drops the device payload copies from a metadata-only disk index entry, keeping everything the
+// matcher reads: frontiers, ledger, identity and the checkpoint lineage.
+inline void strip_sequence_payload(ParkedSequence& entry) {
+    entry.text.clear();
+    entry.backend.clear();
+    entry.linear_state.clear();
+    entry.tail_hidden.clear();
+    entry.checkpoint_state.clear();
+    entry.checkpoint_hidden.clear();
+    for (HostCheckpoint& checkpoint : entry.checkpoint_history) {
+        checkpoint.state.clear();
+        checkpoint.hidden.clear();
+    }
+    for (HostCheckpoint& checkpoint : entry.boundary_history) {
+        checkpoint.state.clear();
+        checkpoint.hidden.clear();
+    }
+    entry.shared_prefix.state.clear();
+    entry.shared_prefix.hidden.clear();
+    entry.tools_prefix.state.clear();
+    entry.tools_prefix.hidden.clear();
+}
 
 // Which pinned cross-conversation boundary a plan resumes: the end of the tool definitions or the
 // end of the whole static leading block. Both live outside the checkpoint ring.
@@ -207,6 +257,7 @@ public:
     // The most valuable parked entry whose resident prefix is a prefix of `prompt`: the largest
     // resident frontier wins, and a tie goes to the most recently used. Returns nullptr when the
     // store is empty or nothing matches. The pointer stays valid until the next insert or erase.
+    [[nodiscard]] std::vector<const ParkedSequence*> candidates() const;
     [[nodiscard]] const ParkedSequence* match(const PreparedPromptData& prompt) const;
 
     // The best rewrite-checkpoint boundary across every entry (current and historical). A
@@ -215,6 +266,10 @@ public:
     // the execution frontier, so an exact resume always wins at an equal frontier.
     [[nodiscard]] std::optional<ParkedCheckpointMatch>
     match_checkpoint(const PreparedPromptData& prompt) const;
+
+    // Disk spill support: the caller writes the removed entry out, then reinserts a metadata-only
+    // index entry (or drops it when the write fails).
+    std::unique_ptr<ParkedSequence> remove_least_recently_used();
 
     [[nodiscard]] const ParkedSequence* find_by_id(std::uint64_t id) const noexcept;
     // Non-const: a restore takes ownership of the entry's host payloads (they are moved into the
@@ -258,10 +313,14 @@ inline std::optional<std::uint64_t> ParkedSequenceStore::insert(
     return id;
 }
 
-inline const ParkedSequence* ParkedSequenceStore::match(const PreparedPromptData& prompt) const {
+// Matching is defined over an arbitrary collection of candidates so the resident store and the
+// disk-backed index (metadata-only entries) share one predicate. Each candidate must outlive the
+// call; the returned pointer names the entry the caller should restore.
+inline const ParkedSequence* match_parked_entries(std::span<const ParkedSequence* const> entries,
+                                                  const PreparedPromptData& prompt) {
     const ParkedSequence* best = nullptr;
-    for (const std::unique_ptr<ParkedSequence>& entry : entries_) {
-        if (entry->execution_frontier == 0) { continue; }
+    for (const ParkedSequence* entry : entries) {
+        if (entry == nullptr || entry->execution_frontier == 0) { continue; }
         if (!prefix_matches(prompt, entry->ledger, entry->prefix_identity,
                             entry->execution_frontier)) {
             continue;
@@ -269,14 +328,14 @@ inline const ParkedSequence* ParkedSequenceStore::match(const PreparedPromptData
         if (best == nullptr || entry->execution_frontier > best->execution_frontier ||
             (entry->execution_frontier == best->execution_frontier &&
              entry->last_used > best->last_used)) {
-            best = entry.get();
+            best = entry;
         }
     }
     return best;
 }
 
-inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoint(
-    const PreparedPromptData& prompt) const {
+inline std::optional<ParkedCheckpointMatch> match_parked_checkpoints(
+    std::span<const ParkedSequence* const> entries, const PreparedPromptData& prompt) {
     std::optional<ParkedCheckpointMatch> best;
     const auto consider = [&](const ParkedSequence& entry, std::uint32_t frontier,
                               std::uint32_t index, SharedPrefixSlot shared,
@@ -299,7 +358,8 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
         }
         best = ParkedCheckpointMatch{&entry, frontier, index, shared};
     };
-    for (const std::unique_ptr<ParkedSequence>& entry : entries_) {
+    for (const ParkedSequence* entry : entries) {
+        if (entry == nullptr) { continue; }
         // A checkpoint's own lineage decides whether it is valid for this prompt. Only legacy
         // entries without provenance fall back to the entry ledger.
         if (entry->checkpoint_valid) {
@@ -331,6 +391,39 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
     }
     return best;
 }
+
+inline std::vector<const ParkedSequence*> ParkedSequenceStore::candidates() const {
+    std::vector<const ParkedSequence*> pointers;
+    pointers.reserve(entries_.size());
+    for (const std::unique_ptr<ParkedSequence>& entry : entries_) { pointers.push_back(entry.get()); }
+    return pointers;
+}
+
+inline const ParkedSequence* ParkedSequenceStore::match(const PreparedPromptData& prompt) const {
+    const std::vector<const ParkedSequence*> entries = candidates();
+    return match_parked_entries(entries, prompt);
+}
+
+inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoint(
+    const PreparedPromptData& prompt) const {
+    const std::vector<const ParkedSequence*> entries = candidates();
+    return match_parked_checkpoints(entries, prompt);
+}
+
+// Removes and returns the least-recently-used entry so the caller can spill it to disk and index
+// it there. Returns nullptr when the store is empty. The caller owns the returned payload.
+inline std::unique_ptr<ParkedSequence> ParkedSequenceStore::remove_least_recently_used() {
+    if (entries_.empty()) { return nullptr; }
+    std::size_t oldest = 0;
+    for (std::size_t i = 1; i < entries_.size(); ++i) {
+        if (entries_[i]->last_used < entries_[oldest]->last_used) { oldest = i; }
+    }
+    std::unique_ptr<ParkedSequence> entry = std::move(entries_[oldest]);
+    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(oldest));
+    used_bytes_ -= entry->bytes;
+    return entry;
+}
+
 
 inline const ParkedSequence* ParkedSequenceStore::find_by_id(std::uint64_t id) const noexcept {
     for (const std::unique_ptr<ParkedSequence>& entry : entries_) {
