@@ -126,7 +126,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
            "[--vision-kv-swap] [--boundary-checkpoints [--boundary-history N]] "
-           "[--shared-prefix [--shared-prefix-save FILE] [--shared-prefix-load FILE]] "
+           "[--shared-prefix [--shared-prefix-save FILE] [--shared-prefix-load FILE] "
+           "[--shared-prefix-dir DIR]] "
            "[--kv-park-spill-dir DIR] [--kv-park-spill-bytes N] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -163,6 +164,7 @@ std::string serve_usage_text(const char* argv0) {
            "       client that rewrites an assistant message several turns back still resumes nearby\n"
            "       --shared-prefix-save FILE persists the shared-prefix resume state after capture;\n"
            "       --shared-prefix-load FILE restores it at startup instead of re-prefilling the block\n"
+           "       --shared-prefix-dir DIR keeps one image per distinct shared prefix and loads them all\n"
            "       --kv-park-spill-dir DIR spills the least-recently-used parked conversation to disk when\n"
            "       the host parking budget is exhausted; --kv-park-spill-bytes N bounds that directory\n"
            "       --kv-capacity auto leaves " +
@@ -393,6 +395,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.shared_prefix_load_path = require_value("--shared-prefix-load");
             if (options.shared_prefix_load_path.empty()) {
                 throw std::invalid_argument("--shared-prefix-load must not be empty");
+            }
+            options.shared_prefix_checkpoints = true;
+        } else if (arg == "--shared-prefix-dir") {
+            options.shared_prefix_dir = require_value("--shared-prefix-dir");
+            if (options.shared_prefix_dir.empty()) {
+                throw std::invalid_argument("--shared-prefix-dir must not be empty");
             }
             options.shared_prefix_checkpoints = true;
         } else if (arg == "--kv-park-spill-dir") {

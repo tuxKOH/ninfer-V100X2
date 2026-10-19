@@ -258,6 +258,48 @@ ResidentPrefixIdentity ResidentPrefixIdentity::load(std::istream& in) {
     return identity;
 }
 
+std::uint64_t ResidentPrefixIdentity::fingerprint(std::size_t count) const noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix     = [&](const void* data, std::size_t bytes) {
+        const auto* bytes_ptr = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            hash ^= bytes_ptr[i];
+            hash *= 1099511628211ULL;
+        }
+    };
+    count = std::min(count, token_types_.size());
+    mix(token_types_.data(), count);
+    for (const auto& axis : positions_) { mix(axis.data(), count * sizeof(std::int32_t)); }
+    for (const VisionItem& item : vision_items_) {
+        if (item.token_spans.empty() || item.token_spans.front().begin >= count) { continue; }
+        mix(&item.grid, sizeof(item.grid));
+        mix(&item.patch_begin, sizeof(item.patch_begin));
+        mix(&item.patch_count, sizeof(item.patch_count));
+        mix(item.content_digest.data(), item.content_digest.size());
+        mix(item.timestamps.data(), item.timestamps.size() * sizeof(double));
+        for (const TokenSpan& span : item.token_spans) {
+            mix(&span.begin, sizeof(span.begin));
+            mix(&span.count, sizeof(span.count));
+        }
+    }
+    return hash;
+}
+
+std::uint64_t prefix_fingerprint(std::span<const TokenId> tokens,
+                                 const ResidentPrefixIdentity& identity,
+                                 std::size_t count) noexcept {
+    const std::size_t length = std::min(count, tokens.size());
+    std::uint64_t hash       = 1469598103934665603ULL;
+    const auto* bytes        = reinterpret_cast<const std::uint8_t*>(tokens.data());
+    for (std::size_t i = 0; i < length * sizeof(TokenId); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= identity.fingerprint(length);
+    hash *= 1099511628211ULL;
+    return hash;
+}
+
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }

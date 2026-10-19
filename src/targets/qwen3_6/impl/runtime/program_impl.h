@@ -269,6 +269,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       boundary_history_depth(std::max(1U, plan.boundary_history)),
       shared_prefix_save_path(plan.shared_prefix_save_path),
       shared_prefix_load_path(plan.shared_prefix_load_path),
+      shared_prefix_dir(plan.shared_prefix_dir),
       park_spill_dir(plan.park_spill_dir),
       park_spill_bytes(plan.park_spill_bytes),
       speculative_backend(plan.speculative_backend),
@@ -515,6 +516,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     load_shared_prefix_entries();
+    load_parked_spill_entries();
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -754,6 +756,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             pinned = &sequence.tools_prefix;
         } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::Leading) {
             pinned = &sequence.shared_prefix;
+        } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::Response) {
+            for (HostCheckpoint& checkpoint : sequence.response_history) {
+                if (checkpoint.frontier == request_plan.reuse_base) { pinned = &checkpoint; break; }
+            }
+        } else if (request_plan.restore_shared_prefix == SharedPrefixSlot::LongRange) {
+            for (HostCheckpoint& checkpoint : sequence.long_range_history) {
+                if (checkpoint.frontier == request_plan.reuse_base) { pinned = &checkpoint; break; }
+            }
         } else {
             for (HostCheckpoint& boundary : sequence.boundary_history) {
                 if (boundary.frontier == request_plan.reuse_base) { pinned = &boundary; break; }
@@ -846,6 +856,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.ledger.clear();
             sequence.checkpoint_history.clear();
             sequence.boundary_history.clear();
+            sequence.response_history.clear();
+            sequence.long_range_history.clear();
             sequence.rewrite_checkpoint = {};
             sequence.checkpoint_ledger.clear();
             sequence.checkpoint_identity.clear();
@@ -972,6 +984,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.timings            = {};
         request.pending            = {};
         sequence.mtp_draft_count   = 0;
+        const bool checkpoint_hidden =
+            is_rewrite_checkpoint_restore(request_plan.reuse) ||
+            (request_plan.reuse == ReusePath::RestoreParkedKv && request_plan.parked_checkpoint);
+        const RequestControl::Prefill::ResumeHidden resumed_hidden =
+            checkpoint_hidden ? RequestControl::Prefill::ResumeHidden::Checkpoint
+            : sequence.tail_hidden_valid ? RequestControl::Prefill::ResumeHidden::Tail
+                                         : RequestControl::Prefill::ResumeHidden::None;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt);
@@ -1014,6 +1033,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .message_checkpoint_captures = request_plan.message_checkpoint_captures,
             .prefix_checkpoint_capture  = request_plan.prefix_checkpoint_capture,
             .tools_checkpoint_capture   = request_plan.tools_checkpoint_capture,
+            .resumed_hidden             = resumed_hidden,
             .base                       = base,
             .cursor                     = base,
             .prompt_tokens              = prompt_tokens,
@@ -1363,17 +1383,37 @@ bool ProgramImplCore::retain_cancelled_prefill_lane(std::uint32_t lane) noexcept
     const std::int32_t tail_column        = staged.tail_column;
     // A partially prefilled lane is continuable only from a chunk boundary: the KV, ledger and
     // recurrent state all describe exactly `cursor` tokens, and the last chunk left the hidden of
-    // token cursor-1 in prefill_hidden.
-    if (cursor == 0 || cursor >= prompt_tokens || tail_column < 0 ||
+    // token cursor-1 in prefill_hidden. The exception is a prefill cancelled before its first
+    // chunk: nothing is staged, but the state this request resumed from (a parked restore, an
+    // append frontier or a checkpoint) is intact and its hidden is authoritative. Refusing that
+    // case drops a conversation whose parked entry was already consumed, and the retry then
+    // re-prefills everything. An exact hit (cursor == prompt) is valid too: the lane simply had
+    // nothing to prefill.
+    const bool unstarted = cursor == staged.base &&
+                           staged.resumed_hidden != RequestControl::Prefill::ResumeHidden::None;
+    if (cursor == 0 || cursor > prompt_tokens || (!unstarted && tail_column < 0) ||
         sequence.text_kv_valid != cursor) {
-        reuse_trace("retain_prefill lane=%u CLEAR cursor=%u prompt=%u tail_col=%d text_kv=%u",
-                    lane, cursor, prompt_tokens, tail_column, sequence.text_kv_valid);
+        reuse_trace("retain_prefill lane=%u CLEAR cursor=%u prompt=%u tail_col=%d text_kv=%u "
+                    "base=%u unstarted=%d",
+                    lane, cursor, prompt_tokens, tail_column, sequence.text_kv_valid, staged.base,
+                    unstarted ? 1 : 0);
         return false;
     }
     try {
         // The MTP bridge of the resumed request consumes the hidden of token cursor-1, exactly as
-        // an appended lane's bridge consumes its retained tail hidden.
-        copy_tail(sequence, prefill_hidden.slice(1, tail_column, 1));
+        // an appended lane's bridge consumes its retained tail hidden. An unstarted prefill has no
+        // chunk hidden; the restored tail hidden already is the state at cursor-1.
+        if (!unstarted) {
+            copy_tail(sequence, prefill_hidden.slice(1, tail_column, 1));
+        } else if (staged.resumed_hidden == RequestControl::Prefill::ResumeHidden::Checkpoint) {
+            // A checkpoint restore keeps the boundary hidden in the checkpoint tensor; the
+            // retained lane's bridge consumes the tail.
+            copy_tail(sequence, sequence.rewrite_checkpoint_hidden);
+        } else {
+            // An append or an exact parked restore left the authoritative hidden in the tail; it
+            // was only un-flagged for the suffix prefill that never started.
+            sequence.tail_hidden_valid = true;
+        }
         sequence.ledger.resize(cursor);
         // A cursor that divides one Vision item's consumer span would leave media state no later
         // request can resume from; truncate() throws and the lane is cleared by the caller.
@@ -1440,6 +1480,22 @@ std::vector<const ParkedSequence*> ProgramImplCore::parked_candidates() const {
     return pointers;
 }
 
+void ProgramImplCore::storage_pools(std::vector<PagedKVPool*>& text,
+                                    std::vector<PagedKVPool*>& backend) const {
+    text.clear();
+    backend.clear();
+    text.push_back(const_cast<PagedKVPool*>(&decoder->text_kv.pool()));
+    if (backend_kv_cache() != nullptr) {
+        backend.push_back(const_cast<PagedKVPool*>(&backend_kv_cache()->pool()));
+    }
+    for (auto& peer : peers) {
+        text.push_back(const_cast<PagedKVPool*>(&peer->decoder->text_kv.pool()));
+        if (peer->decoder->mtp_cache() != nullptr) {
+            backend.push_back(const_cast<PagedKVPool*>(&peer->decoder->mtp_cache()->pool()));
+        }
+    }
+}
+
 SequenceImageGeometry ProgramImplCore::image_geometry() const {
     SequenceImageGeometry geometry;
     geometry.rank_count  = static_cast<std::size_t>(device_count);
@@ -1464,19 +1520,72 @@ SequenceImageGeometry ProgramImplCore::image_geometry() const {
     return geometry;
 }
 
+namespace {
+constexpr std::size_t kSharedPrefixDirFiles = 24;
+std::string prefix_key_hex(std::uint64_t value) {
+    char buffer[17];
+    std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(value));
+    return buffer;
+}
+} // namespace
+
 void ProgramImplCore::load_shared_prefix_entries() {
-    if (shared_prefix_load_path.empty()) { return; }
     const SequenceImageGeometry geometry = image_geometry();
-    PagedKVPool* backend_pool =
-        backend_kv_cache() != nullptr ? &backend_kv_cache()->pool() : nullptr;
+    std::vector<PagedKVPool*> text_pools;
+    std::vector<PagedKVPool*> backend_pools;
+    storage_pools(text_pools, backend_pools);
+
+    if (!shared_prefix_dir.empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(shared_prefix_dir, error);
+        for (const std::filesystem::directory_entry& file :
+             std::filesystem::directory_iterator(shared_prefix_dir, error)) {
+            if (error || !file.is_regular_file()) { continue; }
+            const std::string name = file.path().filename().string();
+            if (name.rfind("sp-", 0) != 0 || name.size() < 4 ||
+                name.compare(name.size() - 4, 4, ".img") != 0) {
+                continue;
+            }
+            try {
+                std::vector<std::unique_ptr<ParkedSequence>> entries = read_sequence_images(
+                    file.path().string(), geometry, text_pools, backend_pools);
+                for (std::unique_ptr<ParkedSequence>& entry : entries) {
+                    for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
+                        entry->text_pages.push_back(image->pages());
+                    }
+                    for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
+                        entry->backend_pages.push_back(image->pages());
+                    }
+                    saved_prefix_keys.insert(
+                        {entry->execution_frontier,
+                         prefix_fingerprint(entry->ledger, entry->prefix_identity,
+                                            entry->execution_frontier)});
+                    entry->disk_backed = true;
+                    entry->disk_path   = file.path().string();
+                    entry->pinned      = true;
+                    entry->id          = kDiskEntryIdBase + next_disk_entry++;
+                    strip_sequence_payload(*entry);
+                    disk_entries.push_back(std::move(entry));
+                }
+                reuse_trace("disk_prefix_load path=%s entries=%zu", file.path().c_str(),
+                            entries.size());
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[reuse] disk_prefix_load FAILED path=%s: %s\n",
+                             file.path().c_str(), error.what());
+            }
+        }
+        if (!disk_entries.empty()) { enforce_prefix_dir_cap(); }
+        return;
+    }
+    if (shared_prefix_load_path.empty()) { return; }
     const std::vector<std::string> paths{shared_prefix_load_path,
                                          shared_prefix_load_path + ".tools"};
     for (const std::string& path : paths) {
         std::error_code error;
         if (!std::filesystem::exists(path, error) || error) { continue; }
         try {
-            std::vector<std::unique_ptr<ParkedSequence>> entries = read_sequence_images(
-                path, geometry, &decoder->text_kv.pool(), backend_pool);
+            std::vector<std::unique_ptr<ParkedSequence>> entries =
+                read_sequence_images(path, geometry, text_pools, backend_pools);
             for (std::unique_ptr<ParkedSequence>& entry : entries) {
                 for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
                     entry->text_pages.push_back(image->pages());
@@ -1499,10 +1608,288 @@ void ProgramImplCore::load_shared_prefix_entries() {
     }
 }
 
+void ProgramImplCore::persist_state() {
+    if (park_spill_dir.empty()) {
+        reuse_trace("shutdown_persist skipped: no spill directory");
+        return;
+    }
+    // Park every retained lane first; a lane whose store has room lands in RAM and is written by
+    // the drain below, while a full store spills it directly.
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (sequences[lane].retained) { (void)park_retained_lane(lane); }
+    }
+    // Flush the RAM tier to disk so nothing dies with the process.
+    std::size_t written = 0;
+    std::size_t failed  = 0;
+    while (std::unique_ptr<ParkedSequence> entry = parked.remove_least_recently_used()) {
+        if (spill_entry(std::move(entry)) == nullptr) {
+            ++written;
+        } else {
+            ++failed;
+        }
+    }
+    reuse_trace("shutdown_persist entries=%zu failed=%zu disk_bytes=%llu", written, failed,
+                static_cast<unsigned long long>(disk_spilled_bytes));
+}
+
+void ProgramImplCore::remove_sequence_files(const std::string& image_path) noexcept {
+    std::error_code error;
+    std::filesystem::remove(image_path, error);
+    std::filesystem::remove(image_path + ".meta", error);
+}
+
+void ProgramImplCore::load_parked_spill_entries() {
+    if (park_spill_dir.empty()) { return; }
+    const SequenceImageGeometry geometry = image_geometry();
+    std::uint64_t newest     = 0;
+    std::uint64_t max_suffix = 0;
+    // Spill file names carry a numeric suffix from the shared entry counter. Track the largest
+    // existing suffix so a new spill can never overwrite a file this index points at (a restart
+    // can load a sparse set of names, making the counter smaller than an existing file's).
+    const auto note_suffix = [&](const std::string& name) {
+        if (name.rfind("park-", 0) != 0) { return; }
+        const std::string digits = name.substr(5, name.find('.') - 5);
+        if (digits.empty()) { return; }
+        try {
+            max_suffix = std::max<std::uint64_t>(max_suffix, std::stoull(digits));
+        } catch (const std::exception&) {}
+    };
+    {
+        std::error_code iteration_error;
+        for (const std::filesystem::directory_entry& file :
+             std::filesystem::directory_iterator(park_spill_dir, iteration_error)) {
+            if (iteration_error) { break; }
+            if (file.is_regular_file()) { note_suffix(file.path().filename().string()); }
+        }
+    }
+    std::error_code error;
+    for (const std::filesystem::directory_entry& file :
+         std::filesystem::directory_iterator(park_spill_dir, error)) {
+        if (error || !file.is_regular_file()) { continue; }
+        const std::string name = file.path().filename().string();
+        if (name.rfind("park-", 0) != 0 || name.size() < 9 ||
+            name.compare(name.size() - 5, 5, ".meta") != 0) {
+            continue;
+        }
+        const std::string meta_path = file.path().string();
+        const std::string img_path  = meta_path.substr(0, meta_path.size() - 5);
+        std::error_code exists_error;
+        if (!std::filesystem::exists(img_path, exists_error) || exists_error) {
+            // The image is gone; the sidecar is stale.
+            std::error_code remove_error;
+            std::filesystem::remove(meta_path, remove_error);
+            continue;
+        }
+        try {
+            std::unique_ptr<ParkedSequence> entry = read_sequence_metadata(meta_path, geometry);
+            entry->disk_backed = true;
+            entry->disk_path   = img_path;
+            entry->pinned      = false;
+            entry->id          = kDiskEntryIdBase + next_disk_entry++;
+            std::error_code stamp_error;
+            const auto stamp   = std::filesystem::last_write_time(img_path, stamp_error);
+            entry->last_used   = stamp_error ? 0
+                                       : static_cast<std::uint64_t>(
+                                             std::chrono::duration_cast<std::chrono::seconds>(
+                                                 stamp.time_since_epoch())
+                                                 .count());
+            newest = std::max(newest, entry->last_used);
+            disk_spilled_bytes += entry->bytes + sequence_metadata_bytes(*entry);
+            disk_entries.push_back(std::move(entry));
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "[reuse] park_load_skip path=%s: %s\n", img_path.c_str(),
+                         failure.what());
+        }
+    }
+    // Images written before sidecars existed: read each once, persist its sidecar, and keep only
+    // the metadata. This is sequential (one image resident at a time) and happens only for files
+    // without a sidecar, so later restarts index them without touching the payloads.
+    std::vector<std::string> legacy;
+    {
+        std::error_code iteration_error;
+        for (const std::filesystem::directory_entry& file :
+             std::filesystem::directory_iterator(park_spill_dir, iteration_error)) {
+            if (iteration_error) { break; }
+            if (!file.is_regular_file()) { continue; }
+            const std::string name = file.path().filename().string();
+            if (name.rfind("park-", 0) != 0 || name.size() < 4 ||
+                name.compare(name.size() - 4, 4, ".img") != 0) {
+                continue;
+            }
+            const std::string image_path = file.path().string();
+            std::error_code meta_error;
+            if (!std::filesystem::exists(image_path + ".meta", meta_error) || meta_error) {
+                legacy.push_back(image_path);
+            }
+        }
+    }
+    std::vector<PagedKVPool*> text_pools;
+    std::vector<PagedKVPool*> backend_pools;
+    storage_pools(text_pools, backend_pools);
+    for (const std::string& image_path : legacy) {
+        try {
+            std::unique_ptr<ParkedSequence> entry = read_sequence_image(
+                image_path, geometry, text_pools, backend_pools);
+            for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
+                entry->text_pages.push_back(image->pages());
+            }
+            for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
+                entry->backend_pages.push_back(image->pages());
+            }
+            write_sequence_metadata(*entry, entry->bytes, geometry, image_path + ".meta");
+            entry->disk_backed = true;
+            entry->disk_path   = image_path;
+            entry->pinned      = false;
+            entry->id          = kDiskEntryIdBase + next_disk_entry++;
+            std::error_code stamp_error;
+            const auto stamp   = std::filesystem::last_write_time(image_path, stamp_error);
+            entry->last_used   = stamp_error ? 0
+                                       : static_cast<std::uint64_t>(
+                                             std::chrono::duration_cast<std::chrono::seconds>(
+                                                 stamp.time_since_epoch())
+                                                 .count());
+            newest = std::max(newest, entry->last_used);
+            disk_spilled_bytes += entry->bytes + sequence_metadata_bytes(*entry);
+            strip_sequence_payload(*entry);
+            disk_entries.push_back(std::move(entry));
+            reuse_trace("park_migrate path=%s", image_path.c_str());
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "[reuse] park_migrate_skip path=%s: %s\n", image_path.c_str(),
+                         failure.what());
+        }
+    }
+    // Advance the clocks even when nothing was indexed, so a new spill can never overwrite a
+    // file that failed to load or match (its name suffix still counts).
+    if (park_clock <= newest) { park_clock = newest + 1; }
+    if (next_disk_entry <= max_suffix) { next_disk_entry = max_suffix + 1; }
+    if (disk_entries.empty()) { return; }
+    // One current copy per lineage, newest first: stale duplicates from earlier runs are removed.
+    // Pruning erases from disk_entries, so work from an ID snapshot and re-resolve each entry
+    // instead of holding pointers into the vector.
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> spilled;
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        if (!entry->pinned) { spilled.push_back({entry->execution_frontier, entry->id}); }
+    }
+    std::sort(spilled.begin(), spilled.end());
+    for (const auto& [frontier, id] : spilled) {
+        for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+            if (entry->id == id) {
+                prune_superseded_disk(*entry, id);
+                break;
+            }
+        }
+    }
+    enforce_disk_budget();
+    reuse_trace("park_load entries=%zu disk_bytes=%llu", disk_entries.size(),
+                static_cast<unsigned long long>(disk_spilled_bytes));
+}
+
+void ProgramImplCore::enforce_prefix_dir_cap() {
+    if (shared_prefix_dir.empty()) { return; }
+    struct Item {
+        std::filesystem::path path;
+        std::filesystem::file_time_type time;
+    };
+    std::error_code error;
+    std::vector<Item> files;
+    for (const std::filesystem::directory_entry& file :
+         std::filesystem::directory_iterator(shared_prefix_dir, error)) {
+        if (error || !file.is_regular_file()) { continue; }
+        const std::string name = file.path().filename().string();
+        if (name.rfind("sp-", 0) != 0 || name.size() < 4 ||
+            name.compare(name.size() - 4, 4, ".img") != 0) {
+            continue;
+        }
+        files.push_back(Item{file.path(), file.last_write_time(error)});
+    }
+    if (files.size() <= kSharedPrefixDirFiles) { return; }
+    std::sort(files.begin(), files.end(), [](const Item& a, const Item& b) { return a.time < b.time; });
+    const std::size_t remove_count = files.size() - kSharedPrefixDirFiles;
+    for (std::size_t i = 0; i < remove_count; ++i) {
+        const std::string removed = files[i].path.string();
+        std::filesystem::remove(files[i].path, error);
+        for (auto it = disk_entries.begin(); it != disk_entries.end();) {
+            if ((*it)->pinned && (*it)->disk_path == removed) {
+                it = disk_entries.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        reuse_trace("prefix_dir_evict path=%s", removed.c_str());
+    }
+    // Rebuild the key set from the surviving entries so an evicted prefix can be saved again.
+    saved_prefix_keys.clear();
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        if (entry->pinned) {
+            saved_prefix_keys.insert(
+                {entry->execution_frontier,
+                 prefix_fingerprint(entry->ledger, entry->prefix_identity,
+                                    entry->execution_frontier)});
+        }
+    }
+}
+
+void ProgramImplCore::pin_response_checkpoint(SequenceState& sequence) {
+    if (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0) {
+        return;
+    }
+    const std::uint32_t frontier = sequence.rewrite_checkpoint.frontier;
+    // Skip only when this exact lineage is already pinned. A checkpoint from another branch at
+    // the same frontier is not a substitute: selection validates the checkpoint's own lineage, so
+    // keeping the stale one would make the pin useless. push_pinned_boundary replaces it.
+    for (const HostCheckpoint& checkpoint : sequence.response_history) {
+        if (checkpoint.frontier != frontier || checkpoint.ledger.size() < frontier ||
+            sequence.checkpoint_ledger.size() < frontier ||
+            checkpoint.identity.size() < frontier) {
+            continue;
+        }
+        const bool same_tokens = std::equal(sequence.checkpoint_ledger.begin(),
+                                            sequence.checkpoint_ledger.begin() + frontier,
+                                            checkpoint.ledger.begin());
+        if (same_tokens &&
+            checkpoint.identity.same_prefix(sequence.checkpoint_identity, frontier)) {
+            return;
+        }
+    }
+    try {
+        // The ladder takes a copy of the same state every kLongRangeSpacing tokens; the dense
+        // response list takes the export itself.
+        const bool ladder =
+            sequence.long_range_history.empty() ||
+            frontier >= sequence.long_range_history.front().frontier + kLongRangeSpacing;
+        HostCheckpoint checkpoint = export_checkpoint(sequence);
+        if (ladder) {
+            push_pinned_boundary(sequence.long_range_history, checkpoint, kLongRangeDepth);
+        }
+        push_pinned_boundary(sequence.response_history, std::move(checkpoint),
+                             kResponseHistoryDepth);
+        reuse_trace("pin_response lane=%u frontier=%u depth=%zu ladder=%zu", sequence.lane,
+                    frontier, sequence.response_history.size(),
+                    sequence.long_range_history.size());
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[reuse] pin_response FAILED: %s\n", error.what());
+    }
+}
+
 void ProgramImplCore::write_shared_prefix(SequenceState& sequence,
                                           const HostCheckpoint& pinned, bool tools) {
-    if (shared_prefix_save_path.empty()) { return; }
-    if (tools ? saved_tools_prefix : saved_leading_prefix) { return; }
+    const bool dir_mode = !shared_prefix_dir.empty();
+    if (!dir_mode && shared_prefix_save_path.empty()) { return; }
+    if (!dir_mode && (tools ? saved_tools_prefix : saved_leading_prefix)) { return; }
+    // Directory mode keeps every distinct prefix: the key is the frontier plus a content
+    // fingerprint of the lineage up to it, so a changed system prompt persists as a new entry
+    // instead of being dropped.
+    std::pair<std::uint32_t, std::uint64_t> key{0, 0};
+    std::string path;
+    if (dir_mode) {
+        key = {pinned.frontier,
+               prefix_fingerprint(sequence.ledger, sequence.prefix_identity, pinned.frontier)};
+        if (saved_prefix_keys.count(key) != 0) { return; }
+        path = (std::filesystem::path(shared_prefix_dir) /
+                ("sp-" + std::string(tools ? "tools" : "lead") + "-" +
+                 std::to_string(pinned.frontier) + "-" + prefix_key_hex(key.second) + ".img"))
+                   .string();
+    }
     try {
         ParkedSequence entry;
         const std::uint32_t frontier = pinned.frontier;
@@ -1562,13 +1949,73 @@ void ProgramImplCore::write_shared_prefix(SequenceState& sequence,
         bytes += entry.shared_prefix.bytes + entry.tools_prefix.bytes;
         entry.bytes = bytes;
 
-        const std::string path = tools ? shared_prefix_save_path + ".tools"
-                                       : shared_prefix_save_path;
+        if (!dir_mode) {
+            path = tools ? shared_prefix_save_path + ".tools" : shared_prefix_save_path;
+        }
         write_sequence_image(entry, path);
-        (tools ? saved_tools_prefix : saved_leading_prefix) = true;
+        if (dir_mode) {
+            saved_prefix_keys.insert(key);
+            enforce_prefix_dir_cap();
+        } else {
+            (tools ? saved_tools_prefix : saved_leading_prefix) = true;
+        }
         reuse_trace("disk_prefix_save path=%s frontier=%u bytes=%zu", path.c_str(), frontier, bytes);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[reuse] disk_prefix_save FAILED: %s\n", error.what());
+    }
+}
+
+bool ProgramImplCore::supersedes(const ParkedSequence& older,
+                                 const ParkedSequence& incoming) noexcept {
+    const std::uint32_t frontier = older.execution_frontier;
+    if (frontier == 0 || frontier > incoming.execution_frontier ||
+        older.ledger.size() < frontier || incoming.ledger.size() < frontier) {
+        return false;
+    }
+    return std::equal(older.ledger.begin(),
+                      older.ledger.begin() + static_cast<std::ptrdiff_t>(frontier),
+                      incoming.ledger.begin()) &&
+           older.prefix_identity.same_prefix(incoming.prefix_identity, frontier);
+}
+
+std::uint64_t ProgramImplCore::superseded_ram_bytes(const ParkedSequence& incoming,
+                                                    std::uint64_t protect_id) const {
+    std::uint64_t bytes = 0;
+    for (const ParkedSequence* entry : parked.candidates()) {
+        if (entry->id != protect_id && !entry->pinned && supersedes(*entry, incoming)) {
+            bytes += entry->bytes;
+        }
+    }
+    return bytes;
+}
+
+void ProgramImplCore::prune_superseded_ram(const ParkedSequence& incoming,
+                                           std::uint64_t protect_id) {
+    std::vector<std::uint64_t> victims;
+    for (const ParkedSequence* entry : parked.candidates()) {
+        if (entry->id != protect_id && !entry->pinned && supersedes(*entry, incoming)) {
+            victims.push_back(entry->id);
+        }
+    }
+    for (const std::uint64_t id : victims) {
+        reuse_trace("parked_supersede ram id=%llu", static_cast<unsigned long long>(id));
+        parked.erase(id);
+    }
+}
+
+void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
+                                            std::uint64_t protect_id) {
+    for (auto it = disk_entries.begin(); it != disk_entries.end();) {
+        if ((*it)->id != protect_id && !(*it)->pinned && supersedes(**it, incoming)) {
+            const std::size_t bytes = (*it)->bytes + sequence_metadata_bytes(**it);
+            reuse_trace("parked_supersede disk id=%llu bytes=%zu",
+                        static_cast<unsigned long long>((*it)->id), bytes);
+            remove_sequence_files((*it)->disk_path);
+            disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
+            it = disk_entries.erase(it);
+            continue;
+        }
+        ++it;
     }
 }
 
@@ -1582,12 +2029,21 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         const std::filesystem::path path =
             std::filesystem::path(park_spill_dir) /
             ("park-" + std::to_string(next_disk_entry) + ".img");
-        write_sequence_image(*entry, path.string());
+        // Page counts are part of the sidecar (the planner checks them against the request's
+        // entitlement before restoring), so record them before writing it.
         for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
             entry->text_pages.push_back(image->pages());
         }
         for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
             entry->backend_pages.push_back(image->pages());
+        }
+        write_sequence_image(*entry, path.string());
+        try {
+            write_sequence_metadata(*entry, entry->bytes, image_geometry(),
+                                    path.string() + ".meta");
+        } catch (...) {
+            remove_sequence_files(path.string());
+            throw;
         }
         entry->disk_backed = true;
         entry->disk_path   = path.string();
@@ -1599,6 +2055,8 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         strip_sequence_payload(*entry);
         disk_entries.push_back(std::move(entry));
         disk_spilled_bytes += charged;
+        reuse_trace("park_spill path=%s entries=%zu bytes=%llu", path.c_str(), disk_entries.size(),
+                    static_cast<unsigned long long>(disk_spilled_bytes));
         enforce_disk_budget();
         return nullptr;
     } catch (const std::exception& error) {
@@ -1624,8 +2082,10 @@ void ProgramImplCore::enforce_disk_budget() {
             }
         }
         if (oldest == disk_entries.size()) { break; }
-        std::error_code error;
-        std::filesystem::remove(disk_entries[oldest]->disk_path, error);
+        reuse_trace("park_spill_evict path=%s bytes=%zu entries=%zu",
+                    disk_entries[oldest]->disk_path.c_str(), disk_entries[oldest]->bytes,
+                    disk_entries.size());
+        remove_sequence_files(disk_entries[oldest]->disk_path);
         disk_spilled_bytes -= disk_entries[oldest]->bytes +
                               sequence_metadata_bytes(*disk_entries[oldest]);
         disk_entries.erase(disk_entries.begin() + static_cast<std::ptrdiff_t>(oldest));
@@ -1635,12 +2095,12 @@ void ProgramImplCore::enforce_disk_budget() {
 void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
                                          std::uint32_t text_pages, std::uint32_t backend_pages,
                                          const RequestPlanImpl& plan) {
-    PagedKVPool* backend_pool =
-        backend_kv_cache() != nullptr ? &backend_kv_cache()->pool() : nullptr;
+    std::vector<PagedKVPool*> text_pools;
+    std::vector<PagedKVPool*> backend_pools;
+    storage_pools(text_pools, backend_pools);
     std::unique_ptr<ParkedSequence> loaded;
     try {
-        loaded = read_sequence_image(meta.disk_path, image_geometry(),
-                                     &decoder->text_kv.pool(), backend_pool);
+        loaded = read_sequence_image(meta.disk_path, image_geometry(), text_pools, backend_pools);
     } catch (...) {
         // Drop a poison index entry so later requests are planned against the remaining state
         // instead of failing on the same file again.
@@ -1649,8 +2109,7 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
         const std::size_t bytes =
             meta.bytes + (meta.pinned ? 0 : sequence_metadata_bytes(meta));
         if (!meta.pinned) {
-            std::error_code error;
-            std::filesystem::remove(path, error);
+            remove_sequence_files(path);
             disk_spilled_bytes -=
                 std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
             for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
@@ -1669,8 +2128,7 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
         const std::uint64_t id   = meta.id;
         const std::string path   = meta.disk_path;
         const std::size_t bytes = meta.bytes + sequence_metadata_bytes(meta);
-        std::error_code error;
-        std::filesystem::remove(path, error);
+        remove_sequence_files(path);
         disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
         for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
             if ((*it)->id == id) {
@@ -1734,6 +2192,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         }
         for (const HostCheckpoint& host : sequence.checkpoint_history) { planned += host.bytes; }
         for (const HostCheckpoint& boundary : sequence.boundary_history) { planned += boundary.bytes; }
+        for (const HostCheckpoint& response : sequence.response_history) { planned += response.bytes; }
+        for (const HostCheckpoint& checkpoint : sequence.long_range_history) { planned += checkpoint.bytes; }
         planned += sequence.shared_prefix.bytes + sequence.tools_prefix.bytes;
         if (sequence.kv->backend) { planned += sequence.kv->backend->mapped_payload_bytes(); }
         for (auto& peer : peers) {
@@ -1744,9 +2204,12 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                 planned += sequence.kv->backend_peers[peer->rank - 1]->mapped_payload_bytes();
             }
         }
-        reuse_trace("park lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu", lane,
-                    sequence.execution_frontier, planned, parked.budget_bytes(),
-                    planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size());
+        reuse_trace("park lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu "
+                    "ram_used=%zu ram_entries=%zu disk_entries=%zu disk_bytes=%llu",
+                    lane, sequence.execution_frontier, planned, parked.budget_bytes(),
+                    planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size(),
+                    parked.used_bytes(), parked.entry_count(), disk_entries.size(),
+                    static_cast<unsigned long long>(disk_spilled_bytes));
         if (!spill_enabled && planned > parked.budget_bytes()) { return false; }
 
         auto entry                = std::make_unique<ParkedSequence>();
@@ -1768,6 +2231,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         }
         entry->checkpoint_history = sequence.checkpoint_history;
         entry->boundary_history   = sequence.boundary_history;
+        entry->response_history   = sequence.response_history;
+        entry->long_range_history = sequence.long_range_history;
         entry->shared_prefix      = sequence.shared_prefix;
         entry->tools_prefix       = sequence.tools_prefix;
 
@@ -1842,13 +2307,28 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                  entry->checkpoint_identity.bytes();
         for (const HostCheckpoint& host : entry->checkpoint_history) { bytes += host.bytes; }
         for (const HostCheckpoint& boundary : entry->boundary_history) { bytes += boundary.bytes; }
+        for (const HostCheckpoint& response : entry->response_history) { bytes += response.bytes; }
+        for (const HostCheckpoint& checkpoint : entry->long_range_history) { bytes += checkpoint.bytes; }
         bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
         entry->bytes = bytes;
 
-        // RAM first: make room by spilling the least-recently-used parked conversations, then
-        // insert. `insert` destroys its argument when it refuses, so the space check is made
-        // before the call.
+        // A lightweight copy of the matching metadata, so superseded entries can be pruned after
+        // `entry` is moved into a store. Older states of this lineage are strictly contained in
+        // this one; keeping them would let one conversation consume the whole budget.
+        ParkedSequence probe;
+        probe.execution_frontier = entry->execution_frontier;
+        probe.ledger             = entry->ledger;
+        probe.prefix_identity    = entry->prefix_identity;
+
+        // RAM first: drop superseded copies when that arithmetic guarantees the insert, make
+        // room by spilling the least-recently-used conversations, then insert. `insert` destroys
+        // its argument when it refuses, so the space check is made before the call.
         if (parked.enabled() && entry->bytes <= parked.budget_bytes()) {
+            const std::uint64_t reclaim = superseded_ram_bytes(probe, protect_id);
+            const std::uint64_t used    = parked.used_bytes();
+            if (used - std::min(used, reclaim) + entry->bytes <= parked.budget_bytes()) {
+                prune_superseded_ram(probe, protect_id);
+            }
             if (spill_enabled) {
                 while (parked.used_bytes() + entry->bytes > parked.budget_bytes()) {
                     std::unique_ptr<ParkedSequence> victim = parked.remove_least_recently_used();
@@ -1864,13 +2344,16 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
             }
             if (parked.used_bytes() + entry->bytes <= parked.budget_bytes() &&
                 parked.insert(std::move(entry), park_clock++, protect_id).has_value()) {
+                prune_superseded_disk(probe, protect_id);
                 clear_lane(sequence, requests[lane]);
                 return true;
             }
         }
         // The conversation is too large for the RAM tier (or the tier is disabled): keep it on
-        // disk when a spill directory is configured.
+        // disk when a spill directory is configured. Disk copies are pruned only after the new
+        // state is safely stored, so a failed write cannot lose the conversation.
         if (spill_enabled && spill_entry(std::move(entry)) == nullptr) {
+            prune_superseded_disk(probe, protect_id);
             clear_lane(sequence, requests[lane]);
             return true;
         }
@@ -1910,6 +2393,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.checkpoint_identity.clear();
     sequence.checkpoint_history.clear();
     sequence.boundary_history.clear();
+    sequence.response_history.clear();
+    sequence.long_range_history.clear();
     sequence.shared_prefix           = {};
     sequence.tools_prefix            = {};
     request.pending                  = {};
@@ -2387,6 +2872,14 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
             pinned = &entry.tools_prefix;
         } else if (resume_at_shared_prefix == SharedPrefixSlot::Leading) {
             pinned = &entry.shared_prefix;
+        } else if (resume_at_shared_prefix == SharedPrefixSlot::Response) {
+            for (const HostCheckpoint& checkpoint : entry.response_history) {
+                if (checkpoint.frontier == resume_frontier) { pinned = &checkpoint; break; }
+            }
+        } else if (resume_at_shared_prefix == SharedPrefixSlot::LongRange) {
+            for (const HostCheckpoint& checkpoint : entry.long_range_history) {
+                if (checkpoint.frontier == resume_frontier) { pinned = &checkpoint; break; }
+            }
         } else {
             for (const HostCheckpoint& boundary : entry.boundary_history) {
                 if (boundary.frontier == resume_frontier) { pinned = &boundary; break; }
@@ -2469,6 +2962,8 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         // The entry owns the history; the lane takes it over (the entry is erased afterwards).
         sequence.checkpoint_history = std::move(entry.checkpoint_history);
         sequence.boundary_history   = std::move(entry.boundary_history);
+        sequence.response_history   = std::move(entry.response_history);
+        sequence.long_range_history = std::move(entry.long_range_history);
         sequence.shared_prefix      = std::move(entry.shared_prefix);
         sequence.tools_prefix       = std::move(entry.tools_prefix);
         if (resume_at_checkpoint) {
@@ -2494,6 +2989,20 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                     selected_ptr = &sequence.tools_prefix;
                 } else if (resume_at_shared_prefix == SharedPrefixSlot::Leading) {
                     selected_ptr = &sequence.shared_prefix;
+                } else if (resume_at_shared_prefix == SharedPrefixSlot::Response) {
+                    for (HostCheckpoint& checkpoint : sequence.response_history) {
+                        if (checkpoint.frontier == resume_frontier) {
+                            selected_ptr = &checkpoint;
+                            break;
+                        }
+                    }
+                } else if (resume_at_shared_prefix == SharedPrefixSlot::LongRange) {
+                    for (HostCheckpoint& checkpoint : sequence.long_range_history) {
+                        if (checkpoint.frontier == resume_frontier) {
+                            selected_ptr = &checkpoint;
+                            break;
+                        }
+                    }
                 } else {
                     for (HostCheckpoint& boundary : sequence.boundary_history) {
                         if (boundary.frontier == resume_frontier) {
@@ -3881,6 +4390,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             // already includes the freshly sampled token; selection only reads [0, frontier).
             sequence.checkpoint_ledger   = sequence.ledger;
             sequence.checkpoint_identity = sequence.prefix_identity;
+            // Pin the response boundary now, at capture. Pinning it later (at the next
+            // request's start) can evict the entry that request's plan already selected, which
+            // leaves the plan pointing at a checkpoint that no longer exists.
+            pin_response_checkpoint(sequence);
         }
 
         staged.prompt.release_all_media_payloads();

@@ -201,7 +201,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--shared-prefix` | retain reusable checkpoints after the tool definitions and after the static leading system/tools block | off |
 | `--shared-prefix-save PATH` | persist the shared-prefix resume state to `PATH` (`PATH.tools` for the tool anchor) after capture | unset |
 | `--shared-prefix-load PATH` | load a saved shared prefix at startup (`PATH.tools` too when present) | unset |
-| `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to disk when the host parking budget is full | unset |
+| `--shared-prefix-dir DIR` | persist one image per distinct shared prefix and load the whole directory at startup (capped at 24 images) | unset |
+| `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to disk; the directory is reloaded at startup (metadata sidecars) | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations (`0` = `--kv-park-bytes`) | `0` |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

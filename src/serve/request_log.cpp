@@ -516,6 +516,7 @@ std::string format_server_start_json(
           {"shared_prefix_checkpoints", options.shared_prefix_checkpoints},
           {"shared_prefix_save_path", options.shared_prefix_save_path},
           {"shared_prefix_load_path", options.shared_prefix_load_path},
+          {"shared_prefix_dir", options.shared_prefix_dir},
           {"kv_park_spill_dir", options.park_spill_dir},
           {"kv_park_spill_bytes", options.park_spill_bytes},
           {"cuda_graph", options.use_cuda_graph},

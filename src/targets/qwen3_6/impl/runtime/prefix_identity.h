@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <istream>
 #include <ostream>
+#include <span>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -37,6 +38,10 @@ public:
     // Approximate heap size of the metadata, for host budget accounting.
     [[nodiscard]] std::size_t bytes() const noexcept;
 
+    // Stable content hash of the first `count` identity entries, used to deduplicate persisted
+    // shared prefixes. Not cryptographic; a 64-bit FNV-1a over the compact representation.
+    [[nodiscard]] std::uint64_t fingerprint(std::size_t count) const noexcept;
+
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
@@ -47,5 +52,12 @@ private:
                                   const std::vector<TokenId>& resident_tokens,
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
+
+// Content key for a persisted prefix: the identity fields together with the token IDs they were
+// assigned from. Two prompts of equal length but different tokens (different system prompts of
+// the same size) must not share a key.
+[[nodiscard]] std::uint64_t prefix_fingerprint(std::span<const TokenId> tokens,
+                                               const ResidentPrefixIdentity& identity,
+                                               std::size_t count) noexcept;
 
 } // namespace ninfer::targets::qwen3_6::detail

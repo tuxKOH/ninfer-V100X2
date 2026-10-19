@@ -380,6 +380,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 for (const HostCheckpoint& boundary : sequence.boundary_history) {
                     consider_shared(boundary, SharedPrefixSlot::Message);
                 }
+                for (const HostCheckpoint& response : sequence.response_history) {
+                    consider_shared(response, SharedPrefixSlot::Response);
+                }
+                for (const HostCheckpoint& checkpoint : sequence.long_range_history) {
+                    consider_shared(checkpoint, SharedPrefixSlot::LongRange);
+                }
             }
             // DFlash keeps its checkpoint state in its own context, so the host history (which
             // mirrors only the recurrent slot and hidden) cannot restore it.
@@ -486,9 +492,36 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             candidate          = exact_entry;
             candidate_frontier = exact_entry->execution_frontier;
         }
-        // Only take the parked state when it beats what the resident lane already offers.
+        // Only take the parked state when it beats what the resident lane already offers by
+        // enough to pay for the host-to-device restore and the incumbent's parking. A parked
+        // entry can match at the shared leading block (or a warmup boundary) while sharing
+        // almost nothing else; restoring it then costs a multi-gigabyte copy to save a few
+        // hundred tokens of prefill.
+        constexpr std::uint32_t kMinimumParkedReuseTokens = 2048;
+        constexpr std::uint32_t kMinimumParkedReuseGain   = 1024;
         const std::uint32_t resident_base = plan->reuse_base;
-        if (candidate != nullptr && candidate_frontier > resident_base) {
+        const bool worth_restoring =
+            candidate != nullptr && candidate_frontier > resident_base &&
+            candidate_frontier >= kMinimumParkedReuseTokens &&
+            candidate_frontier >= resident_base + kMinimumParkedReuseGain;
+        if (!worth_restoring && candidate != nullptr) {
+            reuse_trace("parked declined frontier=%u resident=%u", candidate_frontier,
+                        resident_base);
+        }
+        if (worth_restoring) {
+            // Mark the target most-recently-used at plan time: an admission-time eviction of
+            // another lane (or disk-budget enforcement) between planning and start_prefill must
+            // not take the entry this plan already names.
+            if (is_disk_entry_id(candidate->id)) {
+                for (std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+                    if (entry->id == candidate->id) {
+                        entry->last_used = park_clock++;
+                        break;
+                    }
+                }
+            } else {
+                parked.touch(candidate->id, park_clock++);
+            }
             parked_entry                = candidate;
             plan->reuse                 = ReusePath::RestoreParkedKv;
             plan->reuse_base            = candidate_frontier;
@@ -586,6 +619,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 // assistant message a few turns back resumes at the last boundary before it.
                 for (const HostCheckpoint& boundary : sequence.boundary_history) {
                     consider_shared(boundary, SharedPrefixSlot::Message);
+                }
+                for (const HostCheckpoint& response : sequence.response_history) {
+                    consider_shared(response, SharedPrefixSlot::Response);
+                }
+                for (const HostCheckpoint& checkpoint : sequence.long_range_history) {
+                    consider_shared(checkpoint, SharedPrefixSlot::LongRange);
                 }
             }
             for (std::size_t i = 0; i < sequence.checkpoint_history.size(); ++i) {

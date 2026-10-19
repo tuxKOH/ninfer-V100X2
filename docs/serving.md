@@ -614,6 +614,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--shared-prefix` | capture reusable checkpoints after the tool definitions and after the static leading system/tools block, so any session sharing that block restores the prefilled prefix | off |
 | `--shared-prefix-save PATH` | write the shared-prefix resume state (KV pages, recurrent slots, hidden) to PATH after it is captured | unset |
 | `--shared-prefix-load PATH` | load a saved shared prefix at startup; `PATH.tools` is loaded too when present | unset |
+| `--shared-prefix-dir DIR` | persist one image per distinct shared prefix (different system prompts/tool sets) and load every image in the directory at startup | unset |
 | `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to DIR when the host parking budget is exhausted | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations; `0` uses `--kv-park-bytes` | `0` |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
@@ -755,6 +756,12 @@ active slot, serving an unrelated conversation can replace the retained entry; i
 cache of every conversation. Only the current resident frontier and a saved complete turn/response
 checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
 
+The Server also pins the last few response (assistant-header) checkpoints outside the ring. A
+client re-renders the assistant message it just received -- tool-call JSON and thinking text do
+not always round-trip byte for byte -- so a tool turn's continuation diverges at that message's
+header. Message-boundary captures would evict the response checkpoint from the depth-3 ring
+within a turn, which is why it is pinned separately.
+
 With `--boundary-checkpoints`, the Server retains checkpoints at recent message boundaries.
 Clients rewrite history between requests: Claude Code injects ephemeral `<system-reminder>` user
 messages and drops them on the next turn, and an interrupted tool call is removed together with
@@ -766,6 +773,13 @@ depth-3 rewrite-checkpoint ring and rides with a parked conversation. A boundary
 per-rank recurrent-state copy (about 150 MB per boundary on the 27B TP2 profile, released with
 the lane), so the depth is a memory/latency trade: eight boundaries cover roughly four turns of
 rewritten assistant messages.
+
+`--shared-prefix-dir DIR` keeps *every distinct* shared prefix instead of one: each captured
+leading block or tool anchor is keyed by its frontier and a content fingerprint of its lineage, so
+a changed system text persists as a separate image rather than replacing the previous one. Every
+`sp-*.img` in the directory is loaded at startup as a metadata-only entry. The directory is capped
+at 24 images (oldest removed first, about 12 GiB at the 27B TP2 profile), so several agent
+variants can be pre-warmed without unbounded growth.
 
 `--shared-prefix-save PATH` persists that work: after the tool anchor and the leading block are
 captured, their complete resume state -- KV pages for the prefix, every rank's recurrent slot and
@@ -779,9 +793,13 @@ the `--kv-park-bytes` budget is full, the least-recently-used parked conversatio
 `DIR` (one file per conversation) and replaced by a metadata-only index entry, which the planner
 matches exactly like a resident one. `--kv-park-spill-bytes` bounds the directory (payloads plus
 the metadata kept in RAM); entries are removed least-recently-used first. A restored entry's file
-is deleted once its state is back on the device. Spill files belong to the running process: they
-are not reloaded after a restart, and a stale `park-*.img` can be deleted while the server is
-stopped. Choose a filesystem with room for the budget; a 175k-token conversation is roughly 7 GiB.
+is deleted once its state is back on the device. Spilled conversations persist across restarts:
+each image has a small `park-*.img.meta` sidecar holding the matching metadata, and startup
+indexes every sidecar without reading the payloads. Images whose metadata does not match the
+loaded model (different rank count, KV slot/hidden sizes or plane geometry) are skipped with a log
+line, and duplicate states of one lineage are reduced to the newest copy. Choose a filesystem with
+room for the budget; a 175k-token conversation is roughly 7 GiB. Files can be deleted while the
+server is stopped; the sidecar and image are removed together.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

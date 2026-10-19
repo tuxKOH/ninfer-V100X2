@@ -191,6 +191,10 @@ struct EngineOptions {
     // after it is captured, and reload it at startup so a restart does not re-prefill the block.
     std::string shared_prefix_save_path;
     std::string shared_prefix_load_path;
+    // Directory holding one image per distinct shared prefix (leading block and tool anchor).
+    // Unlike the single-file paths, every distinct prefix captured by this process is kept, and
+    // every file in the directory is loaded at startup.
+    std::string shared_prefix_dir;
     // Spill parked conversations to this directory when the host parking budget is exhausted.
     // An empty path disables the disk tier; `park_spill_bytes` bounds it (0 = same as
     // kv_park_bytes).

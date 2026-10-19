@@ -177,6 +177,9 @@ public:
     [[nodiscard]] bool retain_cancelled_prefill_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Persists the resident lanes and every RAM-parked conversation to the spill directory (when
+    // one is configured), so a restart can resume them. Called by the executor on shutdown.
+    void persist_state();
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

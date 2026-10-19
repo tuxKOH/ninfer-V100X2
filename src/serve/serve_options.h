@@ -74,6 +74,7 @@ struct ServeOptions {
     bool shared_prefix_checkpoints = false;
     std::string shared_prefix_save_path;
     std::string shared_prefix_load_path;
+    std::string shared_prefix_dir;
     std::string park_spill_dir;
     std::uint64_t park_spill_bytes = 0;
     bool use_cuda_graph     = true;

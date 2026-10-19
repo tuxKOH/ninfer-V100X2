@@ -1269,6 +1269,11 @@ private:
                 }
                 if (stopping_) {
                     lock.unlock();
+                    if (!failed_) {
+                        // Graceful shutdown: keep retained conversations (and the resident lane)
+                        // in the spill directory so the next process can resume them.
+                        try { instance_.program->persist_state(); } catch (...) {}
+                    }
                     fail_all(std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down")));
                     return;

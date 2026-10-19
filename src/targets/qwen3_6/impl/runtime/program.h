@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <array>
 #include <memory>
@@ -221,6 +222,13 @@ struct SequenceState {
     // tool_result), and each boundary before such a message is a resume point the depth-3 ring
     // would have evicted.
     std::vector<HostCheckpoint> boundary_history;
+    // Recent response (assistant-header) checkpoints, newest first, pinned outside the ring. A
+    // client re-renders the assistant message it received, so a tool turn diverges at that
+    // message's header; only a response checkpoint resumes there.
+    std::vector<HostCheckpoint> response_history;
+    // Sparse long-range checkpoints, newest first, so a client snapshot lagging many turns behind
+    // still resumes within about kLongRangeSpacing tokens.
+    std::vector<HostCheckpoint> long_range_history;
     // The shared leading-block boundary, pinned outside the ring: it is identical across agent
     // sessions, so it must survive ring rotation to stay usable by a later conversation.
     HostCheckpoint shared_prefix;
@@ -255,6 +263,10 @@ struct RequestControl {
         bool prefix_checkpoint_captured  = false;
         std::optional<RewriteCheckpointSpec> tools_checkpoint_capture;
         bool tools_checkpoint_captured   = false;
+        // Where the resumed state's hidden at base-1 lives, captured before start_prefill clears
+        // tail_hidden_valid for a suffix. Retention uses it when nothing has been staged yet.
+        enum class ResumeHidden : std::uint8_t { None, Tail, Checkpoint };
+        ResumeHidden resumed_hidden = ResumeHidden::None;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -343,6 +355,8 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    // Shutdown dump: parks retained lanes and writes every RAM-parked conversation to disk.
+    void persist_state();
     // A cancelled decode stops at a resolved round boundary, so its lane holds exactly the state
     // a completed turn leaves behind. Keeps that state for the conversation's next request when
     // it is decode-ready; otherwise clears the lane like abort_lane.
@@ -461,6 +475,9 @@ public:
     // Paths and budget for the disk tier; see EngineOptions.
     const std::string shared_prefix_save_path;
     const std::string shared_prefix_load_path;
+    const std::string shared_prefix_dir;
+    // (frontier, identity fingerprint) pairs already persisted in the directory.
+    std::set<std::pair<std::uint32_t, std::uint64_t>> saved_prefix_keys;
     const std::string park_spill_dir;
     const std::uint64_t park_spill_bytes;
     bool saved_tools_prefix    = false;
@@ -609,15 +626,37 @@ private:
     // the lane's current one, so the existing checkpoint-restore path can re-prefill the suffix.
     // Disk tier.
     [[nodiscard]] SequenceImageGeometry image_geometry() const;
+    // Per-rank KV pools, in rank order (rank 0 first). Each rank owns a distinct pool object and
+    // a restored image must be bound to the pool it will attach to.
+    void storage_pools(std::vector<PagedKVPool*>& text,
+                       std::vector<PagedKVPool*>& backend) const;
     [[nodiscard]] std::vector<const ParkedSequence*> parked_candidates() const;
     [[nodiscard]] const ParkedSequence* find_disk_entry(std::uint64_t id) const noexcept;
     static bool is_disk_entry_id(std::uint64_t id) noexcept;
     void load_shared_prefix_entries();
+    // Reloads conversations spilled by an earlier process from their metadata sidecars.
+    void load_parked_spill_entries();
+    static void remove_sequence_files(const std::string& image_path) noexcept;
+    // Keeps the shared-prefix directory bounded: removes the oldest images and their disk index
+    // entries when more than kSharedPrefixDirFiles are present.
+    void enforce_prefix_dir_cap();
+    // Pins the response checkpoint just captured at this request's prompt end. Called at the
+    // capture site so a later request's plan can never select an entry that a subsequent pin
+    // evicts before the restore runs.
+    void pin_response_checkpoint(SequenceState& sequence);
     void write_shared_prefix(SequenceState& sequence, const HostCheckpoint& pinned, bool tools);
     // Writes an entry to the spill directory and replaces it with a metadata-only index entry.
     // Returns nullptr on success; on failure it returns the still-intact entry so the caller can
     // reinsert or drop it deliberately.
     std::unique_ptr<ParkedSequence> spill_entry(std::unique_ptr<ParkedSequence> entry);
+    // Drops older parked states that the incoming lineage strictly contains (same tokens,
+    // positions and media up to a shorter frontier). One current copy per conversation; the
+    // plan's protected target and pinned entries are never removed.
+    static bool supersedes(const ParkedSequence& older, const ParkedSequence& incoming) noexcept;
+    std::uint64_t superseded_ram_bytes(const ParkedSequence& incoming,
+                                       std::uint64_t protect_id) const;
+    void prune_superseded_ram(const ParkedSequence& incoming, std::uint64_t protect_id);
+    void prune_superseded_disk(const ParkedSequence& incoming, std::uint64_t protect_id);
     void enforce_disk_budget();
     void restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
                             std::uint32_t text_pages, std::uint32_t backend_pages,

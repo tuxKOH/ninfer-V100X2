@@ -27,7 +27,7 @@
 namespace ninfer::targets::qwen3_6::detail {
 
 inline constexpr std::uint32_t kSequenceImageMagic   = 0x3147514eU;  // 'NQG1'
-inline constexpr std::uint32_t kSequenceImageVersion = 1U;
+inline constexpr std::uint32_t kSequenceImageVersion = 3U;  // v3 adds long-range checkpoints
 
 // Per-rank geometry the image must match. Values come from the live decoder state, so a file
 // written by a different model, quantization, TP width or page layout is refused.
@@ -192,6 +192,8 @@ inline void write_entry(std::ostream& out, const ParkedSequence& entry) {
         };
         write_history(entry.checkpoint_history);
         write_history(entry.boundary_history);
+        write_history(entry.response_history);
+        write_history(entry.long_range_history);
         write_optional_checkpoint(out, entry.shared_prefix);
         write_optional_checkpoint(out, entry.tools_prefix);
 }
@@ -240,8 +242,9 @@ namespace sequence_image_io_detail {
 
 inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
                                                   const SequenceImageGeometry& geometry,
-                                                  PagedKVPool* text_pool,
-                                                  PagedKVPool* backend_pool) {
+                                                  std::span<PagedKVPool* const> text_pools,
+                                                  std::span<PagedKVPool* const> backend_pools,
+                                                  std::uint32_t version) {
     using namespace image_stream;
     auto entry                = std::make_unique<ParkedSequence>();
     entry->execution_frontier = get_scalar<std::uint32_t>(in);
@@ -280,10 +283,14 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
     read_rank_blobs(entry->linear_state, geometry.slot_bytes, geometry.rank_count, "state");
     read_rank_blobs(entry->tail_hidden, geometry.hidden_bytes, 1, "tail hidden");
 
-    const auto read_images = [&](std::vector<std::unique_ptr<PagedKVImage>>& images,
-                                 std::size_t expected_count, PagedKVPool* pool,
-                                 std::size_t planes, std::uint32_t capacity,
-                                 const std::vector<std::size_t>& plane_bytes, const char* what) {
+    // Each TP rank owns a distinct pool object, and attach_from_host rejects an image built for
+    // another pool even when the geometry matches, so every rank is bound to its own pool.
+    const auto read_images_ranked = [&](std::vector<std::unique_ptr<PagedKVImage>>& images,
+                                        std::size_t expected_count,
+                                        std::span<PagedKVPool* const> pools, std::size_t planes,
+                                        std::uint32_t capacity,
+                                        const std::vector<std::size_t>& plane_bytes,
+                                        const char* what) {
         const std::size_t count = get_size(in, 64);
         if (count != expected_count) {
             throw std::runtime_error(std::string("sequence image ") + what +
@@ -291,16 +298,18 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
         }
         images.reserve(count);
         for (std::size_t rank = 0; rank < count; ++rank) {
-            images.push_back(sequence_image_io_detail::read_image(in, pool, planes, capacity,
-                                                                  plane_bytes));
+            PagedKVPool* pool = rank < pools.size() ? pools[rank] : nullptr;
+            images.push_back(
+                read_image(in, pool, planes, capacity, plane_bytes));
         }
     };
-    read_images(entry->text, geometry.rank_count, text_pool, geometry.text_plane_count,
-                geometry.text_page_capacity, geometry.text_plane_page_bytes, "text KV");
+    read_images_ranked(entry->text, geometry.rank_count, text_pools,
+                       geometry.text_plane_count, geometry.text_page_capacity,
+                       geometry.text_plane_page_bytes, "text KV");
     const bool has_backend = geometry.backend_plane_count != 0;
-    read_images(entry->backend, has_backend ? geometry.rank_count : 0, backend_pool,
-                geometry.backend_plane_count, geometry.backend_page_capacity,
-                geometry.backend_plane_page_bytes, "backend KV");
+    read_images_ranked(entry->backend, has_backend ? geometry.rank_count : 0, backend_pools,
+                       geometry.backend_plane_count, geometry.backend_page_capacity,
+                       geometry.backend_plane_page_bytes, "backend KV");
 
     entry->checkpoint_valid = get_scalar<std::uint8_t>(in) != 0;
     if (entry->checkpoint_valid) {
@@ -321,6 +330,10 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
     };
     read_history(entry->checkpoint_history);
     read_history(entry->boundary_history);
+    // v1 predates pinned response checkpoints; v2 predates the long-range ladder. Reading an older
+    // image keeps a cache written by a previous build usable instead of discarding it.
+    if (version >= 2) { read_history(entry->response_history); }
+    if (version >= 3) { read_history(entry->long_range_history); }
     const auto read_optional = [&](HostCheckpoint& target) {
         if (get_scalar<std::uint8_t>(in) != 0) {
             target = read_checkpoint(in, geometry);
@@ -339,6 +352,8 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
     bytes += entry->checkpoint_ledger.size() * sizeof(TokenId) + entry->checkpoint_identity.bytes();
     for (const HostCheckpoint& checkpoint : entry->checkpoint_history) { bytes += checkpoint.bytes; }
     for (const HostCheckpoint& checkpoint : entry->boundary_history) { bytes += checkpoint.bytes; }
+    for (const HostCheckpoint& checkpoint : entry->response_history) { bytes += checkpoint.bytes; }
+    for (const HostCheckpoint& checkpoint : entry->long_range_history) { bytes += checkpoint.bytes; }
     bytes += entry->shared_prefix.bytes + entry->tools_prefix.bytes;
     entry->bytes = bytes;
     return entry;
@@ -347,23 +362,24 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
 } // namespace sequence_image_io_detail
 
 inline std::vector<std::unique_ptr<ParkedSequence>> read_sequence_images(
-    const std::string& path, const SequenceImageGeometry& geometry, PagedKVPool* text_pool,
-    PagedKVPool* backend_pool) {
+    const std::string& path, const SequenceImageGeometry& geometry,
+    std::span<PagedKVPool* const> text_pools, std::span<PagedKVPool* const> backend_pools) {
     using namespace image_stream;
     std::ifstream in(path, std::ios::binary);
     if (!in) { throw std::runtime_error("cannot open sequence image: " + path); }
     if (get_scalar<std::uint32_t>(in) != kSequenceImageMagic) {
         throw std::runtime_error("not a sequence image: " + path);
     }
-    if (get_scalar<std::uint32_t>(in) != kSequenceImageVersion) {
+    const std::uint32_t version = get_scalar<std::uint32_t>(in);
+    if (version == 0 || version > kSequenceImageVersion) {
         throw std::runtime_error("unsupported sequence image version: " + path);
     }
     const std::size_t count = get_size(in, 64);
     std::vector<std::unique_ptr<ParkedSequence>> entries;
     entries.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
-        entries.push_back(
-            sequence_image_io_detail::read_entry(in, geometry, text_pool, backend_pool));
+        entries.push_back(sequence_image_io_detail::read_entry(in, geometry, text_pools,
+                                                               backend_pools, version));
     }
     if (in.peek() != std::char_traits<char>::eof()) {
         throw std::runtime_error("sequence image has trailing data: " + path);
@@ -371,12 +387,191 @@ inline std::vector<std::unique_ptr<ParkedSequence>> read_sequence_images(
     return entries;
 }
 
-inline std::unique_ptr<ParkedSequence> read_sequence_image(const std::string& path,
-                                                           const SequenceImageGeometry& geometry,
-                                                           PagedKVPool* text_pool,
-                                                           PagedKVPool* backend_pool) {
+// --- Metadata sidecar -------------------------------------------------------------------------
+// A spilled conversation's image holds gigabytes of payload; startup only needs the matching
+// fields. A small `<image>.meta` sidecar carries them so a restart can index every spill without
+// reading the payloads. Written after the image, removed with it.
+
+inline constexpr std::uint32_t kSequenceMetaMagic   = 0x314d514eU;  // 'NQM1'
+inline constexpr std::uint32_t kSequenceMetaVersion = 1U;
+
+namespace sequence_image_io_detail {
+
+inline void write_meta_checkpoint(std::ostream& out, const HostCheckpoint& checkpoint) {
+    using namespace image_stream;
+    put_scalar<std::uint8_t>(out, static_cast<std::uint8_t>(checkpoint.kind));
+    put_scalar<std::uint32_t>(out, checkpoint.frontier);
+    put_vector<std::int32_t>(out, checkpoint.ledger);
+    checkpoint.identity.save(out);
+}
+
+inline void read_meta_checkpoint(std::istream& in, HostCheckpoint& checkpoint) {
+    using namespace image_stream;
+    constexpr std::size_t kMaximumTokens = 1U << 20;
+    checkpoint.kind     = static_cast<RewriteCheckpointKind>(get_scalar<std::uint8_t>(in));
+    checkpoint.frontier = get_scalar<std::uint32_t>(in);
+    checkpoint.ledger   = get_vector<TokenId>(in, kMaximumTokens);
+    checkpoint.identity = ResidentPrefixIdentity::load(in);
+}
+
+inline void write_meta_history(std::ostream& out, const std::vector<HostCheckpoint>& history) {
+    using namespace image_stream;
+    put_size(out, history.size());
+    for (const HostCheckpoint& checkpoint : history) { write_meta_checkpoint(out, checkpoint); }
+}
+
+inline void read_meta_history(std::istream& in, std::vector<HostCheckpoint>& history) {
+    using namespace image_stream;
+    const std::size_t count = get_size(in, 64);
+    history.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        HostCheckpoint checkpoint;
+        read_meta_checkpoint(in, checkpoint);
+        history.push_back(std::move(checkpoint));
+    }
+}
+
+} // namespace sequence_image_io_detail
+
+inline void write_sequence_metadata(const ParkedSequence& entry, std::size_t payload_bytes,
+                                    const SequenceImageGeometry& geometry,
+                                    const std::string& path) {
+    using namespace image_stream;
+    const std::filesystem::path target(path);
+    const std::filesystem::path temporary = target.string() + ".tmp";
+    {
+        std::error_code directory_error;
+        if (!target.parent_path().empty()) {
+            std::filesystem::create_directories(target.parent_path(), directory_error);
+        }
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) { throw std::runtime_error("cannot open sequence metadata for writing: " + path); }
+        put_scalar<std::uint32_t>(out, kSequenceMetaMagic);
+        put_scalar<std::uint32_t>(out, kSequenceMetaVersion);
+        // Geometry is validated at startup so an artifact from another model/layout is skipped
+        // instead of failing a restore later.
+        put_size(out, geometry.rank_count);
+        put_size(out, geometry.slot_bytes);
+        put_size(out, geometry.hidden_bytes);
+        put_size(out, geometry.text_plane_count);
+        put_size(out, geometry.backend_plane_count);
+        put_scalar<std::uint32_t>(out, entry.execution_frontier);
+        put_scalar<std::uint32_t>(out, entry.ledger_frontier);
+        put_scalar<std::uint32_t>(out, entry.mtp_kv_valid);
+        put_scalar<std::int32_t>(out, entry.rope_delta);
+        put_scalar<std::uint8_t>(out, entry.tail_hidden_valid ? 1U : 0U);
+        put_scalar<std::uint32_t>(out, entry.mtp_draft_count);
+        for (const TokenId draft : entry.mtp_drafts) { put_scalar<std::int32_t>(out, draft); }
+        put_vector<std::int32_t>(out, entry.ledger);
+        entry.prefix_identity.save(out);
+        put_vector<std::uint32_t>(out, entry.text_pages);
+        put_vector<std::uint32_t>(out, entry.backend_pages);
+        put_size(out, payload_bytes);
+        put_scalar<std::uint8_t>(out, entry.checkpoint_valid ? 1U : 0U);
+        if (entry.checkpoint_valid) {
+            HostCheckpoint current;
+            current.kind     = entry.checkpoint_kind;
+            current.frontier = entry.checkpoint_frontier;
+            current.ledger   = entry.checkpoint_ledger;
+            current.identity = entry.checkpoint_identity;
+            sequence_image_io_detail::write_meta_checkpoint(out, current);
+        }
+        sequence_image_io_detail::write_meta_history(out, entry.checkpoint_history);
+        sequence_image_io_detail::write_meta_history(out, entry.boundary_history);
+        sequence_image_io_detail::write_meta_history(out, entry.response_history);
+        sequence_image_io_detail::write_meta_history(out, entry.long_range_history);
+        put_scalar<std::uint8_t>(out, entry.shared_prefix.frontier != 0 ? 1U : 0U);
+        if (entry.shared_prefix.frontier != 0) {
+            sequence_image_io_detail::write_meta_checkpoint(out, entry.shared_prefix);
+        }
+        put_scalar<std::uint8_t>(out, entry.tools_prefix.frontier != 0 ? 1U : 0U);
+        if (entry.tools_prefix.frontier != 0) {
+            sequence_image_io_detail::write_meta_checkpoint(out, entry.tools_prefix);
+        }
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("sequence metadata write failed: " + path);
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, target, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+        throw std::runtime_error("cannot publish sequence metadata: " + path);
+    }
+}
+
+inline std::unique_ptr<ParkedSequence> read_sequence_metadata(
+    const std::string& path, const SequenceImageGeometry& geometry) {
+    using namespace image_stream;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { throw std::runtime_error("cannot open sequence metadata: " + path); }
+    if (get_scalar<std::uint32_t>(in) != kSequenceMetaMagic) {
+        throw std::runtime_error("not sequence metadata: " + path);
+    }
+    if (get_scalar<std::uint32_t>(in) != kSequenceMetaVersion) {
+        throw std::runtime_error("unsupported sequence metadata version: " + path);
+    }
+    constexpr std::size_t kMaximumSize = std::numeric_limits<std::size_t>::max();
+    if (get_size(in, kMaximumSize) != geometry.rank_count ||
+        get_size(in, kMaximumSize) != geometry.slot_bytes ||
+        get_size(in, kMaximumSize) != geometry.hidden_bytes ||
+        get_size(in, kMaximumSize) != geometry.text_plane_count ||
+        get_size(in, kMaximumSize) != geometry.backend_plane_count) {
+        throw std::runtime_error("sequence metadata geometry does not match the engine: " + path);
+    }
+    auto entry                = std::make_unique<ParkedSequence>();
+    entry->execution_frontier = get_scalar<std::uint32_t>(in);
+    entry->ledger_frontier    = get_scalar<std::uint32_t>(in);
+    entry->mtp_kv_valid       = get_scalar<std::uint32_t>(in);
+    entry->rope_delta         = get_scalar<std::int32_t>(in);
+    entry->tail_hidden_valid  = get_scalar<std::uint8_t>(in) != 0;
+    entry->mtp_draft_count    = get_scalar<std::uint32_t>(in);
+    if (entry->mtp_draft_count > entry->mtp_drafts.size()) {
+        throw std::runtime_error("sequence metadata draft count is out of range");
+    }
+    for (TokenId& draft : entry->mtp_drafts) { draft = get_scalar<std::int32_t>(in); }
+    entry->ledger          = get_vector<TokenId>(in, 1U << 20);
+    entry->prefix_identity = ResidentPrefixIdentity::load(in);
+    entry->text_pages      = get_vector<std::uint32_t>(in, 64);
+    entry->backend_pages   = get_vector<std::uint32_t>(in, 64);
+    if (entry->text_pages.size() != geometry.rank_count ||
+        (geometry.backend_plane_count != 0 &&
+         entry->backend_pages.size() != geometry.rank_count) ||
+        (geometry.backend_plane_count == 0 && !entry->backend_pages.empty())) {
+        throw std::runtime_error("sequence metadata page counts do not match the engine: " + path);
+    }
+    entry->bytes           = get_size(in, std::numeric_limits<std::size_t>::max());
+    entry->checkpoint_valid = get_scalar<std::uint8_t>(in) != 0;
+    if (entry->checkpoint_valid) {
+        HostCheckpoint current;
+        sequence_image_io_detail::read_meta_checkpoint(in, current);
+        entry->checkpoint_kind     = current.kind;
+        entry->checkpoint_frontier = current.frontier;
+        entry->checkpoint_ledger   = std::move(current.ledger);
+        entry->checkpoint_identity = std::move(current.identity);
+    }
+    sequence_image_io_detail::read_meta_history(in, entry->checkpoint_history);
+    sequence_image_io_detail::read_meta_history(in, entry->boundary_history);
+    sequence_image_io_detail::read_meta_history(in, entry->response_history);
+    sequence_image_io_detail::read_meta_history(in, entry->long_range_history);
+    if (get_scalar<std::uint8_t>(in) != 0) {
+        sequence_image_io_detail::read_meta_checkpoint(in, entry->shared_prefix);
+    }
+    if (get_scalar<std::uint8_t>(in) != 0) {
+        sequence_image_io_detail::read_meta_checkpoint(in, entry->tools_prefix);
+    }
+    if (in.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("sequence metadata has trailing data: " + path);
+    }
+    return entry;
+}
+
+inline std::unique_ptr<ParkedSequence> read_sequence_image(
+    const std::string& path, const SequenceImageGeometry& geometry,
+    std::span<PagedKVPool* const> text_pools, std::span<PagedKVPool* const> backend_pools) {
     std::vector<std::unique_ptr<ParkedSequence>> entries =
-        read_sequence_images(path, geometry, text_pool, backend_pool);
+        read_sequence_images(path, geometry, text_pools, backend_pools);
     if (entries.size() != 1) {
         throw std::runtime_error("sequence image does not hold exactly one entry: " + path);
     }

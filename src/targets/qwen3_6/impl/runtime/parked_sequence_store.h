@@ -35,6 +35,19 @@ inline constexpr std::size_t kCheckpointHistoryDepth = 3;
 // this is a memory/latency trade: eight boundaries cover several turns of client rewrites.
 inline constexpr std::size_t kBoundaryHistoryDepth = 8;
 
+// How many recent response (assistant-header) checkpoints are pinned. A client re-renders the
+// assistant message it just received -- tool-call argument JSON and thinking text do not always
+// round-trip -- so a tool turn's continuation diverges at that message's header. That header is a
+// response checkpoint, not a message boundary, and boundary captures would evict it from the
+// depth-3 ring within a turn.
+inline constexpr std::size_t kResponseHistoryDepth = 3;
+
+// Sparse long-range checkpoints, one per kLongRangeSpacing tokens, so a client snapshot that lags
+// the resident conversation by many turns (background agents resend an older full history) can
+// resume within one spacing step instead of re-prefilling the whole gap.
+inline constexpr std::uint32_t kLongRangeSpacing = 16384;
+inline constexpr std::size_t kLongRangeDepth     = 4;
+
 /**
  * One rewrite checkpoint retained off the device: the boundary, each rank's recurrent slot at
  * that boundary, and rank 0's hidden there. Copies are host buffers, newest-first in a small
@@ -149,6 +162,10 @@ struct ParkedSequence {
     std::vector<HostCheckpoint> checkpoint_history;
     // Pinned recent message boundaries, newest first; see SequenceState::boundary_history.
     std::vector<HostCheckpoint> boundary_history;
+    // Pinned recent response (assistant-header) checkpoints, newest first.
+    std::vector<HostCheckpoint> response_history;
+    // Sparse long-range checkpoints, newest first; see kLongRangeSpacing.
+    std::vector<HostCheckpoint> long_range_history;
 
     // The shared leading-block checkpoint, pinned outside the ring (see SequenceState).
     HostCheckpoint shared_prefix;
@@ -180,6 +197,8 @@ inline std::size_t sequence_metadata_bytes(const ParkedSequence& entry) noexcept
     }
     for (const HostCheckpoint& checkpoint : entry.checkpoint_history) { add(checkpoint); }
     for (const HostCheckpoint& checkpoint : entry.boundary_history) { add(checkpoint); }
+    for (const HostCheckpoint& checkpoint : entry.response_history) { add(checkpoint); }
+    for (const HostCheckpoint& checkpoint : entry.long_range_history) { add(checkpoint); }
     add(entry.shared_prefix);
     add(entry.tools_prefix);
     return bytes;
@@ -202,6 +221,14 @@ inline void strip_sequence_payload(ParkedSequence& entry) {
         checkpoint.state.clear();
         checkpoint.hidden.clear();
     }
+    for (HostCheckpoint& checkpoint : entry.response_history) {
+        checkpoint.state.clear();
+        checkpoint.hidden.clear();
+    }
+    for (HostCheckpoint& checkpoint : entry.long_range_history) {
+        checkpoint.state.clear();
+        checkpoint.hidden.clear();
+    }
     entry.shared_prefix.state.clear();
     entry.shared_prefix.hidden.clear();
     entry.tools_prefix.state.clear();
@@ -210,7 +237,14 @@ inline void strip_sequence_payload(ParkedSequence& entry) {
 
 // Which pinned cross-conversation boundary a plan resumes: the end of the tool definitions or the
 // end of the whole static leading block. Both live outside the checkpoint ring.
-enum class SharedPrefixSlot : std::uint8_t { None = 0, Tools = 1, Leading = 2, Message = 3 };
+enum class SharedPrefixSlot : std::uint8_t {
+    None    = 0,
+    Tools   = 1,
+    Leading = 2,
+    Message   = 3,
+    Response  = 4,
+    LongRange = 5,
+};
 
 // Which retained boundary a parked conversation can be resumed from. `checkpoint_index` 0 is
 // the entry's current checkpoint, i+1 is checkpoint_history[i].
@@ -387,6 +421,12 @@ inline std::optional<ParkedCheckpointMatch> match_parked_checkpoints(
         consider_shared(entry->shared_prefix, SharedPrefixSlot::Leading);
         for (const HostCheckpoint& boundary : entry->boundary_history) {
             consider_shared(boundary, SharedPrefixSlot::Message);
+        }
+        for (const HostCheckpoint& response : entry->response_history) {
+            consider_shared(response, SharedPrefixSlot::Response);
+        }
+        for (const HostCheckpoint& checkpoint : entry->long_range_history) {
+            consider_shared(checkpoint, SharedPrefixSlot::LongRange);
         }
     }
     return best;

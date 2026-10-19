@@ -97,6 +97,7 @@ struct SequencePlanningInputs {
     std::uint32_t boundary_history = 1;
     std::string shared_prefix_save_path;
     std::string shared_prefix_load_path;
+    std::string shared_prefix_dir;
     std::string park_spill_dir;
     std::uint64_t park_spill_bytes = 0;
     bool volta_long_attention = false;
@@ -136,6 +137,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t boundary_history = 1;
     std::string shared_prefix_save_path;
     std::string shared_prefix_load_path;
+    std::string shared_prefix_dir;
     std::string park_spill_dir;
     std::uint64_t park_spill_bytes = 0;
     bool volta_long_attention = false;

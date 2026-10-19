@@ -833,6 +833,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->boundary_history    = inputs.boundary_history;
     impl->shared_prefix_save_path = inputs.shared_prefix_save_path;
     impl->shared_prefix_load_path = inputs.shared_prefix_load_path;
+    impl->shared_prefix_dir  = inputs.shared_prefix_dir;
     impl->park_spill_dir      = inputs.park_spill_dir;
     impl->park_spill_bytes    = inputs.park_spill_bytes;
     impl->volta_long_attention = inputs.volta_long_attention;
@@ -975,6 +976,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .boundary_history = options.boundary_history,
         .shared_prefix_save_path = options.shared_prefix_save_path,
         .shared_prefix_load_path = options.shared_prefix_load_path,
+        .shared_prefix_dir = options.shared_prefix_dir,
         .park_spill_dir = options.park_spill_dir,
         .park_spill_bytes = options.park_spill_bytes,
         .volta_long_attention = options.volta_long_attention,
