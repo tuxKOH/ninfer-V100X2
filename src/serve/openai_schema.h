@@ -65,9 +65,15 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                                   std::int64_t created, const CompletionUsage& usage);
 std::string sse_done();
 
-// /v1/models payloads.
-std::string make_models_list(const std::string& model_id, std::int64_t created);
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+// /v1/models payloads. The entries carry both the OpenAI fields and the Anthropic model object
+// fields, including `max_input_tokens`/`max_tokens`: Anthropic-SDK clients (claude-code-best
+// among them) discover the context window from GET /v1/models and fall back to their built-in
+// default when the capability fields are absent.
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t max_input_tokens, std::uint32_t max_output_tokens);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_input_tokens,
+                              std::uint32_t max_output_tokens);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);

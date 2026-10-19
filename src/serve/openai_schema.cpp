@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <limits>
 #include <random>
 #include <string>
@@ -681,19 +682,50 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-std::string make_models_list(const std::string& model_id, std::int64_t created) {
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"}}})}};
+namespace {
+
+std::string rfc3339_utc(std::int64_t seconds) {
+    const std::time_t stamp = static_cast<std::time_t>(seconds);
+    std::tm parts{};
+    gmtime_r(&stamp, &parts);
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &parts);
+    return buffer;
+}
+
+// One model entry carrying both schemas: OpenAI reads id/object/created/owned_by, while the
+// Anthropic models API (and the SDK clients built on it) reads type/created_at/display_name and
+// the capability fields. Clients ignore the fields they do not know.
+Json model_entry(const std::string& model_id, std::int64_t created,
+                 std::uint32_t max_input_tokens, std::uint32_t max_output_tokens) {
+    return Json{{"id", model_id},
+                {"object", "model"},
+                {"type", "model"},
+                {"created", created},
+                {"created_at", rfc3339_utc(created)},
+                {"display_name", model_id},
+                {"owned_by", "ninfer"},
+                {"max_input_tokens", max_input_tokens},
+                {"max_tokens", max_output_tokens}};
+}
+
+} // namespace
+
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t max_input_tokens, std::uint32_t max_output_tokens) {
+    const Json payload = {
+        {"object", "list"},
+        {"data", Json::array({model_entry(model_id, created, max_input_tokens, max_output_tokens)})},
+        // Anthropic page fields; the SDK stops after this single page.
+        {"has_more", false},
+        {"first_id", model_id},
+        {"last_id", model_id}};
     return payload.dump();
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}};
-    return payload.dump();
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_input_tokens, std::uint32_t max_output_tokens) {
+    return model_entry(model_id, created, max_input_tokens, max_output_tokens).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

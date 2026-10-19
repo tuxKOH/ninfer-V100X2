@@ -159,7 +159,7 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /v1/models` | configured OpenAI model alias |
+| `GET /v1/models` | configured model alias plus `max_input_tokens`/`max_tokens` (Anthropic-compatible capability discovery) |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
@@ -566,6 +566,12 @@ Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or An
 curl http://127.0.0.1:8080/v1/models \
   -H 'Authorization: Bearer local-secret'
 ```
+
+Each model entry carries `max_input_tokens` and `max_tokens` set to the per-request context
+ceiling (`--max-context`, as validated against the model's native or YaRN window). This is the
+same capability discovery the Anthropic models API exposes, so clients that adapt their context
+window to the server (claude-code-best and other Anthropic-SDK front ends) pick it up without a
+client-side override.
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 

@@ -316,7 +316,9 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), model_max_input_tokens_,
+                                     model_max_output_tokens_),
+                    "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -330,7 +332,9 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), model_max_input_tokens_,
+                                      model_max_output_tokens_),
+                    "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -773,8 +777,15 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
+    const ninfer::MemorySummary memory = service.memory_summary();
+    // `max_context` is the per-request sequence ceiling the engine admits against (the KV pool
+    // can be larger when automatic capacity spans several concurrent sequences). Report it as
+    // both the input window and the output ceiling; the engine clamps a request's output to
+    // whatever the prompt leaves, and the client chooses its own smaller default output budget.
+    model_max_input_tokens_ = memory.max_context != 0 ? memory.max_context : options_.max_context;
+    model_max_output_tokens_ = model_max_input_tokens_;
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+                                      memory);
 }
 
 bool HttpServer::listen() {

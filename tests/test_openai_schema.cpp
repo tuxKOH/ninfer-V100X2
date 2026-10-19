@@ -688,15 +688,23 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
+    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, 262144, 65536));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
+    failures += check(list.at("data").at(0).at("type") == "model", "models list anthropic type");
+    failures += check(list.at("data").at(0).at("max_input_tokens") == 262144,
+                      "models list input window");
+    failures += check(list.at("data").at(0).at("max_tokens") == 65536, "models list output limit");
+    failures += check(list.at("data").at(0).at("created_at").is_string(), "models list created_at");
+    failures += check(list.at("has_more") == false && list.at("last_id") == "qwen3.6-27b",
+                      "models list pagination");
 
-    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
+    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, 262144, 65536));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
+    failures += check(one.at("max_input_tokens") == 262144, "model input window");
 
     ApiError error;
     error.status   = 400;

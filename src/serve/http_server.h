@@ -65,6 +65,10 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    // Advertised on GET /v1/models. Clients such as claude-code-best take max_input_tokens as
+    // their context window; this is the per-request sequence ceiling the engine admits against.
+    std::uint32_t model_max_input_tokens_  = 0;
+    std::uint32_t model_max_output_tokens_ = 0;
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
