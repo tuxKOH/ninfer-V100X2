@@ -24,6 +24,8 @@ struct FrontendOptions {
     // Record a reusable checkpoint at the last stable message boundary in addition to the
     // response checkpoint.
     bool message_boundary_checkpoints      = false;
+    // Recent message boundaries retained (counting the stable one); 0 or 1 keeps only stable.
+    std::uint32_t boundary_history         = 1;
     // Record a reusable checkpoint after the static leading block, shared across sessions.
     bool shared_prefix_checkpoints         = false;
 };

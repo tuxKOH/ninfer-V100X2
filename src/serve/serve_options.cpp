@@ -125,7 +125,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
-           "[--vision-kv-swap] [--boundary-checkpoints] [--shared-prefix] "
+           "[--vision-kv-swap] [--boundary-checkpoints [--boundary-history N]] "
+           "[--shared-prefix] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -157,6 +158,8 @@ std::string serve_usage_text(const char* argv0) {
            "       no Vision weights or scratch are uploaded, at the cost of CPU encode time\n"
            "       --vision-kv-swap keeps GPU Vision but reserves no startup scratch: each image's\n"
            "       encode swaps this rank's runtime KV/state to host RAM and restores it afterwards\n"
+           "       --boundary-history N keeps the last N message boundaries (default 1, max 16), so a\n"
+           "       client that rewrites an assistant message several turns back still resumes nearby\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -364,6 +367,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--vision-kv-swap") {
             options.vision_kv_swap = true;
         } else if (arg == "--boundary-checkpoints") {
+            options.message_boundary_checkpoints = true;
+        } else if (arg == "--boundary-history") {
+            options.boundary_history = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--boundary-history"), "boundary-history"));
+            if (options.boundary_history == 0 || options.boundary_history > 16) {
+                throw std::invalid_argument("--boundary-history must be in [1,16]");
+            }
             options.message_boundary_checkpoints = true;
         } else if (arg == "--shared-prefix") {
             options.shared_prefix_checkpoints = true;

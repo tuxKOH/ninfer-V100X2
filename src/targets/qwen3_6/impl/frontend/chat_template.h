@@ -79,6 +79,12 @@ struct ChatRenderOptions {
     // PromptIdentity::stable_checkpoint). Off by default: it costs one extra prefix
     // tokenization per request.
     bool message_boundary_checkpoint = false;
+    // How many recent message boundaries to retain when `message_boundary_checkpoint` is on,
+    // counting the newest (the stable boundary). Clients can rewrite an assistant message
+    // several turns back -- dropping the tool_use of an interrupted tool call also drops its
+    // tool_result -- so one boundary before the final message cannot cover the divergence.
+    // 0 or 1 keeps only the stable boundary.
+    std::uint32_t boundary_history = 1;
     // Records reusable boundaries in the static leading block before the first conversation
     // message: one after the tool definitions, and one after the whole block (tool definitions and
     // instruction/system messages). Agent frontends send that block first and it is identical
@@ -98,6 +104,9 @@ struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
+    // Older message boundaries, oldest first, retained for clients that rewrite a message
+    // several turns back.
+    std::vector<RewriteCheckpointByteSpec> message_boundaries;
     std::optional<RewriteCheckpointByteSpec> prefix_checkpoint;
     // End of the tool definitions, before the leading instruction text that follows them.
     std::optional<RewriteCheckpointByteSpec> tools_checkpoint;

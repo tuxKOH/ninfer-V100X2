@@ -179,6 +179,10 @@ struct EngineOptions {
     // interrupted tool result) can then resume from the common message prefix instead of
     // re-prefilling the whole prompt.
     bool message_boundary_checkpoints      = false;
+    // Recent message boundaries retained, counting the stable one. Clients can rewrite an
+    // assistant message several turns back; each retained boundary is a resume point before it.
+    // 0 or 1 keeps only the stable boundary.
+    std::uint32_t boundary_history         = 1;
     // Captures a reusable checkpoint after the static leading block (tool definitions and system
     // messages). Agent sessions share that block, so a new conversation can restore a prefix the
     // server already prefilled instead of starting from token zero.

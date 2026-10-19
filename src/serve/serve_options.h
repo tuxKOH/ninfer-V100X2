@@ -70,6 +70,7 @@ struct ServeOptions {
     // GPU Vision scratch is allocated per image by swapping this rank's runtime arena to host.
     bool vision_kv_swap = false;
     bool message_boundary_checkpoints = false;
+    std::uint32_t boundary_history = 1;
     bool shared_prefix_checkpoints = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

@@ -609,7 +609,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` retains the backbone on host and reserves no Vision device scratch | `gpu` |
 | `--vision-kv-swap` | GPU Vision without a startup scratch reservation: each image's encode swaps this rank's runtime KV/state to host memory and restores it afterwards | off |
-| `--boundary-checkpoints` | capture an extra reusable checkpoint at the last stable message boundary, so a rewritten or dropped final message resumes from the common prefix | off |
+| `--boundary-checkpoints` | capture reusable checkpoints at recent message boundaries, so a rewritten message resumes from the common prefix | off |
+| `--boundary-history N` | how many recent message boundaries to retain (`1..16`, implies `--boundary-checkpoints`) | `1` |
 | `--shared-prefix` | capture reusable checkpoints after the tool definitions and after the static leading system/tools block, so any session sharing that block restores the prefilled prefix | off |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -750,13 +751,17 @@ active slot, serving an unrelated conversation can replace the retained entry; i
 cache of every conversation. Only the current resident frontier and a saved complete turn/response
 checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
 
-With `--boundary-checkpoints`, the Server also retains one boundary at the end of the message
-before the last one. Clients commonly rewrite the final message between requests -- Claude Code
-injects ephemeral `<system-reminder>` user messages and drops them on the next turn, and an
-interrupted tool result can shrink or disappear. Such a replay matches neither the resident
-frontier nor the response checkpoint, which both sit after the rewritten message; the boundary
-checkpoint turns the full re-prefill into a suffix prefill from the common message prefix. The
-capture costs one extra checkpoint copy per request and one extra prefix tokenization.
+With `--boundary-checkpoints`, the Server retains checkpoints at recent message boundaries.
+Clients rewrite history between requests: Claude Code injects ephemeral `<system-reminder>` user
+messages and drops them on the next turn, and an interrupted tool call is removed together with
+its tool result -- possibly several turns back. Such a replay matches neither the resident
+frontier nor the response checkpoint, which both sit after the rewritten message, so without a
+boundary it re-prefills from the last matching prefix. `--boundary-history N` keeps the last N
+message boundaries (default 1, the boundary before the final message); each is pinned outside the
+depth-3 rewrite-checkpoint ring and rides with a parked conversation. A boundary costs one
+per-rank recurrent-state copy (about 150 MB per boundary on the 27B TP2 profile, released with
+the lane), so the depth is a memory/latency trade: eight boundaries cover roughly four turns of
+rewritten assistant messages.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

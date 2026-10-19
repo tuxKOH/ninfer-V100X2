@@ -111,6 +111,7 @@ struct ProcessedInput {
     std::vector<std::shared_ptr<const qwen3_6::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointSpec> stable_checkpoint;
+    std::vector<RewriteCheckpointSpec> message_checkpoints;
     std::optional<RewriteCheckpointSpec> prefix_checkpoint;
     std::optional<RewriteCheckpointSpec> tools_checkpoint;
     PreprocessStats stats;
@@ -122,6 +123,7 @@ struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointSpec> stable_checkpoint;
+    std::vector<RewriteCheckpointSpec> message_checkpoints;
     std::optional<RewriteCheckpointSpec> prefix_checkpoint;
     std::optional<RewriteCheckpointSpec> tools_checkpoint;
 };

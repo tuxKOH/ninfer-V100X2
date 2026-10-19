@@ -736,10 +736,16 @@ int test_stable_checkpoint_trace() {
     failures += check(!render_chat({question, follow}, disabled).stable_checkpoint,
                       "stable boundary was published while the option was off");
 
-    // Two consecutive tool results: the first has no closing "<|im_end|>", so no boundary.
+    // Two consecutive tool results: the boundary between them (Tool -> Tool) sits inside the
+    // tool group and is skipped, so the newest usable boundary is the one before the group.
     const fi::ChatMessage tool_one = chat_message(ninfer::ChatRole::Tool, "first result");
     const fi::ChatMessage tool_two = chat_message(ninfer::ChatRole::Tool, "second result");
-    failures += check(!render_chat({question, tool_one, tool_two}, options).stable_checkpoint,
+    fi::ChatRenderOptions user_block_only = options;
+    user_block_only.add_generation_prompt = false;
+    const fi::RenderedChat user_only      = render_chat({question}, user_block_only);
+    const fi::RenderedChat tool_group     = render_chat({question, tool_one, tool_two}, options);
+    failures += check(tool_group.stable_checkpoint &&
+                          tool_group.stable_checkpoint->offset == user_only.text.size(),
                       "stable boundary was recorded inside an open tool group");
 
     // The conversation ends in a tool result, but with preserve-thinking off the response
@@ -753,6 +759,34 @@ int test_stable_checkpoint_trace() {
         {question, calling, chat_message(ninfer::ChatRole::Tool, "result")}, preserve_off);
     failures += check(tool_tail.rewrite_checkpoint && !tool_tail.stable_checkpoint,
                       "stable boundary was kept after an earlier response checkpoint");
+
+    // Deeper history: a client can rewrite an assistant message several turns back, so the last
+    // N message boundaries are retained, ascending and all before the stable boundary.
+    const std::vector<fi::ChatMessage> turns{
+        chat_message(ninfer::ChatRole::User, "one"),
+        chat_message(ninfer::ChatRole::Assistant, "answer one"),
+        chat_message(ninfer::ChatRole::User, "two"),
+        chat_message(ninfer::ChatRole::Assistant, "answer two"),
+        chat_message(ninfer::ChatRole::User, "three")};
+    fi::ChatRenderOptions deep = options;
+    deep.boundary_history      = 4;
+    const fi::RenderedChat deep_rendered = render_chat(turns, deep);
+    failures += check(deep_rendered.message_boundaries.size() == 3 &&
+                          deep_rendered.stable_checkpoint.has_value(),
+                      "boundary history did not retain the requested count");
+    std::size_t previous = 0;
+    for (const fi::RewriteCheckpointByteSpec& boundary : deep_rendered.message_boundaries) {
+        failures += check(boundary.offset > previous &&
+                              (deep_rendered.stable_checkpoint
+                                   ? boundary.offset < deep_rendered.stable_checkpoint->offset
+                                   : false),
+                          "boundary history is not ascending before the stable boundary");
+        previous = boundary.offset;
+    }
+    fi::ChatRenderOptions shallow = deep;
+    shallow.boundary_history      = 1;
+    failures += check(render_chat(turns, shallow).message_boundaries.empty(),
+                      "boundary_history=1 retained older boundaries");
     return failures;
 }
 

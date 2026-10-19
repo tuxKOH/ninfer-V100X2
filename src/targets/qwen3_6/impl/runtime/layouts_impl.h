@@ -684,6 +684,11 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("RAM KV requires kv_capacity equal to its GPU window");
         }
     }
+    // Each retained message boundary costs a full per-rank recurrent-state copy; the Server caps
+    // this in its own parser, and an embedder using EngineOptions directly is capped here.
+    if (options.boundary_history > 16) {
+        throw std::invalid_argument("boundary_history must be at most 16");
+    }
     if (options.kv_park_bytes != 0) {
         // Parking mirrors a lane's whole continuation state, which is defined for the plain
         // per-rank KV and GDN layout only. RAM KV already owns a host archive, DFlash keeps a
@@ -825,6 +830,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pipeline_chunks     = inputs.pipeline_chunks;
     impl->ram_kv              = inputs.ram_kv;
     impl->kv_park_bytes       = inputs.kv_park_bytes;
+    impl->boundary_history    = inputs.boundary_history;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -962,6 +968,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .pipeline_chunks = options.pp == 2 ? options.pipeline_chunks : 1U,
         .ram_kv         = options.ram_kv,
         .kv_park_bytes  = options.kv_park_bytes,
+        .boundary_history = options.boundary_history,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

@@ -71,6 +71,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint;
+    std::vector<qwen3_6::RewriteCheckpointSpec> message_checkpoints;
     std::optional<qwen3_6::RewriteCheckpointSpec> prefix_checkpoint;
     std::optional<qwen3_6::RewriteCheckpointSpec> tools_checkpoint;
     bool allow_prefix_reuse = false;
@@ -103,6 +104,8 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     // frontier. It lands in the host checkpoint history and lets a client that rewrites or drops
     // its final message resume from the common message prefix.
     std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint_capture;
+    // Recent message boundaries captured in prompt order, oldest first, excluding the stable one.
+    std::vector<qwen3_6::RewriteCheckpointSpec> message_checkpoint_captures;
     // A capture after the static leading block; shared by every session with that prefix.
     std::optional<qwen3_6::RewriteCheckpointSpec> prefix_checkpoint_capture;
     // A capture after the tool definitions, before the volatile leading instruction text.
@@ -210,6 +213,11 @@ struct SequenceState {
     // Older rewrite-checkpoint boundaries of this conversation, newest-first. Kept host-side so
     // a stale or forked replay can resume at one of them without growing device memory.
     std::vector<HostCheckpoint> checkpoint_history;
+    // Recent message boundaries, newest first, pinned outside the ring. A client can rewrite an
+    // assistant message several turns back (dropping an interrupted tool_use also drops its
+    // tool_result), and each boundary before such a message is a resume point the depth-3 ring
+    // would have evicted.
+    std::vector<HostCheckpoint> boundary_history;
     // The shared leading-block boundary, pinned outside the ring: it is identical across agent
     // sessions, so it must survive ring rotation to stay usable by a later conversation.
     HostCheckpoint shared_prefix;
@@ -238,6 +246,8 @@ struct RequestControl {
         // Captured once, at its frontier, into the host checkpoint history; see RequestPlanImpl.
         std::optional<RewriteCheckpointSpec> stable_checkpoint_capture;
         bool stable_checkpoint_captured  = false;
+        std::vector<RewriteCheckpointSpec> message_checkpoint_captures;
+        std::size_t message_capture_index = 0;
         std::optional<RewriteCheckpointSpec> prefix_checkpoint_capture;
         bool prefix_checkpoint_captured  = false;
         std::optional<RewriteCheckpointSpec> tools_checkpoint_capture;
@@ -370,6 +380,8 @@ public:
     const std::uint32_t draft_window;
     const RamKvOptions ram_kv;
     const bool volta_long_attention;
+    // Recent message boundaries pinned per lane/entry; see EngineOptions::boundary_history.
+    const std::uint32_t boundary_history_depth;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
@@ -583,7 +595,8 @@ private:
     void restore_parked_lane(SequenceState& sequence, ParkedSequence& entry,
                              std::uint32_t text_pages, std::uint32_t backend_pages,
                              bool resume_at_checkpoint, std::uint32_t checkpoint_index,
-                             SharedPrefixSlot resume_at_shared_prefix = SharedPrefixSlot::None);
+                             SharedPrefixSlot resume_at_shared_prefix = SharedPrefixSlot::None,
+                             std::uint32_t resume_frontier = 0);
     // Copies a checkpoint's per-rank recurrent slot and rank-0 hidden from host. `into_current`
     // also materializes it into the running slot (a parked restore); otherwise only the
     // checkpoint slot is written and the resident checkpoint path copies it forward.

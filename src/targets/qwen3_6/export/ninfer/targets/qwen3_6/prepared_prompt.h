@@ -78,6 +78,9 @@ struct PromptIdentity {
     // which makes the response checkpoint above unusable; this boundary still matches the common
     // message prefix.
     std::optional<RewriteCheckpointSpec> stable_checkpoint;
+    // Recent message boundaries, oldest first, excluding the stable one. A client can rewrite an
+    // assistant message several turns back; each boundary is a resumable point before a rewrite.
+    std::vector<RewriteCheckpointSpec> message_checkpoints;
     // A reusable boundary after the static leading block (tool definitions and instruction
     // messages) that agent frontends send first. It is shared by every session with that block,
     // so a new conversation can restore an already-prefilled KV prefix.

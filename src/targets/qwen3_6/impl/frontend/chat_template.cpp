@@ -366,6 +366,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::optional<RewriteCheckpointByteSpec> stable_checkpoint;
     std::optional<RewriteCheckpointByteSpec> prefix_checkpoint;
+    std::vector<std::size_t> message_boundary_offsets;
 
     int image_count = 0;
     int video_count = 0;
@@ -383,20 +384,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             prefix_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
-        if (options.message_boundary_checkpoint && !stable_checkpoint && !rewrite_checkpoint &&
-            i > message_begin && i + 1 == messages.size()) {
-            // The boundary before the final message is the last one a client can rewrite away
-            // between requests. A tool group that continues into the final message has not
-            // emitted its closing "<|im_end|>", so a boundary there would sit mid-group and is
-            // skipped. Every other boundary ends on "<|im_end|>\n" and is followed by the fixed
-            // "<|im_start|>" token, which cannot retokenize the cut. A response checkpoint
-            // already recorded at an earlier assistant turn (preserve-thinking off, last message
-            // a tool result) lies before this cut, so the boundary cannot precede it and is
-            // dropped instead of failing the ordering validation.
-            if (!(messages[i - 1].role == ChatRole::Tool &&
-                  message.role == ChatRole::Tool)) {
-                stable_checkpoint = RewriteCheckpointByteSpec{
-                    .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        if (options.message_boundary_checkpoint && i > message_begin) {
+            // Every message boundary is a candidate. A client can rewrite an assistant message
+            // several turns back (dropping the tool_use of an interrupted tool call also drops
+            // its tool_result), so the boundary before the final message alone does not cover
+            // the divergence. A tool group that continues into the next message has not emitted
+            // its closing "<|im_end|>", so a boundary there would sit mid-group and is skipped.
+            // Every other boundary ends on "<|im_end|>\n" and is followed by the fixed
+            // "<|im_start|>" token, which cannot retokenize the cut.
+            if (!(messages[i - 1].role == ChatRole::Tool && message.role == ChatRole::Tool)) {
+                message_boundary_offsets.push_back(rendered.size());
             }
         }
         if (is_instruction_role(message.role)) {
@@ -488,9 +485,33 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = assistant_frontier};
         }
     }
+    // Keep the last `boundary_history` boundaries. The newest is the stable boundary; older ones
+    // ride in `message_boundaries`. A response checkpoint (preserve-thinking off, last message a
+    // tool result) lies before some of these cuts in the rendered text, and a boundary cannot
+    // follow the response checkpoint, so those are dropped instead of failing validation.
+    std::vector<std::size_t> usable;
+    usable.reserve(message_boundary_offsets.size());
+    for (const std::size_t offset : message_boundary_offsets) {
+        if (!rewrite_checkpoint || offset < rewrite_checkpoint->offset) { usable.push_back(offset); }
+    }
+    std::vector<RewriteCheckpointByteSpec> message_boundaries;
+    if (options.message_boundary_checkpoint && !usable.empty() &&
+        usable.back() == message_boundary_offsets.back()) {
+        stable_checkpoint = RewriteCheckpointByteSpec{
+            .kind = RewriteCheckpointKind::TurnClosure, .offset = usable.back()};
+        usable.pop_back();
+    }
+    const std::size_t history = options.boundary_history > 1 ? options.boundary_history - 1 : 0;
+    const std::size_t keep    = std::min(history, usable.size());
+    for (std::size_t i = usable.size() - keep; i < usable.size(); ++i) {
+        message_boundaries.push_back(
+            RewriteCheckpointByteSpec{.kind = RewriteCheckpointKind::TurnClosure,
+                                      .offset = usable[i]});
+    }
     return RenderedChat{.text                = std::move(rendered),
                         .rewrite_checkpoint  = rewrite_checkpoint,
                         .stable_checkpoint   = stable_checkpoint,
+                        .message_boundaries  = std::move(message_boundaries),
                         .prefix_checkpoint   = prefix_checkpoint,
                         .tools_checkpoint    = tools_checkpoint};
 }

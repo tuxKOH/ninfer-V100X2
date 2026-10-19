@@ -438,21 +438,24 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         const std::string replacement = placeholder(item);
         // Both checkpoint offsets were recorded against the placeholder form and must move with
         // the expanded text, exactly like the bytes they point into.
-        const auto shift_boundary = [&](std::optional<RewriteCheckpointByteSpec>& spec) {
-            if (!spec) { return; }
-            const std::size_t boundary = spec->offset;
-            const std::size_t end      = position + needle.size();
-            if (position < boundary && boundary < end) {
+        const auto shift_offset = [&](std::size_t& offset) {
+            const std::size_t end = position + needle.size();
+            if (position < offset && offset < end) {
                 throw std::logic_error("checkpoint intersects a media placeholder");
             }
-            if (end <= boundary) {
-                spec->offset = boundary - needle.size() + replacement.size();
-            }
+            if (end <= offset) { offset = offset - needle.size() + replacement.size(); }
+        };
+        const auto shift_boundary = [&](std::optional<RewriteCheckpointByteSpec>& spec) {
+            if (!spec) { return; }
+            shift_offset(spec->offset);
         };
         shift_boundary(rendered.rewrite_checkpoint);
         shift_boundary(rendered.stable_checkpoint);
         shift_boundary(rendered.prefix_checkpoint);
         shift_boundary(rendered.tools_checkpoint);
+        for (RewriteCheckpointByteSpec& boundary : rendered.message_boundaries) {
+            shift_offset(boundary.offset);
+        }
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -633,11 +636,29 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.stable_checkpoint  = encode_checkpoint(rendered.stable_checkpoint, false);
     encoded.prefix_checkpoint  = encode_checkpoint(rendered.prefix_checkpoint, false);
     encoded.tools_checkpoint   = encode_checkpoint(rendered.tools_checkpoint, true);
+    encoded.message_checkpoints.reserve(rendered.message_boundaries.size());
+    for (const RewriteCheckpointByteSpec& boundary : rendered.message_boundaries) {
+        encoded.message_checkpoints.push_back(
+            *encode_checkpoint(std::optional<RewriteCheckpointByteSpec>(boundary), false));
+    }
     if (encoded.rewrite_checkpoint && encoded.stable_checkpoint &&
         encoded.stable_checkpoint->frontier >= encoded.rewrite_checkpoint->frontier) {
         // The stable boundary precedes the last message, so it must precede the response
         // checkpoint; anything else means the template offsets were mis-assembled.
         throw std::logic_error("stable checkpoint does not precede the rewrite checkpoint");
+    }
+    for (std::size_t i = 0; i < encoded.message_checkpoints.size(); ++i) {
+        const RewriteCheckpointSpec& boundary = encoded.message_checkpoints[i];
+        if (i > 0 && boundary.frontier <= encoded.message_checkpoints[i - 1].frontier) {
+            throw std::logic_error("message checkpoints are not strictly ascending");
+        }
+        if ((encoded.stable_checkpoint && boundary.frontier >= encoded.stable_checkpoint->frontier) ||
+            (encoded.rewrite_checkpoint &&
+             boundary.frontier >= encoded.rewrite_checkpoint->frontier) ||
+            (encoded.prefix_checkpoint &&
+             boundary.frontier <= encoded.prefix_checkpoint->frontier)) {
+            throw std::logic_error("message checkpoint is outside the expected order");
+        }
     }
     if (encoded.prefix_checkpoint &&
         ((encoded.stable_checkpoint &&
@@ -819,8 +840,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.tokenize_seconds = std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
     output.input_ids          = std::move(encoded.input_ids);
-    output.rewrite_checkpoint = encoded.rewrite_checkpoint;
-    output.stable_checkpoint  = encoded.stable_checkpoint;
+    output.rewrite_checkpoint   = encoded.rewrite_checkpoint;
+    output.stable_checkpoint    = encoded.stable_checkpoint;
+    output.message_checkpoints  = encoded.message_checkpoints;
     output.prefix_checkpoint  = encoded.prefix_checkpoint;
     output.tools_checkpoint   = encoded.tools_checkpoint;
     output.token_types.resize(output.input_ids.size(), 0);

@@ -92,6 +92,8 @@ struct SequencePlanningInputs {
     RamKvOptions ram_kv;
     // Host budget for parked conversations. Zero disables parking; see EngineOptions::kv_park_bytes.
     std::uint64_t kv_park_bytes = 0;
+    // Recent message boundaries each lane (or parked entry) pins; see EngineOptions::boundary_history.
+    std::uint32_t boundary_history = 1;
     bool volta_long_attention = false;
 };
 
@@ -126,6 +128,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t pipeline_chunks = 1;
     RamKvOptions ram_kv;
     std::uint64_t kv_park_bytes = 0;
+    std::uint32_t boundary_history = 1;
     bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

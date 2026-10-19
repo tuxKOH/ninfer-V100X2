@@ -105,6 +105,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .media_preprocess_threads = options.media_preprocess_threads,
                                       .message_boundary_checkpoints =
                                           options.message_boundary_checkpoints,
+                                      .boundary_history = options.boundary_history,
                                       .shared_prefix_checkpoints =
                                           options.shared_prefix_checkpoints,
                                   });

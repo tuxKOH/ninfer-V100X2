@@ -196,7 +196,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | where the Vision encoder runs; `cpu` keeps the backbone in host memory and reserves no Vision GPU scratch | `gpu` |
 | `--vision-kv-swap` | GPU Vision without a startup scratch reservation; each encode swaps this rank's runtime KV/state to host RAM | off |
-| `--boundary-checkpoints` | retain a reusable checkpoint at the last stable message boundary | off |
+| `--boundary-checkpoints` | retain reusable checkpoints at recent message boundaries | off |
+| `--boundary-history N` | recent message boundaries to retain (`1..16`, implies `--boundary-checkpoints`) | `1` |
 | `--shared-prefix` | retain reusable checkpoints after the tool definitions and after the static leading system/tools block | off |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

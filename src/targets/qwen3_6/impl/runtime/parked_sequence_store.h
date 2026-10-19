@@ -29,6 +29,11 @@ namespace ninfer::targets::qwen3_6::detail {
 // continuation only ever uses the newest checkpoint, so this is purely a branch-recovery cache.
 inline constexpr std::size_t kCheckpointHistoryDepth = 3;
 
+// How many recent message boundaries a lane (and each parked entry) pins outside the ring. One
+// boundary is roughly 150 MB of recurrent state across both ranks on the 27B TP2 profile, so
+// this is a memory/latency trade: eight boundaries cover several turns of client rewrites.
+inline constexpr std::size_t kBoundaryHistoryDepth = 8;
+
 /**
  * One rewrite checkpoint retained off the device: the boundary, each rank's recurrent slot at
  * that boundary, and rank 0's hidden there. Copies are host buffers, newest-first in a small
@@ -67,6 +72,21 @@ inline void push_host_checkpoint(std::vector<HostCheckpoint>& history, HostCheck
     if (checkpoint.frontier == 0 || depth == 0) { return; }
     for (auto it = history.begin(); it != history.end(); ++it) {
         if (same_checkpoint_boundary(*it, checkpoint)) {
+            history.erase(it);
+            break;
+        }
+    }
+    history.insert(history.begin(), std::move(checkpoint));
+    if (history.size() > depth) { history.resize(depth); }
+}
+
+// Pins a message boundary, newest first, dropping a duplicate frontier and the oldest entry past
+// the depth. Unlike the rewrite-checkpoint ring these are never rotated away by later turns.
+inline void push_pinned_boundary(std::vector<HostCheckpoint>& history, HostCheckpoint checkpoint,
+                                 std::size_t depth = kBoundaryHistoryDepth) {
+    if (checkpoint.frontier == 0 || depth == 0) { return; }
+    for (auto it = history.begin(); it != history.end(); ++it) {
+        if (it->frontier == checkpoint.frontier) {
             history.erase(it);
             break;
         }
@@ -126,6 +146,8 @@ struct ParkedSequence {
     // Older boundaries of the same conversation, newest-first. A forked or stale replay of the
     // conversation can match one of these when it no longer matches the current checkpoint.
     std::vector<HostCheckpoint> checkpoint_history;
+    // Pinned recent message boundaries, newest first; see SequenceState::boundary_history.
+    std::vector<HostCheckpoint> boundary_history;
 
     // The shared leading-block checkpoint, pinned outside the ring (see SequenceState).
     HostCheckpoint shared_prefix;
@@ -138,7 +160,7 @@ struct ParkedSequence {
 
 // Which pinned cross-conversation boundary a plan resumes: the end of the tool definitions or the
 // end of the whole static leading block. Both live outside the checkpoint ring.
-enum class SharedPrefixSlot : std::uint8_t { None = 0, Tools = 1, Leading = 2 };
+enum class SharedPrefixSlot : std::uint8_t { None = 0, Tools = 1, Leading = 2, Message = 3 };
 
 // Which retained boundary a parked conversation can be resumed from. `checkpoint_index` 0 is
 // the entry's current checkpoint, i+1 is checkpoint_history[i].
@@ -303,6 +325,9 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
         };
         consider_shared(entry->tools_prefix, SharedPrefixSlot::Tools);
         consider_shared(entry->shared_prefix, SharedPrefixSlot::Leading);
+        for (const HostCheckpoint& boundary : entry->boundary_history) {
+            consider_shared(boundary, SharedPrefixSlot::Message);
+        }
     }
     return best;
 }
