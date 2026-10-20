@@ -2,15 +2,89 @@
 
 [中文](README.zh-CN.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
-Fast single-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**, CUDA 12.8 / SM70.
+Fast Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**, CUDA 12.8 / SM70.
 The local cards use PCIe P2P through SXM2-to-PCIe adapters, **without NVLink**.
+The measurements below are single-request; the server also runs two concurrent agent
+sessions with shared prefixes, KV parking and restart survival
+(see [What's new](#whats-new-2026-10-15-to-2026-10-20)).
 **QUASAR NVFP4 v3 is the recommended text model**, with TP2, INT8 group-64 KV and CUDA Graphs.
-It loads zero Vision weights; image/video input is unsupported for this artifact.
+It loads zero Vision weights by default; Vision is opt-in with `--vision`.
 
 Maintainer's personal experience: “It feels in the same tier as FP8.”
 The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
+
+## What's new (2026-10-15 to 2026-10-20)
+
+**Prefix reuse now survives real agent traffic.** Exact-prefix reuse no longer depends on
+the client resending a byte-identical tail:
+
+- A cancelled request retains its KV/GDN/hidden state, so ESC-then-retry resumes by append
+  instead of re-prefilling.
+- `--boundary-checkpoints` (with `--boundary-history N`, default 1, max 16) captures the last
+  N closed message boundaries, covering clients that rewrite or drop their final message.
+- Response-replay checkpoints keep the last three older checkpoints per lane, and each one
+  is validated against its own token lineage as well as the lane's KV ledger, so sibling
+  branches never pair one branch's state with another's pages.
+- `--shared-prefix` pins the tool-definition block and the full leading instruction block
+  across sessions. A system prompt that changes a per-request line still reuses the large
+  tool schema; the planner takes the longest match among tools, leading block, message
+  boundaries, response checkpoints and a sparse 16,384-token long-range ladder.
+- The boundary a request resumed from is pinned outside the depth-limited histories, so
+  alternating branches of one conversation return to their fork instead of re-prefilling
+  past it (a measured case went from ~130k to ~3.5k re-prefilled tokens).
+
+**KV parking, disk spill and restart survival.**
+
+- `--kv-park-bytes N` copies a replaced conversation's packed KV pages and per-rank state to
+  a bounded LRU host store. A returning conversation is matched by token-prefix identity and
+  restores in ~0.7 s instead of re-prefilling in ~11 s (27B TP2 measurement); the restored
+  lane is indistinguishable from a retained one.
+- `--kv-park-spill-dir DIR` and `--kv-park-spill-bytes N` add a disk tier under the host
+  budget. Startup indexes metadata sidecars without reading payloads, so a graceful restart
+  (SIGINT/SIGTERM parks retained lanes first) keeps conversations instead of dropping them.
+- `--shared-prefix-save FILE` / `--shared-prefix-load FILE` persist the shared prefix and
+  tool anchor; `--shared-prefix-dir DIR` keeps one image per distinct prefix. Images are
+  written atomically and validated (geometry, page capacity, trailing data), and older
+  image/metadata versions still load.
+
+**Two concurrent sessions with cross-lane page sharing.**
+
+- `--max-concurrency 2` runs two lanes side by side. Physical KV pages are reference-counted:
+  a request that matches another lane's pinned boundary borrows those pages, and only the
+  page at the divergence is copied on write. Admission charges a shared prefix once, and a
+  share plan protects its source lane from eviction.
+- With sharing, the per-lane ceiling for two lanes rises from `pool/2` to `(pool + fork)/2`
+  — about 228k instead of 131k tokens on the 27B TP2 pool. RAM-KV and DFlash remain excluded
+  because neither has a shareable page table.
+- `GET /v1/models` now returns the Anthropic model object (`max_input_tokens`, `max_tokens`,
+  `created_at`, `display_name`) alongside the OpenAI fields, so clients such as
+  claude-code-best size their context window from the server instead of a built-in default.
+  `max_input_tokens` is the per-request sequence ceiling, not the whole KV pool.
+
+**Vision on two 16 GB cards.**
+
+- TP2 Vision now runs for the QUASAR artifact and alongside `--kv-park-bytes`.
+- `--vision-device cpu` executes the 27-layer encoder on host threads with AVX2/FMA workers
+  and sends only merged embeddings to the device.
+- `--vision-kv-swap` keeps the encoder on the GPU without a startup scratch reservation:
+  each image allocates its exact scratch on demand, temporarily swapping the shortfall of
+  the persistent KV/runtime arena to pinned host memory at stable virtual addresses, so CUDA
+  Graph replay is unaffected.
+- `--vision-max-tokens` is now an ordinary option with no compiled ceiling. `unlimited`
+  (also `none` or `0`) sizes the encoder by the context and media-live limits and allocates
+  the request transient on demand; if that allocation fails, only that request fails with
+  503 instead of stopping the engine.
+
+**Serving ergonomics.**
+
+- `--stream-keepalive-ms N` (default 15000, `0` disables) emits an SSE `ping` frame on
+  Anthropic Messages streams while a request produces no output, so a long prefill is not
+  mistaken for an idle connection by clients, proxies, tunnels or NAT.
+- `--pending-timeout-ms 0` disables the admission deadline, so a request queued behind a long
+  prefill waits instead of failing with `request_queue_timeout` after 30 s.
+- Throughput logs now include prefill progress (`prefill_processed/prefill_prompt` tokens).
 
 ## QUASAR measurements
 
@@ -116,6 +190,19 @@ env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD
 
 For DFlash7 use capacity 98304, chunk 1024 and `--spec dflash --draft-tokens 7`, omitting
 `--lm-head-draft`. Output is bounded by remaining context.
+
+For agent serving with two concurrent sessions, replace the concurrency/context flags and add
+reuse and parking:
+
+```bash
+  --max-concurrency 2 --max-context 225280 --kv-capacity 262144 \
+  --boundary-checkpoints --boundary-history 8 --shared-prefix \
+  --kv-park-bytes 34359738368 --kv-park-spill-dir /models/ninfer-kv-cache
+```
+
+Optionally add `--vision --vision-kv-swap --vision-max-tokens unlimited` and
+`--stream-keepalive-ms 15000`. See [What's new](#whats-new-2026-10-15-to-2026-10-20) and
+[serving](docs/serving.md) for what each option does.
 For CLI use `build-v100/apps/ninfer` with the same inference flags and `--prompt TEXT --max-new N`.
 Installed GPU count does not fix runtime width: `--tp 2 --devices 4,6` selects a pair on an
 eight-card host. With `CUDA_VISIBLE_DEVICES=4,6`, use logical devices `0,1`.
