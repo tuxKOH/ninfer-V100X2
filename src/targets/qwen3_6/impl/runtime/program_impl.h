@@ -272,6 +272,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       shared_prefix_dir(plan.shared_prefix_dir),
       park_spill_dir(plan.park_spill_dir),
       park_spill_bytes(plan.park_spill_bytes),
+      kv_park_io_bytes(plan.kv_park_io_bytes),
+      kv_park_prefetch(plan.kv_park_prefetch),
+      kv_park_max_age_sec(plan.kv_park_max_age_sec),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
@@ -516,10 +519,23 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     load_shared_prefix_entries();
+    if (!park_spill_dir.empty() && kv_park_io_bytes != 0) {
+        disk_io = std::make_unique<ParkedDiskIo>(image_geometry(), kv_park_io_bytes);
+    }
+    disk_index_loading_ = true;
     load_parked_spill_entries();
+    disk_index_loading_ = false;
+    // Warm the hot entries first; the age sweep then removes the remaining cold images. Doing it
+    // the other way round would expire an entry the prefetch was about to load.
+    prefetch_disk_entries();
+    sweep_expired_disk_entries();
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    // Finish queued spill images before the index and the CUDA state go away. The writer thread
+    // captures only its own shared state, but shutdown is still the natural barrier: a graceful
+    // restart must find complete images and sidecars.
+    if (disk_io) { disk_io->stop(); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     for (auto& peer : peers) {
         if (peer->device.stream != nullptr) { (void)cudaStreamSynchronize(peer->device.stream); }
@@ -722,7 +738,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+                                                               runtime::TransientRegion transient,
+                                                               std::uint32_t max_tokens) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -828,6 +845,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         ParkedSequence* parked_entry = nullptr;
         if (is_disk_entry_id(target)) {
+            // Publish finished spill writes BEFORE binding `meta` to an index entry: draining can
+            // evict or prune entries, which would leave a reference taken earlier dangling.
+            drain_disk_completions();
             const ParkedSequence* meta = find_disk_entry(target);
             if (meta == nullptr) {
                 throw std::logic_error("planned disk-backed conversation is no longer stored");
@@ -1322,7 +1342,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
-        return advance_prefill(sequence, request);
+        return advance_prefill(sequence, request, max_tokens);
     } catch (...) {
         try {
             device.synchronize();
@@ -1332,9 +1352,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
 }
 
-runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane) {
+runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane,
+                                                                  std::uint32_t max_tokens) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(sequences[lane], requests[lane]);
+    return advance_prefill(sequences[lane], requests[lane], max_tokens);
 }
 
 void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
@@ -1893,6 +1914,11 @@ void ProgramImplCore::persist_state() {
             ++failed;
         }
     }
+    if (disk_io) {
+        // The process is about to exit: finish every queued image and publish its index entry.
+        disk_io->wait_idle();
+        drain_disk_completions();
+    }
     reuse_trace("shutdown_persist entries=%zu failed=%zu disk_bytes=%llu", written, failed,
                 static_cast<unsigned long long>(disk_spilled_bytes));
 }
@@ -2282,9 +2308,10 @@ void ProgramImplCore::prune_superseded_ram(const ParkedSequence& incoming,
 }
 
 void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
-                                            std::uint64_t protect_id) {
+                                            std::uint64_t protect_id, std::uint64_t keep_id) {
     for (auto it = disk_entries.begin(); it != disk_entries.end();) {
-        if ((*it)->id != protect_id && !(*it)->pinned && supersedes(**it, incoming)) {
+        if ((*it)->id != protect_id && (*it)->id != keep_id && !(*it)->pinned &&
+            supersedes(**it, incoming)) {
             const std::size_t bytes = (*it)->bytes + sequence_metadata_bytes(**it);
             reuse_trace("parked_supersede disk id=%llu bytes=%zu",
                         static_cast<unsigned long long>((*it)->id), bytes);
@@ -2298,8 +2325,11 @@ void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
 }
 
 std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
-    std::unique_ptr<ParkedSequence> entry) {
+    std::unique_ptr<ParkedSequence> entry, std::uint64_t protect_id) {
     if (park_spill_dir.empty() || entry == nullptr) { return entry; }
+    std::uint64_t charged = 0;
+    bool charged_pending   = false;
+    bool submitted         = false;
     try {
         std::error_code error;
         std::filesystem::create_directories(park_spill_dir, error);
@@ -2315,6 +2345,46 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         for (const std::unique_ptr<PagedKVImage>& image : entry->backend) {
             entry->backend_pages.push_back(image->pages());
         }
+        entry->disk_backed = true;
+        entry->disk_path   = path.string();
+        entry->pinned      = false;
+        entry->id          = kDiskEntryIdBase + next_disk_entry++;
+        entry->last_used   = park_clock++;
+        charged            = entry->bytes + sequence_metadata_bytes(*entry);
+
+        ParkedSequence probe;
+        probe.execution_frontier    = entry->execution_frontier;
+        probe.ledger                = entry->ledger;
+        probe.prefix_identity       = entry->prefix_identity;
+        const std::uint64_t keep_id = entry->id;
+
+        if (disk_io) {
+            // One FIFO writer owns every image write, so the worker never blocks on the payload
+            // and spill order is deterministic. The probe lets the completion prune superseded
+            // states after the index entry becomes visible.
+            disk_spilled_bytes += charged;
+            charged_pending = true;
+            for (;;) {
+                // Pending bytes are released only by drain, so a full budget wakes the worker,
+                // which drains and retries. The first job is always admitted.
+                drain_disk_completions();
+                if (disk_io->has_capacity(charged)) { break; }
+                disk_io->wait_for_change();
+            }
+            disk_io->submit(DiskSpillJob{
+                .entry = std::move(entry),
+                .path = path.string(),
+                .probe = std::move(probe),
+                .protect_id = protect_id,
+                .charged = charged,
+            });
+            submitted = true;
+            enforce_disk_budget();
+            reuse_trace("park_spill_async path=%s bytes=%llu pending_entries=1", path.c_str(),
+                        static_cast<unsigned long long>(charged));
+            return nullptr;
+        }
+
         write_sequence_image(*entry, path.string());
         try {
             write_sequence_metadata(*entry, entry->bytes, image_geometry(),
@@ -2323,30 +2393,144 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
             remove_sequence_files(path.string());
             throw;
         }
-        entry->disk_backed = true;
-        entry->disk_path   = path.string();
-        entry->pinned      = false;
-        entry->id          = kDiskEntryIdBase + next_disk_entry++;
-        entry->last_used   = park_clock++;
-        const std::size_t metadata = sequence_metadata_bytes(*entry);
-        const std::uint64_t charged = entry->bytes + metadata;
         strip_sequence_payload(*entry);
         disk_entries.push_back(std::move(entry));
         disk_spilled_bytes += charged;
         reuse_trace("park_spill path=%s entries=%zu bytes=%llu", path.c_str(), disk_entries.size(),
                     static_cast<unsigned long long>(disk_spilled_bytes));
         enforce_disk_budget();
+        prune_superseded_disk(probe, protect_id, keep_id);
         return nullptr;
     } catch (const std::exception& error) {
+        if (charged_pending) {
+            disk_spilled_bytes -= std::min(disk_spilled_bytes, charged);
+        }
         std::fprintf(stderr, "[reuse] park_spill FAILED: %s\n", error.what());
-        // The entry may have been partially stripped; it is no longer restorable from RAM. Hand
-        // it back (possibly null payloads) so the caller decides, rather than silently dropping
-        // it here.
-        return entry;
+        // A submitted job is owned by the writer and cannot be returned. A synchronous failure
+        // leaves an entry that still has its payload, so hand it back for the RAM tier -- but
+        // first undo the disk identity, or the planner will decline a valid RAM state.
+        if (submitted || entry == nullptr) { return nullptr; }
+        entry->disk_backed = false;
+        entry->disk_path.clear();
+        entry->id = 0;
+        entry->text_pages.clear();
+        entry->backend_pages.clear();
+        return std::move(entry);
+    }
+}
+
+void ProgramImplCore::drain_disk_completions() {
+    if (!disk_io) { return; }
+    std::vector<DiskSpillCompletion> done;
+    disk_io->drain(done);
+    for (DiskSpillCompletion& completion : done) {
+        if (!completion.error.empty()) {
+            disk_spilled_bytes -= std::min(disk_spilled_bytes, completion.charged);
+            std::fprintf(stderr, "[reuse] park_spill FAILED (async): %s\n",
+                         completion.error.c_str());
+            continue;
+        }
+        strip_sequence_payload(*completion.entry);
+        const std::uint64_t keep_id = completion.entry->id;
+        disk_entries.push_back(std::move(completion.entry));
+        enforce_disk_budget();
+        prune_superseded_disk(completion.probe, completion.protect_id, keep_id);
+        reuse_trace("park_spill_done entries=%zu bytes=%llu", disk_entries.size(),
+                    static_cast<unsigned long long>(disk_spilled_bytes));
+    }
+}
+
+void ProgramImplCore::sweep_expired_disk_entries() {
+    if (kv_park_max_age_sec == 0 || disk_entries.empty()) { return; }
+    const auto now     = std::filesystem::file_time_type::clock::now();
+    const auto max_age = std::chrono::seconds(kv_park_max_age_sec);
+    for (auto it = disk_entries.begin(); it != disk_entries.end();) {
+        if ((*it)->pinned) {
+            ++it;
+            continue;
+        }
+        std::error_code error;
+        const auto written = std::filesystem::last_write_time((*it)->disk_path, error);
+        if (error || now - written <= max_age) {
+            ++it;
+            continue;
+        }
+        reuse_trace("park_expire path=%s bytes=%zu age_s=%llu",
+                    (*it)->disk_path.c_str(), (*it)->bytes,
+                    static_cast<unsigned long long>(
+                        std::chrono::duration_cast<std::chrono::seconds>(now - written).count()));
+        remove_sequence_files((*it)->disk_path);
+        disk_spilled_bytes -= std::min<std::uint64_t>(
+            disk_spilled_bytes, (*it)->bytes + sequence_metadata_bytes(**it));
+        it = disk_entries.erase(it);
+    }
+}
+
+void ProgramImplCore::prefetch_disk_entries() {
+    if (kv_park_prefetch == 0 || !parked.enabled() || disk_entries.empty()) { return; }
+    std::vector<PagedKVPool*> text_pools;
+    std::vector<PagedKVPool*> backend_pools;
+    storage_pools(text_pools, backend_pools);
+
+    // Fixed MRU schedule by image mtime: deterministic across restarts, unlike the in-process
+    // park clock. Pinned shared-prefix images are not conversations and are never prefetched.
+    struct Candidate {
+        std::filesystem::file_time_type written;
+        std::uint64_t id;
+    };
+    std::vector<Candidate> candidates;
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        if (entry->pinned) { continue; }
+        std::error_code error;
+        const auto written = std::filesystem::last_write_time(entry->disk_path, error);
+        if (!error) { candidates.push_back({written, entry->id}); }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.written > b.written; });
+
+    std::size_t prefetched = 0;
+    for (const Candidate& candidate : candidates) {
+        if (prefetched >= kv_park_prefetch) { break; }
+        const ParkedSequence* meta = find_disk_entry(candidate.id);
+        if (meta == nullptr) { continue; }
+        const std::string path  = meta->disk_path;
+        const std::uint64_t id  = meta->id;
+        const std::size_t bytes = meta->bytes + sequence_metadata_bytes(*meta);
+        std::unique_ptr<ParkedSequence> entry;
+        try {
+            entry = read_sequence_image(path, image_geometry(), text_pools, backend_pools);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[reuse] park_prefetch FAILED %s: %s\n", path.c_str(),
+                         error.what());
+            continue;
+        }
+        if (entry == nullptr) { continue; }
+        entry->disk_backed = false;
+        entry->disk_path.clear();
+        entry->pinned = false;
+        if (!parked.insert(std::move(entry), park_clock++, 0).has_value()) {
+            // Does not fit the host budget; leave the disk entry untouched.
+            continue;
+        }
+        for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
+            if ((*it)->id == id) {
+                it = disk_entries.erase(it);
+                break;
+            }
+        }
+        remove_sequence_files(path);
+        disk_spilled_bytes -= std::min<std::uint64_t>(disk_spilled_bytes, bytes);
+        ++prefetched;
+        reuse_trace("park_prefetch id=%llu path=%s ram_entries=%zu", static_cast<unsigned long long>(id),
+                    path.c_str(), parked.entry_count());
     }
 }
 
 void ProgramImplCore::enforce_disk_budget() {
+    // Drop long-idle images first, then apply the byte-budget LRU. Both are fixed policies: no
+    // entry is spared because it is old, and none is kept because it is large. Startup indexing
+    // defers the age sweep until after the MRU prefetch has taken its entries.
+    if (!disk_index_loading_) { sweep_expired_disk_entries(); }
     const std::uint64_t budget =
         park_spill_bytes != 0 ? park_spill_bytes : parked.budget_bytes();
     if (budget == 0) { return; }
@@ -2373,6 +2557,8 @@ void ProgramImplCore::enforce_disk_budget() {
 void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
                                          std::uint32_t text_pages, std::uint32_t backend_pages,
                                          const RequestPlanImpl& plan) {
+    // `meta` is bound to an entry the caller resolved after draining completions; draining again
+    // here could erase that entry under the reference.
     std::vector<PagedKVPool*> text_pools;
     std::vector<PagedKVPool*> backend_pools;
     storage_pools(text_pools, backend_pools);
@@ -2494,29 +2680,40 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         if (!spill_enabled && planned > parked.budget_bytes()) { return false; }
 
         auto entry                = std::make_unique<ParkedSequence>();
-        entry->ledger             = sequence.ledger;
-        entry->prefix_identity    = sequence.prefix_identity;
+        // A detach consumes the lane (the caller clears it once the entry is stored), so its
+        // metadata and checkpoint histories can be moved instead of copied. Every retained
+        // checkpoint carries a ~73 MiB slot image per rank, so copying the ring cost hundreds of
+        // MiB to several GiB per park. A snapshot must copy: the lane keeps its state.
+        const auto take = [detach](auto& destination, auto& source) {
+            if (detach) {
+                destination = std::move(source);
+            } else {
+                destination = source;
+            }
+        };
+        take(entry->ledger, sequence.ledger);
+        take(entry->prefix_identity, sequence.prefix_identity);
         entry->execution_frontier = sequence.execution_frontier;
         entry->ledger_frontier    = sequence.ledger_frontier;
         entry->mtp_kv_valid       = sequence.mtp_kv_valid;
         entry->rope_delta         = sequence.rope_delta;
         entry->tail_hidden_valid  = sequence.tail_hidden_valid;
         entry->mtp_draft_count    = sequence.mtp_draft_count;
-        entry->mtp_drafts         = sequence.mtp_drafts;
+        take(entry->mtp_drafts, sequence.mtp_drafts);
         if (checkpoint) {
             entry->checkpoint_valid    = true;
             entry->checkpoint_kind     = sequence.rewrite_checkpoint.kind;
             entry->checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
-            entry->checkpoint_ledger   = sequence.checkpoint_ledger;
-            entry->checkpoint_identity = sequence.checkpoint_identity;
+            take(entry->checkpoint_ledger, sequence.checkpoint_ledger);
+            take(entry->checkpoint_identity, sequence.checkpoint_identity);
         }
-        entry->checkpoint_history = sequence.checkpoint_history;
-        entry->boundary_history   = sequence.boundary_history;
-        entry->response_history   = sequence.response_history;
-        entry->long_range_history = sequence.long_range_history;
-        entry->shared_prefix      = sequence.shared_prefix;
-        entry->tools_prefix       = sequence.tools_prefix;
-        entry->resume_anchor      = sequence.resume_anchor;
+        take(entry->checkpoint_history, sequence.checkpoint_history);
+        take(entry->boundary_history, sequence.boundary_history);
+        take(entry->response_history, sequence.response_history);
+        take(entry->long_range_history, sequence.long_range_history);
+        take(entry->shared_prefix, sequence.shared_prefix);
+        take(entry->tools_prefix, sequence.tools_prefix);
+        take(entry->resume_anchor, sequence.resume_anchor);
 
         // One rank's KV payloads and its own GDN slots -- the current slot always, and the
         // checkpoint slot when the lane carries a rewrite checkpoint. The caller has made this
@@ -2538,18 +2735,19 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                         backend->copy_to_host(backend->mapped_page_count(), stream));
                 }
             }
-            std::vector<std::byte> slot(state.slot_image_bytes());
-            state.export_slot(LinearStateSlots::current_state_slot(lane, max_concurrency),
-                              std::span<std::byte>(slot), stream);
+            // The slot image is stored in a pageable vector; move it through the pinned window
+            // so the device leg is not serialized by the driver's bounce buffer.
+            const std::span<std::byte> stage = slot_image_staging();
+            state.export_slot(LinearStateSlots::current_state_slot(lane, max_concurrency), stage,
+                              stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            entry->linear_state.push_back(std::move(slot));
+            entry->linear_state.emplace_back(stage.begin(), stage.end());
             if (checkpoint) {
-                std::vector<std::byte> checkpoint_slot(state.slot_image_bytes());
                 state.export_slot(
-                    LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
-                    std::span<std::byte>(checkpoint_slot), stream);
+                    LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency), stage,
+                    stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                entry->checkpoint_state.push_back(std::move(checkpoint_slot));
+                entry->checkpoint_state.emplace_back(stage.begin(), stage.end());
             }
         };
 
@@ -2648,8 +2846,9 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         // The conversation is too large for the RAM tier (or the tier is disabled): keep it on
         // disk when a spill directory is configured. Disk copies are pruned only after the new
         // state is safely stored, so a failed write cannot lose the conversation.
-        if (spill_enabled && spill_entry(std::move(entry)) == nullptr) {
-            prune_superseded_disk(probe, protect_id);
+        if (spill_enabled && spill_entry(std::move(entry), protect_id) == nullptr) {
+            // spill_entry prunes older disk states itself (synchronously or when the background
+            // completion is drained), so the new entry is never treated as its own predecessor.
             if (detach) { clear_lane(sequence, requests[lane]); }
             return true;
         }
@@ -3098,6 +3297,24 @@ void ProgramImplCore::rotate_device_checkpoint(SequenceState& sequence) {
     push_host_checkpoint(sequence.checkpoint_history, export_checkpoint(sequence));
 }
 
+std::span<std::byte> ProgramImplCore::slot_image_staging() {
+    const std::size_t bytes = decoder->linear_attention.slot_image_bytes();
+    if (!slot_image_host || slot_image_host->size() < bytes) {
+        slot_image_host.emplace(bytes);
+    }
+    return {static_cast<std::byte*>(slot_image_host->data()), bytes};
+}
+
+void ProgramImplCore::import_slot_staged(LinearAttentionStatePool& state, std::int32_t slot,
+                                         std::span<const std::byte> image, cudaStream_t stream) {
+    const std::span<std::byte> stage = slot_image_staging();
+    if (image.size() != stage.size()) {
+        throw std::invalid_argument("GDN slot image does not match the pool geometry");
+    }
+    std::memcpy(stage.data(), image.data(), image.size());
+    state.import_slot(slot, stage, stream);
+}
+
 void ProgramImplCore::import_checkpoint_state(SequenceState& sequence,
                                               const HostCheckpoint& checkpoint,
                                               bool into_current) {
@@ -3109,18 +3326,28 @@ void ProgramImplCore::import_checkpoint_state(SequenceState& sequence,
     }
     const auto import_rank = [&](LinearAttentionStatePool& state,
                                  std::span<const std::byte> image, cudaStream_t stream) {
+        // One pinned copy feeds both slots; importing straight from the pageable image would
+        // serialize the device leg through the driver's bounce buffer.
+        const std::span<std::byte> stage = slot_image_staging();
+        if (image.size() != stage.size()) {
+            throw std::invalid_argument("GDN checkpoint image does not match the pool geometry");
+        }
+        std::memcpy(stage.data(), image.data(), image.size());
         if (into_current) {
             state.import_slot(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                              image, stream);
+                              stage, stream);
         }
         state.import_slot(
-            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency), image,
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency), stage,
             stream);
     };
     import_rank(decoder->linear_attention, std::span<const std::byte>(checkpoint.state[0]),
                 device.stream);
     CUDA_CHECK(cudaMemcpyAsync(sequence.rewrite_checkpoint_hidden.data, checkpoint.hidden.data(),
                                checkpoint.hidden.size(), cudaMemcpyHostToDevice, device.stream));
+    // The shared pinned staging window cannot be refilled for the next rank until this rank's
+    // imports have read it.
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
     for (auto& peer : peers) {
         const ScopedDevice scope(peer->device.device);
         import_rank(peer->decoder->linear_attention,
@@ -3239,13 +3466,25 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         if (sequence.kv->backend) {
             sequence.kv->backend->attach_from_host(*entry.backend[0], device.stream);
         }
-        decoder->linear_attention.import_slot(
-            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            std::span<const std::byte>(entry.linear_state[0]), device.stream);
+        // Resuming at a checkpoint materializes the checkpoint state into both slots below, so
+        // importing the execution-frontier slot here would be overwritten unused.
+        const bool resumes_at_boundary =
+            resume_at_checkpoint || resume_at_shared_prefix != SharedPrefixSlot::None;
+        if (!resumes_at_boundary) {
+            import_slot_staged(
+                decoder->linear_attention,
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                std::span<const std::byte>(entry.linear_state[0]), device.stream);
+        }
         if (entry.tail_hidden_valid) {
             CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, entry.tail_hidden[0].data(),
                                        entry.tail_hidden[0].size(), cudaMemcpyHostToDevice,
                                        device.stream));
+        }
+        if (!resumes_at_boundary) {
+            // The pinned staging window is refilled for each rank, so this rank's import must
+            // finish reading it first.
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
         }
         for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
@@ -3255,9 +3494,16 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                 sequence.kv->backend_peers[peer->rank - 1]->attach_from_host(
                     *entry.backend[peer->rank], peer->device.stream);
             }
-            peer->decoder->linear_attention.import_slot(
-                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                std::span<const std::byte>(entry.linear_state[peer->rank]), peer->device.stream);
+            if (!resumes_at_boundary) {
+                import_slot_staged(
+                    peer->decoder->linear_attention,
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    std::span<const std::byte>(entry.linear_state[peer->rank]),
+                    peer->device.stream);
+                // With more than one peer the staging window is reused; wait for this rank to
+                // consume it before the next one refills it.
+                CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+            }
         }
         for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
@@ -3373,13 +3619,19 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                 const auto import_checkpoint = [&](LinearAttentionStatePool& state,
                                                    std::span<const std::byte> image,
                                                    cudaStream_t stream) {
+                    const std::span<std::byte> stage = slot_image_staging();
+                    if (image.size() != stage.size()) {
+                        throw std::invalid_argument(
+                            "GDN checkpoint image does not match the pool geometry");
+                    }
+                    std::memcpy(stage.data(), image.data(), image.size());
                     state.import_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), image,
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), stage,
                         stream);
                     state.import_slot(
                         LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane,
                                                                         max_concurrency),
-                        image, stream);
+                        stage, stream);
                 };
                 import_checkpoint(decoder->linear_attention,
                                   std::span<const std::byte>(entry.checkpoint_state[0]),
@@ -3391,6 +3643,8 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                 CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, entry.checkpoint_hidden.data(),
                                            entry.checkpoint_hidden.size(), cudaMemcpyHostToDevice,
                                            device.stream));
+                // The shared staging window is reused by the peer import below.
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
                 for (auto& peer : peers) {
                     const ScopedDevice scope(peer->device.device);
                     import_checkpoint(
@@ -4372,7 +4626,8 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 }
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
-                                                            RequestControl& request) {
+                                                            RequestControl& request,
+                                                            std::uint32_t max_tokens) {
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -4382,6 +4637,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
+    const std::uint32_t cursor_before     = staged.cursor;
     const auto started                    = Clock::now();
     try {
         if (ram_kv.gpu_tokens != 0 && staged.cursor < staged.prompt_tokens) {
@@ -4455,6 +4711,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal =
                 std::min(prefill_chunk * pipeline_chunks, staged.prompt_tokens - staged.cursor);
+            // A scheduler slice bounds this step so another lane can decode in between. The
+            // boundary and Vision caps below still apply; whichever is shorter wins.
+            if (max_tokens != 0) { nominal = std::min(nominal, max_tokens); }
             // The boundary checkpoints are captured by the chunk that reaches each one, in prompt
             // order: the tool anchor first, then the shared leading boundary, then the last stable
             // message boundary. Clamping this step to that frontier keeps the response checkpoint
@@ -4562,7 +4821,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             // chunk per unit). The scheduler captures only when a chunk actually ends at the
             // frontier, so in that case nothing was captured and the next step -- whose window
             // starts at the Vision boundary -- reaches it instead.
-            if (capture_boundary && staged.cursor == pending_boundary->frontier) {
+            const bool captured_boundary =
+                capture_boundary && staged.cursor == pending_boundary->frontier;
+            if (captured_boundary) {
                 // The boundary state is now in the device checkpoint slot and hidden buffer.
                 // Publish it with this prompt's lineage and move it into the host ring, where a
                 // diverging replay -- or another session sharing this prefix -- can restore it.
@@ -4608,8 +4869,26 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.tail_column = static_cast<std::int32_t>(result.tail_column);
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                // The admission projection counts one quantum per prefill chunk plus one per
+                // boundary split. Slices are fractional steps, so charge a slice only when it
+                // completes that projected work: a chunk boundary relative to the reuse base, a
+                // captured boundary, or the prompt end. Whole-chunk steps keep charging one.
+                std::uint32_t service_units = 1;
+                if (max_tokens != 0) {
+                    const bool crossed_chunk =
+                        staged.cursor >= staged.base && cursor_before >= staged.base &&
+                        (staged.cursor - staged.base) / prefill_chunk !=
+                            (cursor_before - staged.base) / prefill_chunk;
+                    service_units =
+                        (captured_boundary || crossed_chunk ||
+                         staged.cursor == staged.prompt_tokens)
+                            ? 1U
+                            : 0U;
+                }
                 return runtime::PrefillStepResult{
-                    .summary = summary, .processed_prompt_tokens = processed_prompt_tokens};
+                    .summary                 = summary,
+                    .processed_prompt_tokens = processed_prompt_tokens,
+                    .service_units           = service_units};
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");

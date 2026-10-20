@@ -143,6 +143,16 @@ struct EngineOptions {
     // time). Zero disables the deadline entirely, so a request waits as long as the Engine needs.
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Maximum prompt tokens one staged prefill step processes while another lane is decoding.
+    // A prefill step has a large fixed cost, so the slice bounds the GPU work but cannot by
+    // itself give the decoder much time. Zero restores whole-chunk steps. Must be a multiple of
+    // 128 when nonzero.
+    std::uint32_t prefill_slice_tokens = 256;
+    // Decode rounds run between two prefill steps while another lane is decoding. This is the
+    // effective fairness knob: a prefill step costs ~140 ms of fixed overhead, so one round per
+    // step leaves the decoder at ~12 tok/s regardless of slice size; more rounds trade prefill
+    // throughput for decoder responsiveness. Must be at least 1.
+    std::uint32_t prefill_decode_rounds = 1;
     // Interval at which the executor emits an OutputSink::keepalive() ping while a request is
     // producing no output -- a multi-minute prefill, or time spent queued behind another
     // request's prefill. The consumer (e.g. an SSE handler) turns this into a transport-level
@@ -159,6 +169,17 @@ struct EngineOptions {
     // host memory when the lane is reclaimed, so a conversation that comes back resumes exactly
     // without re-prefilling its prompt.
     std::uint64_t kv_park_bytes = 0;
+    // Background spill writer: payload bytes of submitted-but-undrained spill images. Spill
+    // writes run on one deterministic FIFO thread so the serving worker never blocks on a
+    // multi-GB image; 0 restores the old synchronous write on the worker.
+    std::uint64_t kv_park_io_bytes = 8ULL << 30;
+    // At startup, read this many most-recently-used spilled conversations back into the RAM
+    // tier in MRU order, so the first request after a restart avoids a disk restore. 0 disables.
+    std::uint32_t kv_park_prefetch = 0;
+    // Delete spilled conversation images (and sidecars) that have not been written or restored
+    // for this many seconds. The byte budget already evicts least-recently-used entries when it
+    // is exceeded; this additionally removes long-idle leftovers below that budget. 0 disables.
+    std::uint64_t kv_park_max_age_sec = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

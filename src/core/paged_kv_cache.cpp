@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -24,6 +25,86 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     if (tokens == 0) { return 0; }
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+// A packed page image is stored long-term in pageable host memory, but a direct transfer
+// between it and the device is serialized through the driver's bounce buffer. Moving the
+// transfer through a reusable pinned window keeps the device leg at PCIe line rate; the extra
+// host copy is cheap next to that. The window is per-thread, allocated once, and deliberately
+// leaked so it outlives CUDA teardown.
+constexpr std::size_t kCopyStageBytes = 32U << 20U;
+
+unsigned char* copy_stage() noexcept {
+    thread_local unsigned char* stage = [] {
+        void* ptr = nullptr;
+        if (cudaHostAlloc(&ptr, kCopyStageBytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return static_cast<unsigned char*>(nullptr);
+        }
+        return static_cast<unsigned char*>(ptr);
+    }();
+    return stage;
+}
+
+void copy_to_host_staged(unsigned char* host, const unsigned char* device, std::size_t bytes,
+                         cudaStream_t stream) {
+    unsigned char* stage = copy_stage();
+    if (stage == nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(host, device, bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return;
+    }
+    while (bytes != 0) {
+        const std::size_t chunk = std::min(bytes, kCopyStageBytes);
+        CUDA_CHECK(cudaMemcpyAsync(stage, device, chunk, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::memcpy(host, stage, chunk);
+        host += chunk;
+        device += chunk;
+        bytes -= chunk;
+    }
+}
+
+void copy_from_host_staged(unsigned char* device, const unsigned char* host, std::size_t bytes,
+                           cudaStream_t stream) {
+    unsigned char* stage = copy_stage();
+    if (stage == nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return;
+    }
+    while (bytes != 0) {
+        const std::size_t chunk = std::min(bytes, kCopyStageBytes);
+        std::memcpy(stage, host, chunk);
+        CUDA_CHECK(cudaMemcpyAsync(device, stage, chunk, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        device += chunk;
+        host += chunk;
+        bytes -= chunk;
+    }
+}
+
+// Copies the logical page span [page, page + count) of one plane between the device and a host
+// image, coalescing runs of physically contiguous pages into one transfer. The allocator prefers
+// contiguous physical runs, so a fresh image is usually a handful of transfers instead of one per
+// 64-token page.
+template <typename HostPtr, typename Copy>
+void copy_page_runs(std::uint32_t pages, std::span<const std::int32_t> page_ids,
+                    std::size_t page_bytes, HostPtr host, unsigned char* device, Copy&& copy) {
+    std::uint32_t page = 0;
+    while (page < pages) {
+        const std::int32_t first = page_ids[page];
+        if (first < 0) { throw std::logic_error("Paged KV image found an unmapped page"); }
+        std::uint32_t count = 1;
+        while (page + count < pages &&
+               page_ids[page + count] == first + static_cast<std::int32_t>(count)) {
+            ++count;
+        }
+        copy(host + static_cast<std::size_t>(page) * page_bytes,
+             device + static_cast<std::size_t>(first) * page_bytes,
+             static_cast<std::size_t>(count) * page_bytes);
+        page += count;
+    }
 }
 
 void validate_distinct_pools(std::span<const PagedKVReservation> reservations) {
@@ -763,15 +844,12 @@ std::unique_ptr<PagedKVImage> PagedKVAllocation::detach_to_host(cudaStream_t str
         const Tensor& plane          = pool_->plane(p);
         const std::size_t page_bytes = image->plane_page_bytes_[p];
         unsigned char* host          = image->data_.data() + image->plane_offsets_[p];
-        for (std::uint32_t page = 0; page < image->pages_; ++page) {
-            const std::int32_t id = page_ids_[page];
-            if (id < 0) { throw std::logic_error("Paged KV detach found an unmapped logical page"); }
-            CUDA_CHECK(cudaMemcpyAsync(
-                host + static_cast<std::size_t>(page) * page_bytes,
-                static_cast<const unsigned char*>(plane.data) +
-                    static_cast<std::size_t>(id) * page_bytes,
-                page_bytes, cudaMemcpyDeviceToHost, stream));
-        }
+        copy_page_runs(
+            image->pages_, page_ids_, page_bytes, host,
+            static_cast<unsigned char*>(plane.data),
+            [&](unsigned char* dst, unsigned char* src, std::size_t bytes) {
+                copy_to_host_staged(dst, src, bytes, stream);
+            });
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     release();
@@ -801,15 +879,11 @@ std::unique_ptr<PagedKVImage> PagedKVAllocation::copy_to_host(std::uint32_t page
         const Tensor& plane          = pool_->plane(p);
         const std::size_t page_bytes = image->plane_page_bytes_[p];
         unsigned char* host          = image->data_.data() + image->plane_offsets_[p];
-        for (std::uint32_t page = 0; page < pages; ++page) {
-            const std::int32_t id = page_ids_[page];
-            if (id < 0) { throw std::logic_error("Paged KV snapshot found an unmapped page"); }
-            CUDA_CHECK(cudaMemcpyAsync(
-                host + static_cast<std::size_t>(page) * page_bytes,
-                static_cast<const unsigned char*>(plane.data) +
-                    static_cast<std::size_t>(id) * page_bytes,
-                page_bytes, cudaMemcpyDeviceToHost, stream));
-        }
+        copy_page_runs(
+            pages, page_ids_, page_bytes, host, static_cast<unsigned char*>(plane.data),
+            [&](unsigned char* dst, unsigned char* src, std::size_t bytes) {
+                copy_to_host_staged(dst, src, bytes, stream);
+            });
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return image;
@@ -842,15 +916,12 @@ void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t
         const Tensor& plane          = pool_->plane(p);
         const std::size_t page_bytes = image.plane_page_bytes_[p];
         const unsigned char* host    = image.data_.data() + image.plane_offsets_[p];
-        for (std::uint32_t page = 0; page < image.pages_; ++page) {
-            const std::int32_t id = page_ids_[page];
-            if (id < 0) { throw std::logic_error("Paged KV image attach materialized no page"); }
-            CUDA_CHECK(cudaMemcpyAsync(
-                static_cast<unsigned char*>(plane.data) +
-                    static_cast<std::size_t>(id) * page_bytes,
-                host + static_cast<std::size_t>(page) * page_bytes,
-                page_bytes, cudaMemcpyHostToDevice, stream));
-        }
+        copy_page_runs(
+            image.pages_, page_ids_, page_bytes, host,
+            static_cast<unsigned char*>(plane.data),
+            [&](const unsigned char* src, unsigned char* dst, std::size_t bytes) {
+                copy_from_host_staged(dst, src, bytes, stream);
+            });
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (bound_row_ >= 0) { publish_mapping(stream); }

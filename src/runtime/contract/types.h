@@ -85,6 +85,10 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // Service-projection quanta this step consumed. A sliced step that has not yet completed a
+    // projected prefill unit consumes zero, so slicing never overdraws the frozen admission
+    // projection; the default keeps whole-chunk steps at exactly one unit.
+    std::uint32_t service_units = 1;
 };
 
 struct RoundBudget {

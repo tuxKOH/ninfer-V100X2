@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/parked_disk_io.h"
 #include "targets/qwen3_6/impl/runtime/parked_sequence_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
@@ -353,11 +354,15 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // `max_tokens` bounds one step below the configured prefill chunk, so a scheduler can slice a
+    // long prefill and give other lanes decode rounds in between; zero uses the full chunk.
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+                                                                runtime::TransientRegion transient,
+                                                                std::uint32_t max_tokens = 0);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane,
+                                                                  std::uint32_t max_tokens = 0);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
@@ -483,6 +488,11 @@ public:
     // Conversations whose resident frontier did not fit the KV pool, held in host memory so they
     // can be resumed exactly instead of re-prefilled. Disabled (zero budget) by default.
     ParkedSequenceStore parked;
+    // Reusable pinned window for GDN slot images. Park/restore move one ~73 MiB slot per rank;
+    // transferring straight between the device and the pageable vector that stores the image
+    // would serialize each transfer through the driver's bounce buffer. Sized lazily from the
+    // pool's slot geometry and reused by every rank.
+    std::optional<PinnedHostBuffer> slot_image_host;
     // Disk-backed tier: metadata-only entries whose KV/state payload lives in a file. Pinned
     // entries were loaded from the shared-prefix file; the rest are spilled parked conversations.
     std::vector<std::unique_ptr<ParkedSequence>> disk_entries;
@@ -496,6 +506,14 @@ public:
     std::set<std::pair<std::uint32_t, std::uint64_t>> saved_prefix_keys;
     const std::string park_spill_dir;
     const std::uint64_t park_spill_bytes;
+    const std::uint64_t kv_park_io_bytes;
+    const std::uint32_t kv_park_prefetch;
+    const std::uint64_t kv_park_max_age_sec;
+    // Background FIFO spill writer; null when spill I/O is synchronous or no directory is set.
+    std::unique_ptr<ParkedDiskIo> disk_io;
+    // While the startup index is being built, budget enforcement must not age-expire entries:
+    // the prefetch that runs right after loading has first claim on the most recent images.
+    bool disk_index_loading_ = false;
     bool saved_tools_prefix    = false;
     bool saved_leading_prefix  = false;
     // Host image of the persistent arena chunks evicted for the Vision encode in flight. Empty
@@ -611,7 +629,8 @@ private:
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+                                                             RequestControl& request,
+                                                             std::uint32_t max_tokens = 0);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -668,9 +687,18 @@ private:
     static void pin_resume_anchor(SequenceState& sequence, const HostCheckpoint& checkpoint);
     void write_shared_prefix(SequenceState& sequence, const HostCheckpoint& pinned, bool tools);
     // Writes an entry to the spill directory and replaces it with a metadata-only index entry.
-    // Returns nullptr on success; on failure it returns the still-intact entry so the caller can
-    // reinsert or drop it deliberately.
-    std::unique_ptr<ParkedSequence> spill_entry(std::unique_ptr<ParkedSequence> entry);
+    // With the background writer this only submits the job; the index entry appears when the
+    // worker drains completions. Returns nullptr on success; on failure it returns the
+    // still-intact entry so the caller can reinsert or drop it deliberately.
+    std::unique_ptr<ParkedSequence> spill_entry(std::unique_ptr<ParkedSequence> entry,
+                                                std::uint64_t protect_id = 0);
+    // Moves finished background writes into disk_entries and prunes superseded states. Runs only
+    // on the worker thread.
+    void drain_disk_completions();
+    // Startup: reads the MRU spilled conversations back into the RAM tier (fixed MRU order).
+    void prefetch_disk_entries();
+    // Deletes spilled images idle longer than kv_park_max_age_sec. Byte-budget LRU still applies.
+    void sweep_expired_disk_entries();
     // Drops older parked states that the incoming lineage strictly contains (same tokens,
     // positions and media up to a shorter frontier). One current copy per conversation; the
     // plan's protected target and pinned entries are never removed.
@@ -678,7 +706,10 @@ private:
     std::uint64_t superseded_ram_bytes(const ParkedSequence& incoming,
                                        std::uint64_t protect_id) const;
     void prune_superseded_ram(const ParkedSequence& incoming, std::uint64_t protect_id);
-    void prune_superseded_disk(const ParkedSequence& incoming, std::uint64_t protect_id);
+    // `keep_id` is the entry the incoming state was just written as; the equal-frontier state
+    // would otherwise supersede itself and be deleted on the spot.
+    void prune_superseded_disk(const ParkedSequence& incoming, std::uint64_t protect_id,
+                               std::uint64_t keep_id = 0);
     void enforce_disk_budget();
     void restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
                             std::uint32_t text_pages, std::uint32_t backend_pages,
@@ -693,6 +724,11 @@ private:
     // checkpoint slot is written and the resident checkpoint path copies it forward.
     void import_checkpoint_state(SequenceState& sequence, const HostCheckpoint& checkpoint,
                                  bool into_current);
+    // Pinned staging window sized to one GDN slot image, shared by every rank's park/restore.
+    [[nodiscard]] std::span<std::byte> slot_image_staging();
+    // Copies a pageable slot image into the pinned window and imports it into `slot`.
+    void import_slot_staged(LinearAttentionStatePool& state, std::int32_t slot,
+                            std::span<const std::byte> image, cudaStream_t stream);
     [[nodiscard]] HostCheckpoint export_checkpoint(SequenceState& sequence);
     // Moves the lane's current checkpoint into its host history, if one is valid.
     void rotate_device_checkpoint(SequenceState& sequence);

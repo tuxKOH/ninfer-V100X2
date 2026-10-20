@@ -46,11 +46,14 @@ public:
         : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
+          prefill_slice_tokens_(options.prefill_slice_tokens),
+          prefill_decode_rounds_(options.prefill_decode_rounds),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           keepalive_interval_(std::chrono::milliseconds(options.stream_keepalive_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            pending_timeout_.count() < 0 || options.max_pending_requests == 0) {
+            pending_timeout_.count() < 0 || options.max_pending_requests == 0 ||
+            options.prefill_decode_rounds == 0 || options.prefill_decode_rounds > 64) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
@@ -609,7 +612,8 @@ private:
     }
 
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
-        if (work == 0 || work > request->remaining_service_work) {
+        if (work == 0) { return; }
+        if (work > request->remaining_service_work) {
             throw std::logic_error("request service projection consumed " + std::to_string(work) +
                                    " quanta with " +
                                    std::to_string(request->remaining_service_work) + " remaining");
@@ -727,7 +731,7 @@ private:
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         request->prefill_processed_tokens += step.processed_prompt_tokens;
-        consume_service_work(request, 1);
+        consume_service_work(request, step.service_units);
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
@@ -766,6 +770,18 @@ private:
         }
     }
 
+    // A slice only matters while some other lane has output to make: with no decoder to feed,
+    // short steps would just add launch overhead to the same work.
+    [[nodiscard]] std::uint32_t prefill_step_tokens() const noexcept {
+        if (prefill_slice_tokens_ == 0) { return 0; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr && slots_[lane]->decode_ready) {
+                return prefill_slice_tokens_;
+            }
+        }
+        return 0;
+    }
+
     void run_prefill_step() {
         if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane_;
@@ -773,7 +789,8 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
+        const PrefillStepResult step =
+            instance_.program->advance_prefill_lane(lane, prefill_step_tokens());
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();
@@ -966,7 +983,8 @@ private:
             publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+                lane, std::move(request->prompt), std::move(selected_plan), transient,
+                prefill_step_tokens());
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
@@ -1312,11 +1330,16 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
+                    // A prefill step has a large fixed cost, so let the decoder run a configured
+                    // number of rounds between steps; the step itself is bounded by the slice.
+                    if (!membership.empty() &&
+                        decode_rounds_since_prefill_ < prefill_decode_rounds_) {
                         run_decode_round(membership);
+                        ++decode_rounds_since_prefill_;
                         previous_unit_was_decode = true;
                     } else {
                         run_prefill_step();
+                        decode_rounds_since_prefill_ = 0;
                         previous_unit_was_decode = false;
                     }
                     continue;
@@ -1358,6 +1381,8 @@ private:
     const int device_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
+    const std::uint32_t prefill_slice_tokens_;
+    const std::uint32_t prefill_decode_rounds_;
     const std::chrono::milliseconds pending_timeout_;
     const std::chrono::milliseconds keepalive_interval_;
     const AdmissionResources admission_capacity_;
@@ -1371,6 +1396,7 @@ private:
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
+    std::uint32_t decode_rounds_since_prefill_ = 0;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

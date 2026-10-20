@@ -841,6 +841,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->shared_prefix_dir  = inputs.shared_prefix_dir;
     impl->park_spill_dir      = inputs.park_spill_dir;
     impl->park_spill_bytes    = inputs.park_spill_bytes;
+    impl->kv_park_io_bytes    = inputs.kv_park_io_bytes;
+    impl->kv_park_prefetch    = inputs.kv_park_prefetch;
+    impl->kv_park_max_age_sec = inputs.kv_park_max_age_sec;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -996,6 +999,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .shared_prefix_dir = options.shared_prefix_dir,
         .park_spill_dir = options.park_spill_dir,
         .park_spill_bytes = options.park_spill_bytes,
+        .kv_park_io_bytes = options.kv_park_io_bytes,
+        .kv_park_prefetch = options.kv_park_prefetch,
+        .kv_park_max_age_sec = options.kv_park_max_age_sec,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

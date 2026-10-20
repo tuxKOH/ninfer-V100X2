@@ -260,6 +260,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    const PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    // Make background spill completions visible to the planner before it scans parked state.
+    drain_disk_completions();
     const RequestControl& request = requests[lane];
     const SequenceState& sequence = sequences[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||

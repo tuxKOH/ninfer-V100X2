@@ -256,6 +256,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.prefill_slice_tokens     = options_.prefill_slice_tokens;
+    engine_options.prefill_decode_rounds    = options_.prefill_decode_rounds;
     engine_options.stream_keepalive_ms       = options_.stream_keepalive_ms;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
@@ -273,6 +275,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.shared_prefix_dir = options_.shared_prefix_dir;
     engine_options.park_spill_dir = options_.park_spill_dir;
     engine_options.park_spill_bytes = options_.park_spill_bytes;
+    engine_options.kv_park_io_bytes = options_.kv_park_io_bytes;
+    engine_options.kv_park_prefetch = options_.kv_park_prefetch;
+    engine_options.kv_park_max_age_sec = options_.kv_park_max_age_sec;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;

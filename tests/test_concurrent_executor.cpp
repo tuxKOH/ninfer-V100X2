@@ -24,6 +24,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -229,7 +230,8 @@ public:
     }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
-                                             ScriptedPlan&& plan, rt::TransientRegion) {
+                                             ScriptedPlan&& plan, rt::TransientRegion,
+                                             std::uint32_t max_tokens = 0) {
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
         Lane& state         = lanes_[lane];
         state.script        = std::move(queued_.front());
@@ -238,14 +240,26 @@ public:
         state.emitted       = 0;
         state.prompt_tokens = plan.summary().prompt_tokens;
         state.prefill_done  = 0;
+        record_prefill_slice(max_tokens);
         return prefill_step(lane);
     }
 
-    rt::PrefillStepResult advance_prefill_lane(std::uint32_t lane) {
+    rt::PrefillStepResult advance_prefill_lane(std::uint32_t lane, std::uint32_t max_tokens = 0) {
         if (lanes_[lane].lifecycle != Lifecycle::Active) {
             throw std::logic_error("scripted prefill step no longer matches Program state");
         }
+        record_prefill_slice(max_tokens);
         return prefill_step(lane);
+    }
+
+    [[nodiscard]] std::uint32_t last_prefill_slice() const noexcept { return last_prefill_slice_; }
+    [[nodiscard]] std::uint32_t max_prefill_slice() const noexcept { return max_prefill_slice_; }
+    [[nodiscard]] std::uint32_t sliced_prefill_steps() const noexcept {
+        return sliced_prefill_steps_;
+    }
+    // Widest run of decode rounds the executor ran between two prefill steps.
+    [[nodiscard]] std::uint32_t max_decode_rounds_between_prefills() const noexcept {
+        return max_decode_rounds_between_prefills_;
     }
 
     void resolve_prefill_lane(std::uint32_t lane, bool finished) {
@@ -257,6 +271,10 @@ public:
 
     rt::BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                            std::span<const rt::RoundBudget>) {
+        // Only the run between two prefill steps is meaningful; the value is snapshotted when
+        // the next prefill step starts, so decode rounds after the last prefill step do not
+        // inflate it.
+        ++decode_rounds_since_prefill_;
         batch_.clear();
         for (const std::uint32_t lane : lanes) {
             Lane& state = lanes_[lane];
@@ -322,6 +340,8 @@ public:
 
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     void evict_retained_lane(std::uint32_t) noexcept {}
+    // The graceful-shutdown dump is a real-Program concern; the fake has nothing to persist.
+    void persist_state() {}
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
         return {};
     }
@@ -348,6 +368,13 @@ public:
     [[nodiscard]] std::size_t maximum_batch_rows() const noexcept { return maximum_batch_rows_; }
 
 private:
+    void record_prefill_slice(std::uint32_t max_tokens) noexcept {
+        last_prefill_slice_   = max_tokens;
+        current_prefill_slice_ = max_tokens;
+        max_prefill_slice_    = std::max(max_prefill_slice_, max_tokens);
+        if (max_tokens != 0) { ++sliced_prefill_steps_; }
+    }
+
     enum class Lifecycle : std::uint8_t {
         Empty,   // no request
         Active,  // owns a sequence, no round outstanding
@@ -370,6 +397,9 @@ private:
         if (state.script.prefill_step_delay.count() > 0) {
             std::this_thread::sleep_for(state.script.prefill_step_delay);
         }
+        max_decode_rounds_between_prefills_ =
+            std::max(max_decode_rounds_between_prefills_, decode_rounds_since_prefill_);
+        decode_rounds_since_prefill_ = 0;
         ++state.prefill_done;
         if (state.prefill_done < state.script.prefill_steps) {
             return rt::PrefillStepResult{
@@ -377,6 +407,9 @@ private:
                 .round                   = rt::GeneratedRound{},
                 .processed_prompt_tokens = 1,
                 .complete                = false,
+                // Mirror the real Program: a sliced fractional step charges no projected unit;
+                // an unsliced step is a whole chunk and charges one.
+                .service_units           = current_prefill_slice_ == 0 ? 1U : 0U,
             };
         }
         state.token = license(lane);
@@ -410,6 +443,12 @@ private:
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
     std::uint64_t service_allowance_ = 0;
+    std::uint32_t last_prefill_slice_ = 0;
+    std::uint32_t max_prefill_slice_  = 0;
+    std::uint32_t current_prefill_slice_ = 0;
+    std::uint32_t sliced_prefill_steps_ = 0;
+    std::uint32_t decode_rounds_since_prefill_ = 0;
+    std::uint32_t max_decode_rounds_between_prefills_ = 0;
 };
 
 struct ScriptedPackage {
@@ -944,6 +983,91 @@ void test_stream_keepalive_disabled(const q36::Frontend& frontend,
            "a keepalive was emitted even though the interval was disabled");
 }
 
+// A prefill step used to run a whole 2560-token chunk while another lane had committed output
+// waiting, dropping that lane to a few tokens per second. While any lane is decode-ready the
+// executor now bounds each prefill step by the configured slice; with no decoder it still uses
+// the whole chunk.
+void test_prefill_slice_cooperates_with_decode(const q36::Frontend& frontend,
+                                               const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kSlice = 128;
+    const auto run = [&](std::uint32_t slice, bool pair) {
+        ScriptedInstance instance{.loaded =
+                                      std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                                  .program = std::make_unique<ScriptedProgram>(pair ? 2 : 1),
+                                  .request_memory         = {},
+                                  .kv_capacity_resolution = {}};
+        instance.program->set_service_allowance(16);
+        if (pair) {
+            // A decodes long enough to still be ready when B is admitted.
+            instance.program->push_script(
+                GenerationScript{.tokens = std::vector<TokenId>(200, 0)});
+            // B needs several prefill steps; each one should see the slice while A decodes.
+            instance.program->push_script(
+                GenerationScript{.tokens = {0, 0}, .prefill_steps = 5});
+        } else {
+            // Without a companion decoder every step must use the whole chunk.
+            instance.program->push_script(GenerationScript{
+                .tokens = std::vector<TokenId>(200, 0), .prefill_steps = 5});
+        }
+        ScriptedProgram& program     = *instance.program;
+        ninfer::EngineOptions options = executor_options(pair ? 2 : 1);
+        options.prefill_slice_tokens  = slice;
+        Executor executor(instance, options, device);
+
+        auto first = submit_request(executor, frontend, 200);
+        if (pair) {
+            auto second                  = submit_request(executor, frontend, 2);
+            const Outcome second_outcome = await(std::move(second));
+            expect(second_outcome.ok, "the sliced prefill did not complete");
+        }
+        const Outcome first_outcome = await(std::move(first));
+        expect(first_outcome.ok, "the decoding lane failed while a sliced prefill ran");
+        return program;
+    };
+
+    const ScriptedProgram sliced = run(kSlice, true);
+    expect(sliced.sliced_prefill_steps() > 0,
+           "no prefill step was bounded while another lane was decode-ready");
+    expect(sliced.max_prefill_slice() == kSlice,
+           "a prefill step ignored the configured slice");
+
+    const ScriptedProgram gated = run(kSlice, false);
+    expect(gated.sliced_prefill_steps() == 0,
+           "prefill was sliced even though no lane was decode-ready");
+
+    const ScriptedProgram whole = run(0, true);
+    expect(whole.sliced_prefill_steps() == 0,
+           "prefill was sliced even though the slice was disabled");
+}
+
+// A prefill step costs real fixed time, so one decode round per step leaves the companion lane at
+// a low rate. The configured number of decode rounds must actually run between two prefill steps.
+void test_prefill_decode_rounds_cooperate(const q36::Frontend& frontend,
+                                          const ninfer::DeviceContext& device) {
+    constexpr std::uint32_t kRounds = 4;
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(2),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->set_service_allowance(64);
+    instance.program->push_script(GenerationScript{.tokens = std::vector<TokenId>(2000, 0)});
+    instance.program->push_script(GenerationScript{.tokens = {0, 0}, .prefill_steps = 4});
+    ScriptedProgram& program      = *instance.program;
+    ninfer::EngineOptions options = executor_options(2);
+    options.prefill_slice_tokens  = 128;
+    options.prefill_decode_rounds = kRounds;
+    Executor executor(instance, options, device);
+
+    auto first  = submit_request(executor, frontend, 2000);
+    auto second = submit_request(executor, frontend, 2);
+    const Outcome second_outcome = await(std::move(second));
+    const Outcome first_outcome  = await(std::move(first));
+    expect(first_outcome.ok && second_outcome.ok,
+           "a request failed while decode rounds were interleaved with prefill");
+    expect(program.max_decode_rounds_between_prefills() == kRounds,
+           "the executor did not run exactly the configured decode rounds between prefill steps");
+}
+
 } // namespace
 
 int main() {
@@ -963,6 +1087,8 @@ int main() {
     test_admission_deadline_expiry_and_disable(frontend, device);
     test_engine_scope_failure_still_fails_all(frontend, device);
     test_prefill_progress_is_published(frontend, device);
+    test_prefill_slice_cooperates_with_decode(frontend, device);
+    test_prefill_decode_rounds_cooperate(frontend, device);
     test_stream_keepalive_fires_during_prefill(frontend, device);
     test_stream_keepalive_disabled(frontend, device);
     return failures == 0 ? 0 : 1;

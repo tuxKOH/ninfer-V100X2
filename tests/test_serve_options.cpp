@@ -51,7 +51,15 @@ int main() {
                       "periodic throughput interval default mismatch");
     failures += check(defaults.stream_keepalive_ms == 15000,
                       "SSE keepalive interval default mismatch");
+    failures += check(defaults.prefill_slice_tokens == 256,
+                      "prefill slice default mismatch");
+    failures += check(defaults.prefill_decode_rounds == 1,
+                      "prefill decode-round default mismatch");
     failures += check(defaults.kv_park_bytes == 0, "KV parking must be off by default");
+    failures += check(defaults.kv_park_io_bytes == (8ULL << 30),
+                      "background spill writer budget default mismatch");
+    failures += check(defaults.kv_park_prefetch == 0 && defaults.kv_park_max_age_sec == 0,
+                      "spill prefetch/age defaults mismatch");
     failures += check(defaults.default_max_tokens == 65536,
                       "default output-token budget mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
@@ -226,10 +234,45 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--stream-keepalive-ms", "2500"});
     failures += check(keepalive_tuned.stream_keepalive_ms == 2500,
                       "--stream-keepalive-ms did not reach serving options");
+    const ServeOptions sliced =
+        parse({"ninfer-serve", "model.ninfer", "--prefill-slice", "512"});
+    failures += check(sliced.prefill_slice_tokens == 512,
+                      "--prefill-slice did not reach serving options");
+    const ServeOptions unsliced =
+        parse({"ninfer-serve", "model.ninfer", "--prefill-slice", "0"});
+    failures += check(unsliced.prefill_slice_tokens == 0,
+                      "--prefill-slice 0 did not restore whole-chunk steps");
+    bool bad_slice_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-slice", "100"});
+    } catch (const std::invalid_argument&) { bad_slice_rejected = true; }
+    failures += check(bad_slice_rejected, "a misaligned --prefill-slice was accepted");
+    const ServeOptions decode_rounds =
+        parse({"ninfer-serve", "model.ninfer", "--prefill-decode-rounds", "4"});
+    failures += check(decode_rounds.prefill_decode_rounds == 4,
+                      "--prefill-decode-rounds did not reach serving options");
+    for (const char* invalid : {"0", "65"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-decode-rounds", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an out-of-range --prefill-decode-rounds was accepted");
+    }
     const ServeOptions parked =
         parse({"ninfer-serve", "model.ninfer", "--kv-park-bytes", "4294967296"});
     failures += check(parked.kv_park_bytes == 4294967296ULL,
                       "--kv-park-bytes did not reach serving options");
+    const ServeOptions spill_io =
+        parse({"ninfer-serve", "model.ninfer", "--kv-park-io-bytes", "0",
+               "--kv-park-prefetch", "2", "--kv-park-max-age-sec", "86400"});
+    failures += check(spill_io.kv_park_io_bytes == 0 && spill_io.kv_park_prefetch == 2 &&
+                          spill_io.kv_park_max_age_sec == 86400,
+                      "spill I/O scheduling options did not reach serving options");
+    bool bad_prefetch_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-park-prefetch", "65"});
+    } catch (const std::invalid_argument&) { bad_prefetch_rejected = true; }
+    failures += check(bad_prefetch_rejected, "an out-of-range --kv-park-prefetch was accepted");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
@@ -290,6 +333,19 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-slice") !=
+                          std::string::npos,
+                      "serve help omits --prefill-slice");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-decode-rounds") !=
+                          std::string::npos,
+                      "serve help omits --prefill-decode-rounds");
+    failures += check(serve_usage_text("ninfer-serve").find("--kv-park-io-bytes") !=
+                              std::string::npos &&
+                          serve_usage_text("ninfer-serve").find("--kv-park-prefetch") !=
+                              std::string::npos &&
+                          serve_usage_text("ninfer-serve").find("--kv-park-max-age-sec") !=
+                              std::string::npos,
+                      "serve help omits spill I/O scheduling flags");
     failures += check(serve_usage_text("ninfer-serve").find("--stream-keepalive-ms") !=
                           std::string::npos,
                       "serve help omits --stream-keepalive-ms");

@@ -125,6 +125,99 @@ int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder ord
 
 } // namespace
 
+// Park/restore copies packed page images through coalesced runs and a pinned staging window.
+// A fragmented physical layout must still round-trip every logical page in order.
+int check_image_round_trip() {
+    int failures = 0;
+    auto plan    = plan_paged_cache(8, 8, 1,
+                                    {{ninfer::DType::I8, 64, 2},
+                                     {ninfer::DType::I8, 64, 2},
+                                     {ninfer::DType::FP16, 1, 2},
+                                     {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+
+    // Occupy every page, then free alternating ones so the target's pages are non-contiguous.
+    std::vector<ninfer::PagedKVAllocation> holders;
+    holders.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        // A reservation is an entitlement; the physical page is chosen only on materialization.
+        holders.push_back(pool.reserve(1));
+        holders.back().materialize_pages(1);
+    }
+    for (int i = 0; i < 8; i += 2) { holders[static_cast<std::size_t>(i)].release(); }
+
+    auto target = pool.reserve(4);
+    target.materialize_pages(4);
+    const std::span<const std::int32_t> ids = target.page_ids();
+    bool fragmented                        = false;
+    for (std::size_t i = 1; i < ids.size(); ++i) {
+        fragmented = fragmented || ids[i] != ids[0] + static_cast<std::int32_t>(i);
+    }
+    failures += fragmented ? 0 : 1;
+    if (!fragmented) { std::cerr << "image round trip did not produce fragmented pages\n"; }
+
+    const auto pattern = [](std::size_t plane, std::size_t page) {
+        return static_cast<unsigned char>(37U + plane * 41U + page * 7U);
+    };
+    const auto fill_pages = [&](const ninfer::PagedKVAllocation& allocation) {
+        int errors = 0;
+        for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+            const ninfer::Tensor& plane = pool.plane(p);
+            const std::size_t bytes     = static_cast<std::size_t>(plane.nb[3]);
+            std::vector<unsigned char> host(bytes);
+            for (std::size_t page = 0; page < allocation.page_ids().size(); ++page) {
+                std::fill(host.begin(), host.end(), pattern(p, page));
+                const auto id = static_cast<std::size_t>(allocation.page_ids()[page]);
+                const cudaError_t err =
+                    cudaMemcpy(static_cast<unsigned char*>(plane.data) + id * bytes, host.data(),
+                               bytes, cudaMemcpyHostToDevice);
+                if (err != cudaSuccess) { ++errors; }
+            }
+        }
+        return errors;
+    };
+    failures += fill_pages(target);
+    failures += static_cast<int>(cudaDeviceSynchronize() != cudaSuccess);
+
+    const auto expect_image = [&](const ninfer::PagedKVImage& image, const char* label) {
+        int errors = static_cast<int>(image.pages() != 4);
+        for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+            const std::size_t bytes = image.plane_page_bytes()[p];
+            if (bytes != static_cast<std::size_t>(pool.plane(p).nb[3])) { ++errors; }
+            for (std::size_t page = 0; page < 4; ++page) {
+                const unsigned char* payload =
+                    image.payload().data() + image.plane_offsets()[p] + page * bytes;
+                for (std::size_t i = 0; i < bytes; ++i) {
+                    if (payload[i] != pattern(p, page)) {
+                        ++errors;
+                        break;
+                    }
+                }
+            }
+        }
+        if (errors != 0) { std::cerr << label << " payload mismatch\n"; }
+        return errors;
+    };
+
+    const auto snapshot = target.copy_to_host(4);
+    failures += expect_image(*snapshot, "snapshot");
+    failures += expect_size(target.mapped_page_count(), 4, "snapshot kept mapped pages");
+
+    auto detached = target.detach_to_host();
+    failures += expect_image(*detached, "detach");
+
+    auto restored = pool.reserve(4);
+    restored.attach_from_host(*detached);
+    failures += expect_size(restored.mapped_page_count(), 4, "attach mapped pages");
+    const auto reread = restored.copy_to_host(4);
+    failures += expect_image(*reread, "restore");
+
+    restored.release();
+    for (auto& holder : holders) { holder.release(); }
+    return failures == 0 ? 0 : fail("paged KV image round trip failed");
+}
+
 int main() {
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
@@ -420,6 +513,8 @@ int main() {
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
+
+    failures += check_image_round_trip();
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

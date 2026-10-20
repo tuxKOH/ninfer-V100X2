@@ -24,6 +24,11 @@
 #include <system_error>
 #include <vector>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace ninfer::targets::qwen3_6::detail {
 
 inline constexpr std::uint32_t kSequenceImageMagic   = 0x3147514eU;  // 'NQG1'
@@ -365,11 +370,32 @@ inline std::unique_ptr<ParkedSequence> read_entry(std::istream& in,
 
 } // namespace sequence_image_io_detail
 
+// Warm the page cache before a sequential image read. These images are hundreds of MB to a few
+// GB, so the kernel reads ahead while the reader parses the header instead of the stream waiting
+// for every block. No-op off Linux.
+inline void prefetch_image_file(const std::string& path) noexcept {
+#if defined(__linux__)
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { return; }
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    (void)::close(fd);
+#else
+    (void)path;
+#endif
+}
+
 inline std::vector<std::unique_ptr<ParkedSequence>> read_sequence_images(
     const std::string& path, const SequenceImageGeometry& geometry,
     std::span<PagedKVPool* const> text_pools, std::span<PagedKVPool* const> backend_pools) {
     using namespace image_stream;
-    std::ifstream in(path, std::ios::binary);
+    prefetch_image_file(path);
+    // The buffer must outlive the stream: declare it first so it is destroyed last.
+    std::vector<char> stream_buffer(1U << 20);
+    std::ifstream in;
+    in.rdbuf()->pubsetbuf(stream_buffer.data(),
+                          static_cast<std::streamsize>(stream_buffer.size()));
+    in.open(path, std::ios::binary);
     if (!in) { throw std::runtime_error("cannot open sequence image: " + path); }
     if (get_scalar<std::uint32_t>(in) != kSequenceImageMagic) {
         throw std::runtime_error("not a sequence image: " + path);

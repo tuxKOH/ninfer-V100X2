@@ -37,6 +37,10 @@ struct ServeOptions {
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
     std::uint32_t prefill_chunk            = 1024;
+    // Prompt tokens per prefill step while another lane decodes; 0 restores whole-chunk steps.
+    std::uint32_t prefill_slice_tokens     = 256;
+    // Decode rounds between prefill steps while another lane decodes; the fairness knob.
+    std::uint32_t prefill_decode_rounds    = 1;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     // Interval between SSE keepalive pings emitted while a streaming request produces no output
     // (a long prefill, or time queued behind another prefill). 0 disables the pings.
@@ -62,6 +66,11 @@ struct ServeOptions {
     // copied to host memory instead, so a conversation that comes back resumes without a
     // re-prefill. 0 disables parking.
     std::uint64_t kv_park_bytes = 0;
+    // Background spill writer budget (0 = synchronous writes), startup MRU prefetch depth, and
+    // age-based deletion of idle spill images (0 disables each).
+    std::uint64_t kv_park_io_bytes     = 8ULL << 30;
+    std::uint32_t kv_park_prefetch     = 0;
+    std::uint64_t kv_park_max_age_sec  = 0;
     bool volta_long_attention = false;
     SpeculativeOptions speculative;
     bool enable_vision      = false;

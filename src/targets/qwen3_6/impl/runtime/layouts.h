@@ -100,6 +100,10 @@ struct SequencePlanningInputs {
     std::string shared_prefix_dir;
     std::string park_spill_dir;
     std::uint64_t park_spill_bytes = 0;
+    // Background spill writer budget (0 = synchronous) and startup MRU prefetch depth.
+    std::uint64_t kv_park_io_bytes = 0;
+    std::uint32_t kv_park_prefetch = 0;
+    std::uint64_t kv_park_max_age_sec = 0;
     bool volta_long_attention = false;
 };
 
@@ -140,6 +144,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::string shared_prefix_dir;
     std::string park_spill_dir;
     std::uint64_t park_spill_bytes = 0;
+    std::uint64_t kv_park_io_bytes = 0;
+    std::uint32_t kv_park_prefetch = 0;
+    std::uint64_t kv_park_max_age_sec = 0;
     bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

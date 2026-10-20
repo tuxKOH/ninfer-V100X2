@@ -597,6 +597,8 @@ client-side override.
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait; `0` waits as long as the Engine needs | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--prefill-slice N` | prompt tokens per prefill step while another lane decodes; `0` uses the whole chunk | `256` |
+| `--prefill-decode-rounds N` | decode rounds between prefill steps while another lane decodes; `1..64` | `1` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
@@ -628,6 +630,9 @@ client-side override.
 | `--shared-prefix-dir DIR` | persist one image per distinct shared prefix (different system prompts/tool sets) and load every image in the directory at startup | unset |
 | `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to DIR when the host parking budget is exhausted | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations; `0` uses `--kv-park-bytes` | `0` |
+| `--kv-park-io-bytes N` | payload bytes queued to the background spill writer; `0` = synchronous | `8 GiB` |
+| `--kv-park-prefetch N` | startup MRU prefetch of spilled conversations into RAM | `0` |
+| `--kv-park-max-age-sec N` | delete spill images idle longer than N seconds; `0` disables | `0` |
 | `--vision-max-tokens N\|unlimited` | merged visual-token limit per prompt and its device reservations; `unlimited`/`none`/`0` removes the limit (needs `--vision-kv-swap` or `--vision-device cpu`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -725,7 +730,14 @@ waiting, and returns HTTP 503 with code `request_queue_timeout` if admission doe
 Setting it to `0` disables the deadline, so a request waits as long as the Engine needs. Because
 admission requires a free prefill owner, one long prompt can hold the whole queue behind its
 prefill; single-user local serving may prefer `0`, while a shared server wants a nonzero bound.
-There is no admission ETA or unbounded overflow queue.
+There is no admission ETA or unbounded overflow queue. While an admitted prefill runs alongside a
+decoding lane, each prefill step is bounded by `--prefill-slice` tokens (default `256`; `0`
+restores whole-chunk steps) and the worker runs `--prefill-decode-rounds` decode rounds between
+steps (default `1`; range `1..64`). A prefill step has a large fixed cost (~140 ms measured on the
+27B TP2 profile), so the slice alone leaves the decoder at roughly 12 tok/s; raising the decode
+rounds is the effective fairness knob and trades prefill throughput for decoder responsiveness.
+Both settings apply only when some lane is decode-ready; with no decoder present the full chunk is
+used and no decode rounds are inserted.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
@@ -842,6 +854,17 @@ loaded model (different rank count, KV slot/hidden sizes or plane geometry) are 
 line, and duplicate states of one lineage are reduced to the newest copy. Choose a filesystem with
 room for the budget; a 175k-token conversation is roughly 7 GiB. Files can be deleted while the
 server is stopped; the sidecar and image are removed together.
+
+Disk I/O runs on one deterministic FIFO writer, so a multi-GB spill never blocks the serving
+worker and spill order does not depend on request timing. `--kv-park-io-bytes N` bounds the
+payload bytes submitted to that writer (`0` restores synchronous writes on the worker), and the
+worker drains completed images at the next planning or spill step. Restores still run on the
+worker; `--kv-park-prefetch N` reads the N most recently written spill images back into host RAM
+at startup in fixed MRU order, so a restart's first request avoids both the disk read and the
+initial prefill. Reads use sequential page-cache read-ahead. `--kv-park-max-age-sec N` deletes
+spill images idle longer than N seconds (file mtime), independent of the byte budget; the budget
+still evicts least-recently-used entries when exceeded. Pinned shared-prefix images are never
+prefetched or age-deleted.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

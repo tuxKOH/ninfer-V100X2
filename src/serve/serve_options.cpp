@@ -127,7 +127,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--stream-keepalive-ms N] "
+           "[--prefill-chunk N] [--prefill-slice N] [--prefill-decode-rounds N] "
+           "[--log-stats-interval-ms N] [--stream-keepalive-ms N] "
            "[--device N] [--tp 1|2|4] "
            "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -142,6 +143,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--shared-prefix [--shared-prefix-save FILE] [--shared-prefix-load FILE] "
            "[--shared-prefix-dir DIR]] "
            "[--kv-park-spill-dir DIR] [--kv-park-spill-bytes N] "
+           "[--kv-park-io-bytes N] [--kv-park-prefetch N] [--kv-park-max-age-sec N] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -164,6 +166,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
+           "       --prefill-slice defaults to 256: prompt tokens per prefill step while another lane\n"
+           "       decodes, so that lane keeps generating; 0 uses the whole prefill chunk\n"
+           "       --prefill-decode-rounds defaults to 1: decode rounds between prefill steps;\n"
+           "       raise it to trade prefill throughput for decoder responsiveness (1..64)\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --stream-keepalive-ms defaults to 15000; 0 disables SSE prefill keepalive pings\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
@@ -181,6 +187,12 @@ std::string serve_usage_text(const char* argv0) {
            "       --shared-prefix-dir DIR keeps one image per distinct shared prefix and loads them all\n"
            "       --kv-park-spill-dir DIR spills the least-recently-used parked conversation to disk when\n"
            "       the host parking budget is exhausted; --kv-park-spill-bytes N bounds that directory\n"
+           "       --kv-park-io-bytes N bounds spill images queued to the background writer (default\n"
+           "       8 GiB); 0 writes spill images synchronously on the serving thread\n"
+           "       --kv-park-prefetch N reads the N most recently written spill images back into RAM\n"
+           "       at startup, in fixed MRU order (default 0)\n"
+           "       --kv-park-max-age-sec N deletes spill images idle longer than N seconds; the byte\n"
+           "       budget still evicts least-recently-used entries (default 0 = no age limit)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -290,6 +302,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--prefill-slice") {
+            options.prefill_slice_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-slice"), "prefill-slice"));
+        } else if (arg == "--prefill-decode-rounds") {
+            options.prefill_decode_rounds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-decode-rounds"), "prefill-decode-rounds"));
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -425,6 +443,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-park-spill-bytes") {
             options.park_spill_bytes =
                 parse_u64(require_value("--kv-park-spill-bytes"), "kv-park-spill-bytes");
+        } else if (arg == "--kv-park-io-bytes") {
+            options.kv_park_io_bytes =
+                parse_u64(require_value("--kv-park-io-bytes"), "kv-park-io-bytes");
+        } else if (arg == "--kv-park-prefetch") {
+            options.kv_park_prefetch = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-park-prefetch"), "kv-park-prefetch"));
+        } else if (arg == "--kv-park-max-age-sec") {
+            options.kv_park_max_age_sec =
+                parse_u64(require_value("--kv-park-max-age-sec"), "kv-park-max-age-sec");
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = parse_vision_token_budget(require_value("--vision-max-tokens"));
         } else if (arg == "--no-cuda-graph") {
@@ -488,6 +515,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--kv-park-spill-dir requires a bound: set --kv-park-spill-bytes or --kv-park-bytes");
     }
+    if (options.kv_park_prefetch > 64) {
+        throw std::invalid_argument("--kv-park-prefetch must be in [0,64]");
+    }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
@@ -504,6 +534,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.prefill_slice_tokens != 0 && options.prefill_slice_tokens % 128 != 0) {
+        throw std::invalid_argument("--prefill-slice must be 0 or a multiple of 128");
+    }
+    if (options.prefill_decode_rounds == 0 || options.prefill_decode_rounds > 64) {
+        throw std::invalid_argument("--prefill-decode-rounds must be in [1,64]");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_max_tokens == kUnlimitedVisionTokens && options.enable_vision &&
