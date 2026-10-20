@@ -43,7 +43,7 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
-    failures += check(defaults.vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
+    failures += check(defaults.vision_max_tokens == ninfer::kDefaultVisionTokenBudget,
                       "Vision token budget default changed");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -148,6 +148,27 @@ int main() {
                              "--vision-kv-swap"})
                           .vision_kv_swap,
                       "--vision-kv-swap did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-max-tokens", "65536"})
+                              .vision_max_tokens == 65536,
+                      "server rejected a Vision token budget above the former ceiling");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-max-tokens", "unlimited"})
+                              .vision_max_tokens == ninfer::kUnlimitedVisionTokens,
+                      "server did not parse the unlimited Vision token budget");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-max-tokens", "0"})
+                              .vision_max_tokens == ninfer::kUnlimitedVisionTokens,
+                      "server did not parse a zero Vision token budget as unlimited");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-max-tokens",
+                         "unlimited"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unlimited Vision was accepted without a dynamic path");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-kv-swap",
+                             "--vision-max-tokens", "unlimited"})
+                              .vision_max_tokens == ninfer::kUnlimitedVisionTokens,
+                      "unlimited Vision was rejected with --vision-kv-swap");
     {
         bool rejected = false;
         try {
@@ -170,12 +191,12 @@ int main() {
     failures += check(
         serve_usage_text("ninfer-serve").find("--vision-device") != std::string::npos,
         "serve help omits --vision-device");
-    for (const char* invalid : {"0", "32769"}) {
+    for (const char* invalid : {"-1", "abc"}) {
         bool rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--vision-max-tokens", invalid});
         } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "server accepted an out-of-range Vision token budget");
+        failures += check(rejected, "server accepted a malformed Vision token budget");
     }
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");

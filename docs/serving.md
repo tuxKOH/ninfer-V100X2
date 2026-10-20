@@ -68,8 +68,8 @@ from the device arena and leaves only the merged-output transient, at the cost o
 three seconds of CPU time per image after the first. Dequantized weights are cached across
 requests (~1.7 GB of host memory once warm; `NINFER_VISION_CPU_CACHE=0` disables the cache and
 dequantizes per request instead). Host intermediates scale with the visual-token count (about
-0.2 MB per merged token: roughly 150 MB for a typical screenshot, several GB at the 32,768-token
-maximum), so keep `--vision-max-tokens` near what the media actually needs. `--vision-kv-swap` is
+0.2 MB per merged token: roughly 150 MB for a typical screenshot), so keep `--vision-max-tokens`
+near what the media actually needs. `--vision-kv-swap` is
 the third placement: GPU Vision with no startup scratch reservation. Each image's encode allocates
 its scratch on demand; to make room, the primary rank copies its persistent runtime arena (KV and
 per-lane state) to host memory, releases those device pages, runs the encode, and restores them.
@@ -255,10 +255,15 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The separately configurable
 `--vision-max-tokens` limits merged visual tokens across the prompt (four raw patches per merged
-token); it defaults to 32,768, and the effective Vision limit is
-`min(--max-context, --vision-max-tokens)`. The media-processing allowance and the output transient
-use this bound; the GPU Vision scratch does too unless `--vision-device cpu` keeps the encoder on
-host or `--vision-kv-swap` allocates the scratch on demand instead of reserving it at startup.
+token); it defaults to 32,768, and a positive value scales the media-processing allowance, the
+output transient, and (unless `--vision-device cpu` keeps the encoder on host or
+`--vision-kv-swap` allocates the scratch on demand) the GPU Vision scratch reservation. There is
+no compiled ceiling: a larger budget reserves more device memory and is refused at startup if it
+does not fit. `--vision-max-tokens unlimited` (also `none` or `0`) removes the budget check,
+bounded only by `--max-context` since visual tokens are text tokens; in that mode the request
+transient is allocated on first use instead of reserved, so it requires `--vision-kv-swap` or
+`--vision-device cpu`. This is the setting to raise for long conversations whose accumulated
+images exceed a fixed budget.
 A smaller visual-token budget leaves room for long text context on memory-constrained
 hardware; exceeding the media budget returns an error, not a shorter image. There is no fixed
 image/video item-count limit: item count is admitted
@@ -623,7 +628,7 @@ client-side override.
 | `--shared-prefix-dir DIR` | persist one image per distinct shared prefix (different system prompts/tool sets) and load every image in the directory at startup | unset |
 | `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to DIR when the host parking budget is exhausted | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations; `0` uses `--kv-park-bytes` | `0` |
-| `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
+| `--vision-max-tokens N\|unlimited` | merged visual-token limit per prompt and its device reservations; `unlimited`/`none`/`0` removes the limit (needs `--vision-kv-swap` or `--vision-device cpu`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -786,6 +791,30 @@ the oldest entry the boundary history holds, so the captures made while re-prefi
 would evict it first. Keeping it costs one more checkpoint and lets the other branch return to
 the fork instead of falling back to the leading block; it is copied into parked entries and
 persisted with them.
+
+Returning to the fork still re-prefills the branch's own suffix on every switch. When parking is
+enabled and a restore lands at least 8,192 tokens below the resident frontier, the Server also
+snapshots the outgoing branch into the park store before trimming the lane, using a copy (not a
+detach) so the planned restore keeps its pages. The next request for that branch then restores its
+full state instead of returning to the fork. Each switch therefore costs one host copy (or one
+spill/read when the park budget is full) rather than a multi-thousand-token re-prefill; the
+`reuse_trace` emits `park_snapshot` for each such copy.
+
+With `--max-concurrency` above one, two resident lanes can also share the pages of a common prefix
+instead of copying or re-prefilling it. When a request arrives on an idle lane whose prompt matches
+a pinned boundary of another retained lane (the fork where two branches diverge), the planner
+borrows that lane's KV pages by reference: the physical pool reference-counts them, the owning lane
+is never evicted to admit the request, and the new lane copies on write only the page that contains
+the divergence point before appending its own suffix. The recurrent state and hidden at the fork
+come from the boundary checkpoint, so the suffix prefill starts from the exact shared state. The
+completion log reports `reuse=share_lane_prefix`.
+
+The gain is a larger effective per-request ceiling per lane. Without sharing, two lanes each need
+their whole prompt resident, so each is bounded by half the pool; with sharing they only need their
+own suffixes plus one copy of the common prefix -- `2 * ceiling - prefix <= pool`. For a 262,144-token
+pool with a 193,917-token shared fork, two lanes fit with a per-request ceiling of about 228k
+instead of 131k. RAM KV cannot be shared (it owns a single-table host archive), and neither can
+DFlash (its draft context is not mirrored host-side).
 
 `--shared-prefix-dir DIR` keeps *every distinct* shared prefix instead of one: each captured
 leading block or tool anchor is keyed by its frontier and a content fingerprint of its lineage, so

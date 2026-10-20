@@ -12,8 +12,12 @@ struct DeviceContext;
 
 namespace runtime {
 
-// Owns the startup-frozen request transient allocation. Requests activate only a prefix; no
-// request-time device allocation or replacement is permitted.
+// Owns the request transient allocation. Usually it is frozen at startup and a request may
+// activate only a prefix of it. Constructing it with `kDynamicRequestTransientBytes` instead
+// makes the buffer grow on demand: the first request that needs more allocates a larger one and
+// later requests reuse it. Only the unlimited Vision budget uses that mode, where no finite
+// worst case can be reserved. A growth the device cannot satisfy throws
+// RequestError(Unavailable) rather than aborting, so the caller fails that one request.
 class RequestMemory {
 public:
     static constexpr std::size_t kDeviceAllocationAlignment = 256;

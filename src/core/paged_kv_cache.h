@@ -127,8 +127,24 @@ public:
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
-    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
-    [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
+    // Physical pages are reference counted. `shared_pages` names an entitlement prefix the caller
+    // borrows from another allocation through the same pool, so it does not consume pool capacity
+    // again; `can_reserve`/`reserve` subtract it from what this allocation must be able to own.
+    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement,
+                                   std::uint32_t shared_pages = 0) const noexcept;
+    [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement,
+                                            std::uint32_t shared_pages = 0);
+    // Number of allocations currently referencing a physical page (0 = free).
+    [[nodiscard]] std::uint32_t page_use_count(std::int32_t page) const;
+
+    // Replacement feasibility for an allocation that already contributes `old_pages - adopted`
+    // to the pool. `adopted_pages` is the allocation's reserved borrowed prefix, which it never
+    // added to the pool's committed capacity. The committed base is the larger of the reserved
+    // and the physically mapped counts: after a sharing source releases, its borrowed pages stay
+    // mapped for the borrowing allocation while their entitlement left with the source.
+    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages,
+                                               std::uint32_t old_adopted_pages,
+                                               std::uint32_t new_adopted_pages) const noexcept;
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
@@ -137,12 +153,15 @@ private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
 
-    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
-                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
                                                        std::int32_t preferred_first);
     void return_pages(std::span<const std::int32_t> pages) noexcept;
+    // Adds a reference to pages another allocation owns (adoption).
+    void retain_pages(std::span<const std::int32_t> pages);
+    // Copies one physical page's payload to another, device to device, in every plane.
+    void copy_page(std::int32_t from, std::int32_t to, cudaStream_t stream) const;
     void add_entitlement(std::uint32_t pages) noexcept;
+    void remove_entitlement(std::uint32_t pages) noexcept;
     void replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages) noexcept;
     void acquire_row(std::int32_t row);
     void release_row(std::int32_t row) noexcept;
@@ -154,6 +173,7 @@ private:
     Tensor read_tables_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
+    std::vector<std::uint32_t> page_refs_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
 };
@@ -191,6 +211,29 @@ public:
     void unbind_row() noexcept;
     [[nodiscard]] Tensor block_table() const;
 
+    // Cross-lane prefix sharing. The allocation must be fresh (nothing mapped) and was reserved
+    // with `shared_pages >= pages`; it takes its first `pages` logical pages from `source`, which
+    // must belong to the same pool, and reference-counts them instead of copying. Neither side
+    // may be RAM-backed. `copy_on_write` later replaces a borrowed page that is about to be
+    // written with a private copy, so the source's payload is never modified.
+    void adopt_prefix(const PagedKVAllocation& source, std::uint32_t pages,
+                      cudaStream_t stream = nullptr);
+    // Copies any page in [first_page, first_page + page_count) that is still shared with another
+    // allocation into a fresh physical page, preserving the payload. Returns the number of pages
+    // replaced. The block-table row is republished when bound.
+    std::uint32_t copy_on_write(std::uint32_t first_page, std::uint32_t page_count,
+                                cudaStream_t stream = nullptr);
+    [[nodiscard]] std::uint32_t adopted_pages() const noexcept { return adopted_pages_; }
+
+    // What releasing this allocation would change in the pool, without releasing it: the
+    // entitlement contribution it would remove and the mapped pages whose last reference it
+    // holds. Admission uses this to evaluate a plan that replaces the lane's allocation.
+    struct ReleasePreview {
+        std::uint32_t contribution = 0;
+        std::uint32_t freed_pages  = 0;
+    };
+    [[nodiscard]] ReleasePreview release_preview() const;
+
     // Copies every mapped logical page's packed payload to host and returns every physical page
     // to the pool, leaving this allocation empty (as release() would). The image is keyed by
     // LOGICAL page order: which physical page a logical page occupied is pool state that must not
@@ -225,8 +268,16 @@ private:
 
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
+    // Parallel to page_ids_: true when the page is borrowed from another allocation.
+    std::vector<bool> borrowed_;
     std::uint32_t page_entitlement_ = 0;
-    std::int32_t bound_row_         = -1;
+    // Reserved borrowed prefix: the part of `page_entitlement_` that was never added to the
+    // pool's committed capacity. It falls only when copy-on-write converts a borrowed page into
+    // an owned one; trimming borrowed pages forfeits them without changing the reservation.
+    std::uint32_t adopted_pages_ = 0;
+    // What this allocation actually contributed to `entitled_pages_`, removed on release.
+    std::uint32_t pool_contribution_ = 0;
+    std::int32_t bound_row_          = -1;
     struct RamState;
     std::unique_ptr<RamState> ram_;
     void materialize_ram_pages(std::uint32_t pages, cudaStream_t stream);
@@ -283,6 +334,8 @@ private:
 struct PagedKVReservation {
     PagedKVPool* pool              = nullptr;
     std::uint32_t page_entitlement = 0;
+    // Pages of the entitlement borrowed from another allocation in the same pool (shared prefix).
+    std::uint32_t shared_pages = 0;
 };
 
 // Reserves every requested pool or leaves all pools unchanged.

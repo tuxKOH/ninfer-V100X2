@@ -43,7 +43,7 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     VisionDevice vision_device = VisionDevice::Gpu;
-    std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
+    std::uint32_t vision_max_tokens = kDefaultVisionTokenBudget;
     bool vision_kv_swap = false;
     bool message_boundary_checkpoints = false;
     bool shared_prefix_checkpoints = false;

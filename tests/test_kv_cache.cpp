@@ -223,6 +223,163 @@ int main() {
     allocation_c.trim_tokens(64);
     failures += expect_size(allocation_c.mapped_page_count(), 1, "page-aligned mapped pages");
 
+    // Cross-lane page sharing: a borrowed prefix is reference counted rather than copied, and
+    // copy-on-write replaces only the page about to be written, leaving the source's payload.
+    {
+        auto share_plan = plan_paged_cache(8, 8, 2, {{ninfer::DType::I8, 64, 2}});
+        ninfer::DeviceArena share_arena(share_plan.bytes);
+        ninfer::PagedKVPool share_pool({share_arena.base(), share_arena.capacity()},
+                                       share_plan.layout);
+        const auto* plane = static_cast<const unsigned char*>(share_pool.plane(0).data);
+        const std::size_t page_bytes = static_cast<std::size_t>(share_pool.plane(0).nb[3]);
+        const auto page_byte = [&](std::int32_t page) {
+            std::vector<unsigned char> bytes(page_bytes);
+            if (cudaMemcpy(bytes.data(), plane + static_cast<std::size_t>(page) * page_bytes,
+                           page_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return static_cast<unsigned char>(0);
+            }
+            return bytes.front();
+        };
+
+        auto source = share_pool.reserve(4);
+        source.materialize_pages(4);
+        for (std::int32_t p = 0; p < 4; ++p) {
+            const unsigned char value = static_cast<unsigned char>(0x10 + p);
+            (void)cudaMemsetAsync(const_cast<unsigned char*>(plane) +
+                                      static_cast<std::size_t>(source.page_ids()[p]) * page_bytes,
+                                  value, page_bytes, ctx.stream);
+        }
+        (void)cudaStreamSynchronize(ctx.stream);
+
+        auto shared = share_pool.reserve(6, 4);
+        shared.adopt_prefix(source, 4);
+        failures += expect_size(shared.mapped_page_count(), 4, "shared mapped pages");
+        failures += expect_size(shared.adopted_pages(), 4, "shared adopted pages");
+        failures += expect_size(share_pool.mapped_pages(), 4, "shared distinct physical pages");
+        failures += expect_size(share_pool.entitled_pages(), 6,
+                                "shared entitlement counts the prefix once");
+        failures += expect_size(share_pool.page_use_count(shared.page_ids()[0]), 2,
+                                "shared page reference count");
+        shared.bind_row(1);
+        {
+            std::vector<std::int32_t> row(4);
+            (void)cudaMemcpy(row.data(), shared.block_table().data, row.size() * sizeof(row[0]),
+                             cudaMemcpyDeviceToHost);
+            failures += expect_size(std::equal(row.begin(), row.end(), source.page_ids().begin())
+                                        ? 0
+                                        : 1,
+                                    0, "shared block-table row points at the source pages");
+        }
+
+        const std::int32_t replaced = shared.page_ids()[3];
+        failures += expect_size(shared.copy_on_write(3, 1, ctx.stream), 1,
+                                "copy-on-write replaced the boundary page");
+        (void)cudaStreamSynchronize(ctx.stream);
+        failures += expect_size(share_pool.page_use_count(replaced), 1,
+                                "copy-on-write released the shared reference");
+        failures += expect_size(shared.adopted_pages(), 3, "copy-on-write adopted count");
+        failures += expect_size(share_pool.mapped_pages(), 5,
+                                "copy-on-write adds one distinct page");
+        failures += expect_size(page_byte(shared.page_ids()[3]), 0x13,
+                                "copy-on-write preserved the payload");
+        (void)cudaMemsetAsync(const_cast<unsigned char*>(plane) +
+                                  static_cast<std::size_t>(shared.page_ids()[3]) * page_bytes,
+                              0xee, page_bytes, ctx.stream);
+        (void)cudaStreamSynchronize(ctx.stream);
+        failures += expect_size(page_byte(replaced), 0x13,
+                                "copy-on-write left the source payload untouched");
+
+        // Committed after the copy: source 4 + the adopter's 2-token tail + the private copy
+        // (the shared prefix is counted once), so exactly one more page fits.
+        failures += expect_size(share_pool.entitled_pages(), 7,
+                                "copy-on-write committed the split page");
+        failures += expect_size(share_pool.can_reserve(1) ? 0 : 1, 0,
+                                "sharing leaves the last pool page reservable");
+        failures += expect_size(share_pool.can_reserve(2) ? 0 : 1, 1,
+                                "sharing still bounds total capacity");
+
+        source.release();
+        failures += expect_size(share_pool.mapped_pages(), 4,
+                                "releasing the source keeps the borrowed prefix");
+        // The borrower must remain usable after the source is gone: its outstanding reservation
+        // is checked against the committed base (mapped pages included).
+        failures += expect_size(
+            share_pool.can_replace_entitlement(shared.page_entitlement(),
+                                               shared.page_entitlement(),
+                                               shared.adopted_pages(), shared.adopted_pages())
+                ? 0
+                : 1,
+            0, "borrower can resize after the source is released");
+        shared.release();
+        failures += expect_size(share_pool.mapped_pages(), 0, "shared pages returned");
+        failures += expect_size(share_pool.entitled_pages(), 0, "shared entitlement released");
+        failures += expect_size(share_pool.free_pages(), 8, "shared pool fully free");
+    }
+
+    // Trimming borrowed pages forfeits them without corrupting the committed capacity, and the
+    // borrower's contribution is exactly what it reserved.
+    {
+        auto trim_plan = plan_paged_cache(16, 16, 2, {{ninfer::DType::I8, 64, 2}});
+        ninfer::DeviceArena trim_arena(trim_plan.bytes);
+        ninfer::PagedKVPool trim_pool({trim_arena.base(), trim_arena.capacity()}, trim_plan.layout);
+        auto source = trim_pool.reserve(8);
+        source.materialize_pages(8);
+        auto borrower = trim_pool.reserve(12, 8);
+        borrower.adopt_prefix(source, 8);
+        failures += expect_size(trim_pool.entitled_pages(), 12, "trim setup entitlement");
+        borrower.trim_pages(6);
+        failures += expect_size(trim_pool.entitled_pages(), 12,
+                                "trimming borrowed pages kept the reservation");
+        failures += expect_size(borrower.adopted_pages(), 8,
+                                "trimming borrowed pages kept the borrowed reservation");
+        source.release();
+        failures += expect_size(trim_pool.entitled_pages(), 4,
+                                "release removed only the borrower's contribution");
+        failures += expect_size(
+            trim_pool.can_replace_entitlement(12, 12, 8, 8) ? 0 : 1, 0,
+            "borrower resize is feasible after a borrowed trim and source release");
+        borrower.release();
+        failures += expect_size(trim_pool.entitled_pages(), 0, "trim pool entitlement released");
+        failures += expect_size(trim_pool.mapped_pages(), 0, "trim pool pages released");
+        failures += expect_size(trim_pool.free_pages(), 16, "trim pool fully free");
+    }
+
+    // Admission for an allocation-preserving plan (append or checkpoint restore) must pass the
+    // allocation's existing borrowed count as the new adopted count; charging the plan's zero
+    // share would count the borrowed prefix twice and reject feasible continuations.
+    {
+        auto admit_plan = plan_paged_cache(16, 16, 2, {{ninfer::DType::I8, 64, 2}});
+        ninfer::DeviceArena admit_arena(admit_plan.bytes);
+        ninfer::PagedKVPool admit_pool({admit_arena.base(), admit_arena.capacity()},
+                                       admit_plan.layout);
+        auto source = admit_pool.reserve(12);
+        source.materialize_pages(12);
+        auto borrower = admit_pool.reserve(12, 8);
+        borrower.adopt_prefix(source, 8);
+        borrower.materialize_pages(12);
+        failures += expect_size(admit_pool.entitled_pages(), 16, "admission setup entitlement");
+        failures += expect_size(admit_pool.mapped_pages(), 16, "admission setup mapping");
+        failures += expect_size(admit_pool.can_replace_entitlement(12, 12, 8, 8) ? 0 : 1, 0,
+                                "append admission keeps the borrowed prefix");
+        failures += expect_size(admit_pool.can_replace_entitlement(12, 12, 8, 0) ? 0 : 1, 1,
+                                "append admission cannot double-charge the borrowed prefix");
+        failures += expect_size(admit_pool.can_replace_entitlement(12, 13, 8, 8) ? 0 : 1, 1,
+                                "a full pool still rejects real growth");
+        // The release preview separates what a replaced allocation removes from what it frees:
+        // its own pages are last-referenced here, its borrowed ones are still held by the source.
+        const ninfer::PagedKVAllocation::ReleasePreview held = borrower.release_preview();
+        failures += expect_size(held.contribution, 4, "release preview contribution");
+        failures += expect_size(held.freed_pages, 4, "release preview frees only owned pages");
+        source.release();
+        const ninfer::PagedKVAllocation::ReleasePreview sole = borrower.release_preview();
+        failures += expect_size(sole.contribution, 4,
+                                "release preview contribution after source release");
+        failures += expect_size(sole.freed_pages, 12,
+                                "release preview frees borrowed pages once the source is gone");
+        borrower.release();
+        failures += expect_size(admit_pool.free_pages(), 16, "admission pool fully free");
+    }
+
     auto main_plan    = plan_paged_cache(4, 4, 1, {{ninfer::DType::BF16, 16, 1}});
     auto backend_plan = plan_paged_cache(2, 2, 1, {{ninfer::DType::BF16, 16, 1}});
     ninfer::DeviceArena main_arena(main_plan.bytes);

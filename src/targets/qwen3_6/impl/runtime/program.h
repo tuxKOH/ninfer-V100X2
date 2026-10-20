@@ -116,6 +116,12 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::RewriteCheckpointSpec> tools_checkpoint_capture;
     // The selected boundary is one of the lane's pinned shared prefixes rather than a ring entry.
     SharedPrefixSlot restore_shared_prefix = SharedPrefixSlot::None;
+    // ShareLanePrefix: the source lane whose allocation supplies the reusable prefix pages, the
+    // pinned boundary holding its recurrent state, and how many leading pages are borrowed.
+    std::uint32_t share_lane              = 0;
+    SharedPrefixSlot share_slot           = SharedPrefixSlot::None;
+    std::uint32_t shared_text_kv_pages    = 0;
+    std::uint32_t shared_backend_kv_pages = 0;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -381,7 +387,11 @@ public:
     // cannot be parked (parking disabled, RAM KV, Vision, or no room left in the store) is
     // reported false and left untouched, so the caller can fall back to dropping it.
     // `protect_id` names a stored entry the insert must not evict (the plan's restore target).
-    [[nodiscard]] bool park_retained_lane(std::uint32_t lane, std::uint64_t protect_id = 0) noexcept;
+    // With `detach == false` the state is snapshotted without disturbing the lane: the pages are
+    // copied rather than released, so a caller that is about to trim the lane for another branch
+    // keeps the outgoing branch for a later return while still resuming the one it planned.
+    [[nodiscard]] bool park_retained_lane(std::uint32_t lane, std::uint64_t protect_id = 0,
+                                          bool detach = true) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -616,8 +626,11 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
+    // `shared_text_pages`/`shared_backend_pages` name an entitlement prefix borrowed from another
+    // lane's allocation (ShareLanePrefix); the pool only charges the owned remainder.
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
-                             std::uint32_t backend_pages);
+                             std::uint32_t backend_pages, std::uint32_t shared_text_pages = 0,
+                             std::uint32_t shared_backend_pages = 0);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

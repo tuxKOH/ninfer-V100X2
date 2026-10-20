@@ -38,6 +38,9 @@ struct OutputDecision {
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
 
+// Sentinel for "this plan depends on no other lane's resident state".
+inline constexpr std::uint32_t kNoProtectedLane = 0xFFFFFFFFU;
+
 // Complete request-lifetime ownership in the three independently exhausted admission domains.
 // Values are already rounded to the physical allocation granularity by the target.
 struct AdmissionResources {
@@ -56,6 +59,9 @@ struct RequestPlanSummary {
     std::size_t transient_alignment       = 1;
     AdmissionResources admission;
     std::uint64_t service_work_quanta = 0;
+    // A lane whose resident state this plan depends on, which must not be evicted to admit it
+    // (cross-lane prefix sharing).
+    std::uint32_t protected_lane = kNoProtectedLane;
 };
 
 struct BeginSummary {

@@ -10,7 +10,7 @@ class FrontendTestAccess {
 public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
                                                    bool vision_enabled = true,
-                                                   std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget);
+                                                   std::uint32_t vision_max_tokens = kDefaultVisionTokenBudget);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 

@@ -33,6 +33,15 @@ std::uint32_t parse_u32(const char* text, std::string_view label, bool allow_zer
     return static_cast<std::uint32_t>(value);
 }
 
+// `0`, `none`, and `unlimited` all select no Vision token budget. An explicit positive value has
+// no compiled upper bound; a budget that cannot be pre-reserved is rejected when the engine plans
+// its device memory.
+std::uint32_t parse_vision_token_budget(const char* text) {
+    const std::string_view value(text == nullptr ? "" : text);
+    if (value == "unlimited" || value == "none") { return kUnlimitedVisionTokens; }
+    return parse_u32(text, "vision-max-tokens", /*allow_zero=*/true);
+}
+
 int parse_device(const char* text) {
     const std::uint64_t value = parse_u64(text, "device");
     if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
@@ -130,7 +139,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-device gpu|cpu]\n"
-           "       [--vision-max-tokens N] [--vision-kv-swap] [--boundary-checkpoints] [--shared-prefix]\n"
+           "       [--vision-max-tokens N|unlimited] [--vision-kv-swap] [--boundary-checkpoints] [--shared-prefix]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -145,8 +154,10 @@ std::string usage_text(const char* argv0) {
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--boundary-checkpoints retains a reusable checkpoint at the last stable message boundary.\n"
            "--shared-prefix retains one after the static leading system/tools block for cross-session reuse.\n"
-           "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
+           "--vision-max-tokens N bounds merged visual tokens per prompt (default 32768),\n"
            "independently of text context; smaller budgets reduce reserved Vision memory.\n"
+           "'unlimited' (or 0) removes the bound and allocates the request transient on demand;\n"
+           "it requires --vision-kv-swap or --vision-device cpu.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -277,7 +288,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--shared-prefix") {
             options.shared_prefix_checkpoints = true;
         } else if (arg == "--vision-max-tokens") {
-            options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens");
+            options.vision_max_tokens = parse_vision_token_budget(value(arg));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
@@ -352,8 +363,10 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.vision_max_tokens == 0 || options.vision_max_tokens > kMaximumVisionTokenBudget) {
-        throw std::invalid_argument("--vision-max-tokens must be in [1,32768]");
+    if (options.vision_max_tokens == kUnlimitedVisionTokens && options.enable_vision &&
+        options.vision_device != VisionDevice::Cpu && !options.vision_kv_swap) {
+        throw std::invalid_argument(
+            "an unlimited --vision-max-tokens requires --vision-kv-swap or --vision-device cpu");
     }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");

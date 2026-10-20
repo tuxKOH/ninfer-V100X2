@@ -526,6 +526,44 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     }
 }
 
+namespace {
+// What releasing several allocations together changes in a pool. A page is freed only when every
+// reference to it belongs to the released group, so a page lent between two lanes that are both
+// being released frees once, not never.
+struct JointRelease {
+    std::uint32_t contribution = 0;
+    std::uint32_t freed_pages  = 0;
+};
+
+JointRelease joint_release(const PagedKVPool& pool,
+                           std::span<const PagedKVAllocation* const> allocations) {
+    JointRelease out;
+    if (allocations.empty()) { return out; }
+    std::vector<std::uint16_t> held_by_group(pool.page_group_count(), 0);
+    for (const PagedKVAllocation* allocation : allocations) {
+        if (allocation == nullptr) { continue; }
+        out.contribution += allocation->release_preview().contribution;
+        for (const std::int32_t page : allocation->page_ids()) {
+            if (page >= 0) { ++held_by_group[static_cast<std::size_t>(page)]; }
+        }
+    }
+    std::vector<bool> counted(pool.page_group_count(), false);
+    for (const PagedKVAllocation* allocation : allocations) {
+        if (allocation == nullptr) { continue; }
+        for (const std::int32_t page : allocation->page_ids()) {
+            if (page < 0) { continue; }
+            const auto index = static_cast<std::size_t>(page);
+            if (counted[index]) { continue; }
+            if (pool.page_use_count(page) <= held_by_group[index]) {
+                counted[index] = true;
+                ++out.freed_pages;
+            }
+        }
+    }
+    return out;
+}
+} // namespace
+
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];
@@ -534,20 +572,57 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return false;
     }
     const SequenceState& sequence = sequences[lane];
-    const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
+    // A plan that keeps the lane's allocation keeps its borrowed prefix too; only a fresh
+    // allocation (sharing, full reset, or a parked restore) adopts the plan's share count.
+    const bool keeps_allocation =
+        sequence.kv.has_value() && plan.impl_->reuse != ReusePath::ShareLanePrefix &&
+        plan.impl_->reuse != ReusePath::FullReset &&
+        plan.impl_->reuse != ReusePath::RestoreParkedKv;
+    // For a plan that replaces the allocation, admission must model the release that start_prefill
+    // performs before the new reservation: it removes the allocation's contribution and frees
+    // every page whose last reference it holds (a borrowed page still held by its source stays).
+    const auto admits = [](const PagedKVPool& pool, const PagedKVAllocation* existing,
+                           std::uint32_t old_pages, std::uint32_t new_pages,
+                           std::uint32_t new_adopted, bool keeps) {
+        if (new_pages > pool.logical_page_capacity()) { return false; }
+        std::uint32_t entitled = pool.entitled_pages();
+        std::uint32_t mapped   = pool.mapped_pages();
+        std::uint32_t old_owned = 0;
+        if (keeps && existing != nullptr) {
+            old_owned = old_pages - std::min(old_pages, existing->adopted_pages());
+        } else if (existing != nullptr) {
+            const PagedKVAllocation::ReleasePreview preview = existing->release_preview();
+            entitled -= std::min(entitled, preview.contribution);
+            mapped -= std::min(mapped, preview.freed_pages);
+        }
+        const std::uint32_t committed = std::max(entitled, mapped);
+        if (old_owned > committed) { return false; }
+        const std::uint32_t others = committed - old_owned;
+        const std::uint32_t owned  = new_pages - std::min(new_pages, new_adopted);
+        return others <= pool.page_group_count() &&
+               owned <= pool.page_group_count() - others;
     };
-    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
+    const PagedKVAllocation* text_allocation = sequence.kv ? &sequence.kv->text : nullptr;
+    const std::uint32_t new_text_adopted =
+        keeps_allocation ? sequence.kv->text.adopted_pages()
+                         : plan.impl_->shared_text_kv_pages;
+    if (!admits(decoder->text_kv.pool(), text_allocation,
+                text_allocation ? text_allocation->page_entitlement() : 0,
+                plan.impl_->text_kv_page_entitlement, new_text_adopted, keeps_allocation)) {
         return false;
     }
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+    const PagedKVAllocation* backend_allocation =
+        sequence.kv && sequence.kv->backend ? &*sequence.kv->backend : nullptr;
+    const std::uint32_t new_backend_adopted =
+        keeps_allocation && backend_allocation != nullptr
+            ? backend_allocation->adopted_pages()
+            : plan.impl_->shared_backend_kv_pages;
+    return admits(backend->pool(), backend_allocation,
+                  backend_allocation ? backend_allocation->page_entitlement() : 0,
+                  plan.impl_->backend_kv_page_entitlement, new_backend_adopted,
+                  keeps_allocation);
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
@@ -559,40 +634,80 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
         return false;
     }
 
-    std::uint32_t reclaimable_text    = 0;
-    std::uint32_t reclaimable_backend = 0;
+    const SequenceState& sequence = sequences[lane];
+    const bool keeps_allocation =
+        sequence.kv.has_value() && plan.impl_->reuse != ReusePath::ShareLanePrefix &&
+        plan.impl_->reuse != ReusePath::FullReset &&
+        plan.impl_->reuse != ReusePath::RestoreParkedKv;
+
+    // The transition an eviction plan performs is one joint release: every evictable retained
+    // allocation, plus the target lane's allocation when the plan replaces it. Counting the
+    // group together frees pages lent between two lanes that are both released.
+    std::vector<const PagedKVAllocation*> evicted_text;
+    std::vector<const PagedKVAllocation*> evicted_backend;
     for (std::uint32_t other = 0; other < max_concurrency; ++other) {
         if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
-        reclaimable_text += sequences[other].kv->text.page_entitlement();
+        // The lane this plan borrows its prefix pages from is the one thing eviction must keep.
+        if (plan.impl_->reuse == ReusePath::ShareLanePrefix &&
+            other == plan.impl_->share_lane) {
+            continue;
+        }
+        evicted_text.push_back(&sequences[other].kv->text);
         if (sequences[other].kv->backend) {
-            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+            evicted_backend.push_back(&*sequences[other].kv->backend);
         }
     }
+    std::vector<const PagedKVAllocation*> text_group    = evicted_text;
+    std::vector<const PagedKVAllocation*> backend_group = evicted_backend;
+    if (!keeps_allocation && sequence.kv) {
+        text_group.push_back(&sequence.kv->text);
+        if (sequence.kv->backend) { backend_group.push_back(&*sequence.kv->backend); }
+    }
 
-    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
-        if (old_pages > pool.entitled_pages() ||
-            reclaimable_pages > pool.entitled_pages() - old_pages ||
-            new_pages > pool.logical_page_capacity()) {
-            return false;
+    const auto admits = [](const PagedKVPool& pool, const PagedKVAllocation* existing,
+                           std::uint32_t old_pages, std::uint32_t new_pages,
+                           std::uint32_t new_adopted, bool keeps,
+                           const JointRelease& release) {
+        if (new_pages > pool.logical_page_capacity()) { return false; }
+        const std::uint32_t entitled =
+            pool.entitled_pages() - std::min(pool.entitled_pages(), release.contribution);
+        const std::uint32_t mapped =
+            pool.mapped_pages() - std::min(pool.mapped_pages(), release.freed_pages);
+        std::uint32_t old_owned = 0;
+        if (keeps && existing != nullptr) {
+            old_owned = old_pages - std::min(old_pages, existing->adopted_pages());
         }
-        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
-        return new_pages <= pool.page_group_count() - committed;
+        const std::uint32_t committed = std::max(entitled, mapped);
+        if (old_owned > committed) { return false; }
+        const std::uint32_t others = committed - old_owned;
+        const std::uint32_t owned  = new_pages - std::min(new_pages, new_adopted);
+        return others <= pool.page_group_count() &&
+               owned <= pool.page_group_count() - others;
     };
 
-    const SequenceState& sequence = sequences[lane];
-    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.impl_->text_kv_page_entitlement)) {
+    const PagedKVAllocation* text_allocation = sequence.kv ? &sequence.kv->text : nullptr;
+    const std::uint32_t new_text_adopted =
+        keeps_allocation ? sequence.kv->text.adopted_pages()
+                         : plan.impl_->shared_text_kv_pages;
+    if (!admits(decoder->text_kv.pool(), text_allocation,
+                text_allocation ? text_allocation->page_entitlement() : 0,
+                plan.impl_->text_kv_page_entitlement, new_text_adopted, keeps_allocation,
+                joint_release(decoder->text_kv.pool(), text_group))) {
         return false;
     }
 
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, reclaimable_backend,
-                       plan.impl_->backend_kv_page_entitlement);
+    const PagedKVAllocation* backend_allocation =
+        sequence.kv && sequence.kv->backend ? &*sequence.kv->backend : nullptr;
+    const std::uint32_t new_backend_adopted =
+        keeps_allocation && backend_allocation != nullptr
+            ? backend_allocation->adopted_pages()
+            : plan.impl_->shared_backend_kv_pages;
+    return admits(backend->pool(), backend_allocation,
+                  backend_allocation ? backend_allocation->page_entitlement() : 0,
+                  plan.impl_->backend_kv_page_entitlement, new_backend_adopted,
+                  keeps_allocation, joint_release(backend->pool(), backend_group));
 }
 
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
@@ -733,6 +848,128 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
         // one, so the reuse branch below takes both, and the reported path stays truthful.
     }
+    // Cross-lane prefix sharing: materialize the shared prefix by reference into the empty target
+    // lane. The source stays resident and untouched; the pool reference count keeps its pages
+    // alive for both lanes, and copy-on-write splits the page where the branches diverge.
+    if (request_plan.reuse == ReusePath::ShareLanePrefix) {
+        const std::uint32_t source_lane = request_plan.share_lane;
+        if (sequence.kv) { throw std::logic_error("shared prefix requires an empty target lane"); }
+        if (source_lane >= max_concurrency || source_lane == lane) {
+            throw std::logic_error("shared prefix names an invalid source lane");
+        }
+        SequenceState& source = sequences[source_lane];
+        const std::uint32_t frontier = request_plan.reuse_base;
+        if (!source.retained || !source.kv || frontier == 0 ||
+            frontier > source.text_kv_valid ||
+            !qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
+                                             frontier)) {
+            throw std::logic_error("shared prefix source lane is no longer resident");
+        }
+        HostCheckpoint* pinned = nullptr;
+        if (request_plan.share_slot == SharedPrefixSlot::Tools) {
+            pinned = &source.tools_prefix;
+        } else if (request_plan.share_slot == SharedPrefixSlot::Leading) {
+            pinned = &source.shared_prefix;
+        } else if (request_plan.share_slot == SharedPrefixSlot::Anchor) {
+            pinned = &source.resume_anchor;
+        } else if (request_plan.share_slot == SharedPrefixSlot::Response) {
+            for (HostCheckpoint& checkpoint : source.response_history) {
+                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
+            }
+        } else if (request_plan.share_slot == SharedPrefixSlot::LongRange) {
+            for (HostCheckpoint& checkpoint : source.long_range_history) {
+                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
+            }
+        } else {
+            for (HostCheckpoint& boundary : source.boundary_history) {
+                if (boundary.frontier == frontier) { pinned = &boundary; break; }
+            }
+        }
+        if (pinned == nullptr || pinned->frontier != frontier ||
+            pinned->state.size() != static_cast<std::size_t>(device_count) ||
+            pinned->hidden.size() != static_cast<std::size_t>(
+                                        sequence.rewrite_checkpoint_hidden.bytes())) {
+            throw std::logic_error("planned shared prefix boundary is unavailable");
+        }
+        reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                            request_plan.backend_kv_page_entitlement,
+                            request_plan.shared_text_kv_pages,
+                            request_plan.shared_backend_kv_pages);
+        const std::uint32_t text_pages    = request_plan.shared_text_kv_pages;
+        const std::uint32_t backend_pages = request_plan.shared_backend_kv_pages;
+        sequence.kv->text.adopt_prefix(source.kv->text, text_pages, device.stream);
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            sequence.kv->text_peers[peer->rank - 1]->adopt_prefix(
+                *source.kv->text_peers[peer->rank - 1], text_pages, peer->device.stream);
+        }
+        if (sequence.kv->backend && backend_pages != 0) {
+            sequence.kv->backend->adopt_prefix(*source.kv->backend, backend_pages, device.stream);
+            for (auto& peer : peers) {
+                const ScopedDevice scope(peer->device.device);
+                if (sequence.kv->backend_peers[peer->rank - 1]) {
+                    sequence.kv->backend_peers[peer->rank - 1]->adopt_prefix(
+                        *source.kv->backend_peers[peer->rank - 1], backend_pages,
+                        peer->device.stream);
+                }
+            }
+        }
+        // The fork normally falls inside a page, which both lanes would otherwise write.
+        const std::uint32_t boundary_page =
+            frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+        if (frontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0 &&
+            boundary_page < text_pages) {
+            sequence.kv->text.copy_on_write(boundary_page, 1, device.stream);
+            for (auto& peer : peers) {
+                const ScopedDevice scope(peer->device.device);
+                sequence.kv->text_peers[peer->rank - 1]->copy_on_write(boundary_page, 1,
+                                                                       peer->device.stream);
+            }
+        }
+        if (sequence.kv->backend && backend_pages != 0) {
+            const std::uint32_t backend_boundary =
+                (frontier - 1) / static_cast<std::uint32_t>(kPagedKVPageSize);
+            if (backend_boundary < backend_pages) {
+                sequence.kv->backend->copy_on_write(backend_boundary, 1, device.stream);
+                for (auto& peer : peers) {
+                    const ScopedDevice scope(peer->device.device);
+                    if (sequence.kv->backend_peers[peer->rank - 1]) {
+                        sequence.kv->backend_peers[peer->rank - 1]->copy_on_write(
+                            backend_boundary, 1, peer->device.stream);
+                    }
+                }
+            }
+        }
+        // The recurrent state and hidden at the fork come from the source's pinned boundary.
+        import_checkpoint_state(sequence, *pinned, /*into_current=*/true);
+        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, pinned->hidden.data(),
+                                   pinned->hidden.size(), cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        sequence.text_kv_valid     = frontier;
+        sequence.mtp_kv_valid      = speculative_backend == SpeculativeBackend::Mtp
+                                         ? frontier - 1
+                                         : 0;
+        sequence.tail_hidden_valid = true;
+        pin_resume_anchor(sequence, *pinned);
+    }
+    // A checkpoint restore below the resident frontier trims away the continuation the lane
+    // holds. When the incoming prompt is not that continuation -- two branches of one
+    // conversation alternating on a single lane -- snapshot the outgoing branch first, so its
+    // next request restores in full instead of falling back to the boundary the branches share.
+    // The snapshot copies rather than detaches: the restore below still reads the lane's pages.
+    // Below roughly this much divergence the re-prefill is cheaper than a whole-branch copy,
+    // especially when the entry lands on the spill tier, so small rewrites (the client editing
+    // the last message) keep their existing history/boundary handling.
+    constexpr std::uint32_t kSwitchSnapshotMinimumTokens = 8192;
+    if (request_plan.reuse != ReusePath::RestoreParkedKv &&
+        request_plan.reuse != ReusePath::FullReset &&
+        request_plan.reuse != ReusePath::AppendAtFrontier && sequence.retained &&
+        sequence.execution_frontier > request_plan.reuse_base &&
+        sequence.execution_frontier - request_plan.reuse_base >= kSwitchSnapshotMinimumTokens &&
+        !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                         sequence.execution_frontier)) {
+        (void)park_retained_lane(sequence.lane, 0, /*detach=*/false);
+    }
     // A resident plan may resume from an older boundary of the same conversation (a stale or
     // forked replay). Import it first so the checkpoint validation below sees the boundary the
     // plan selected, and preserve the current checkpoint this request is about to overwrite.
@@ -783,6 +1020,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         rotate_device_checkpoint(sequence);
     }
     if (request_plan.reuse != ReusePath::FullReset &&
+        request_plan.reuse != ReusePath::ShareLanePrefix &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
@@ -931,6 +1169,28 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+        } else if (request_plan.reuse == ReusePath::ShareLanePrefix) {
+            // The sharing block above already adopted the pages and imported the fork's recurrent
+            // state into both slots; only the common invariants remain.
+            if (!sequence.kv || sequence.text_kv_valid < base) {
+                throw std::logic_error("shared prefix has no complete KV allocation");
+            }
+            sequence.text_kv_valid = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                    throw std::logic_error(
+                        "shared prefix MTP KV is shorter than the bridge frontier");
+                }
+                sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                throw std::logic_error("shared prefix checkpoints are unavailable for DFlash");
+            }
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
+            if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
+            sequence.ledger.resize(base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -990,6 +1250,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.mtp_draft_count   = 0;
         const bool checkpoint_hidden =
             is_rewrite_checkpoint_restore(request_plan.reuse) ||
+            request_plan.reuse == ReusePath::ShareLanePrefix ||
             (request_plan.reuse == ReusePath::RestoreParkedKv && request_plan.parked_checkpoint);
         const RequestControl::Prefill::ResumeHidden resumed_hidden =
             checkpoint_hidden ? RequestControl::Prefill::ResumeHidden::Checkpoint
@@ -2156,7 +2417,8 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
     }
 }
 
-bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t protect_id) noexcept {
+bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t protect_id,
+                                         bool detach) noexcept {
     try {
         const bool spill_enabled = !park_spill_dir.empty();
         if ((!parked.enabled() && !spill_enabled) || lane >= max_concurrency) { return false; }
@@ -2222,9 +2484,10 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                 planned += sequence.kv->backend_peers[peer->rank - 1]->mapped_payload_bytes();
             }
         }
-        reuse_trace("park lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu "
+        reuse_trace("park%s lane=%u frontier=%u planned=%zu budget=%zu fit=%d history=%zu "
                     "ram_used=%zu ram_entries=%zu disk_entries=%zu disk_bytes=%llu",
-                    lane, sequence.execution_frontier, planned, parked.budget_bytes(),
+                    detach ? "" : "_snapshot", lane, sequence.execution_frontier, planned,
+                    parked.budget_bytes(),
                     planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size(),
                     parked.used_bytes(), parked.entry_count(), disk_entries.size(),
                     static_cast<unsigned long long>(disk_spilled_bytes));
@@ -2257,12 +2520,24 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
 
         // One rank's KV payloads and its own GDN slots -- the current slot always, and the
         // checkpoint slot when the lane carries a rewrite checkpoint. The caller has made this
-        // rank's device current; each image is keyed by logical page, so the physical pages
-        // freed here are irrelevant to the restore that will take fresh ones.
+        // rank's device current; a detached image is keyed by logical page, so the physical pages
+        // freed here are irrelevant to the restore that will take fresh ones. A snapshot copies
+        // the same pages without releasing them, so the lane can still resume the request the
+        // plan selected.
         const auto export_rank = [&](PagedKVAllocation& text, PagedKVAllocation* backend,
                                      LinearAttentionStatePool& state, cudaStream_t stream) {
-            entry->text.push_back(text.detach_to_host(stream));
-            if (backend != nullptr) { entry->backend.push_back(backend->detach_to_host(stream)); }
+            if (detach) {
+                entry->text.push_back(text.detach_to_host(stream));
+                if (backend != nullptr) {
+                    entry->backend.push_back(backend->detach_to_host(stream));
+                }
+            } else {
+                entry->text.push_back(text.copy_to_host(text.mapped_page_count(), stream));
+                if (backend != nullptr) {
+                    entry->backend.push_back(
+                        backend->copy_to_host(backend->mapped_page_count(), stream));
+                }
+            }
             std::vector<std::byte> slot(state.slot_image_bytes());
             state.export_slot(LinearStateSlots::current_state_slot(lane, max_concurrency),
                               std::span<std::byte>(slot), stream);
@@ -2365,7 +2640,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
             if (parked.used_bytes() + entry->bytes <= parked.budget_bytes() &&
                 parked.insert(std::move(entry), park_clock++, protect_id).has_value()) {
                 prune_superseded_disk(probe, protect_id);
-                clear_lane(sequence, requests[lane]);
+                // A snapshot leaves the lane intact: the caller still resumes on it.
+                if (detach) { clear_lane(sequence, requests[lane]); }
                 return true;
             }
         }
@@ -2374,14 +2650,14 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         // state is safely stored, so a failed write cannot lose the conversation.
         if (spill_enabled && spill_entry(std::move(entry)) == nullptr) {
             prune_superseded_disk(probe, protect_id);
-            clear_lane(sequence, requests[lane]);
+            if (detach) { clear_lane(sequence, requests[lane]); }
             return true;
         }
         return false;
     } catch (...) {
-        // Best-effort by contract. A copy that failed partway has already released some of the
-        // lane's pages; the caller's fallback clears the rest, which is exactly what it would have
-        // done without parking.
+        // Best-effort by contract. A detached copy that failed partway has already released some
+        // of the lane's pages, so the caller's fallback clears the rest; a snapshot copy never
+        // disturbs the lane and simply leaves it as it was.
         return false;
     }
 }
@@ -2446,10 +2722,15 @@ std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) c
 }
 
 void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
-                                          std::uint32_t backend_pages) {
+                                          std::uint32_t backend_pages,
+                                          std::uint32_t shared_text_pages,
+                                          std::uint32_t shared_backend_pages) {
     if (sequence.kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
     if (text_pages == 0 || (backend_kv_cache() == nullptr) != (backend_pages == 0)) {
         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
+    }
+    if (shared_text_pages > text_pages || shared_backend_pages > backend_pages) {
+        throw std::invalid_argument("shared KV prefix exceeds the request entitlement");
     }
 
     std::array<PagedKVReservation, 2> reservations{};
@@ -2457,11 +2738,13 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
     reservations[count++] = PagedKVReservation{
         .pool             = &decoder->text_kv.pool(),
         .page_entitlement = text_pages,
+        .shared_pages     = shared_text_pages,
     };
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
         reservations[count++] = PagedKVReservation{
             .pool             = &backend->pool(),
             .page_entitlement = backend_pages,
+            .shared_pages     = shared_backend_pages,
         };
     }
 
@@ -2476,15 +2759,19 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         // rides the SAME bundle call as the text pool, so its page ids match rank 0's too.
         std::array<PagedKVReservation, 2> peer_reservations{};
         std::size_t peer_count     = 0;
-        peer_reservations[peer_count++] =
-            PagedKVReservation{.pool = &peer->decoder->text_kv.pool(), .page_entitlement = text_pages};
+        peer_reservations[peer_count++] = PagedKVReservation{
+            .pool             = &peer->decoder->text_kv.pool(),
+            .page_entitlement = text_pages,
+            .shared_pages     = shared_text_pages};
         qwen3_6::PagedKVCache* peer_backend =
             speculative_backend == SpeculativeBackend::Mtp
                 ? peer->decoder->mtp_cache()
                 : (peer->dflash && peer->dflash->full ? &*peer->dflash->full : nullptr);
         if (peer_backend != nullptr) {
-            peer_reservations[peer_count++] =
-                PagedKVReservation{.pool = &peer_backend->pool(), .page_entitlement = backend_pages};
+            peer_reservations[peer_count++] = PagedKVReservation{
+                .pool             = &peer_backend->pool(),
+                .page_entitlement = backend_pages,
+                .shared_pages     = shared_backend_pages};
         }
         if (peer_count != count) {
             throw std::logic_error("peer KV pool set does not match rank 0's");

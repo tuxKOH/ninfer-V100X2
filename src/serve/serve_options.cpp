@@ -45,6 +45,19 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+// `0`, `none`, and `unlimited` all select no Vision token budget. An explicit positive value has
+// no compiled upper bound; a budget that cannot be pre-reserved is rejected when the engine plans
+// its device memory.
+std::uint32_t parse_vision_token_budget(const char* text) {
+    const std::string value(text == nullptr ? "" : text);
+    if (value == "unlimited" || value == "none") { return kUnlimitedVisionTokens; }
+    const std::uint64_t budget = parse_u64(text, "vision-max-tokens");
+    if (budget > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("vision-max-tokens is out of range");
+    }
+    return static_cast<std::uint32_t>(budget);
+}
+
 RopeMode parse_rope_mode(const char* text) {
     const std::string value(text);
     if (value == "native") { return RopeMode::Native; }
@@ -124,7 +137,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
            "[--default-max-tokens N] "
-           "[--vision] [--vision-max-tokens N] [--vision-device gpu|cpu] "
+           "[--vision] [--vision-max-tokens N|unlimited] [--vision-device gpu|cpu] "
            "[--vision-kv-swap] [--boundary-checkpoints [--boundary-history N]] "
            "[--shared-prefix [--shared-prefix-save FILE] [--shared-prefix-load FILE] "
            "[--shared-prefix-dir DIR]] "
@@ -154,7 +167,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --stream-keepalive-ms defaults to 15000; 0 disables SSE prefill keepalive pings\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768)\n"
+           "       --vision-max-tokens N bounds merged visual tokens per prompt (default 32768);\n"
+           "       'unlimited' (or 0) removes the bound (requires --vision-kv-swap or --vision-device cpu)\n"
            "       independently of text context; smaller budgets reduce reserved Vision memory\n"
            "       --vision-device cpu runs the Vision encoder on host threads instead of the GPU:\n"
            "       no Vision weights or scratch are uploaded, at the cost of CPU encode time\n"
@@ -412,8 +426,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.park_spill_bytes =
                 parse_u64(require_value("--kv-park-spill-bytes"), "kv-park-spill-bytes");
         } else if (arg == "--vision-max-tokens") {
-            options.vision_max_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--vision-max-tokens"), "vision-max-tokens"));
+            options.vision_max_tokens = parse_vision_token_budget(require_value("--vision-max-tokens"));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -493,8 +506,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.vision_max_tokens == 0 || options.vision_max_tokens > kMaximumVisionTokenBudget) {
-        throw std::invalid_argument("--vision-max-tokens must be in [1,32768]");
+    if (options.vision_max_tokens == kUnlimitedVisionTokens && options.enable_vision &&
+        options.vision_device != VisionDevice::Cpu && !options.vision_kv_swap) {
+        throw std::invalid_argument(
+            "an unlimited --vision-max-tokens requires --vision-kv-swap or --vision-device cpu");
     }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::runtime {
 namespace {
@@ -20,6 +21,10 @@ bool is_power_of_two(std::size_t value) noexcept {
 class RequestMemory::Impl {
 public:
     Impl(DeviceContext& context, std::size_t capacity) : device(context.device) {
+        if (capacity == kDynamicRequestTransientBytes) {
+            dynamic = true;
+            return;
+        }
         if (capacity != 0) {
             CUDA_CHECK(cudaSetDevice(device));
             arena = std::make_unique<DeviceArena>(capacity);
@@ -27,14 +32,21 @@ public:
     }
 
     ~Impl() {
-        if (arena != nullptr) {
-            (void)cudaSetDevice(device);
-            arena.reset();
-        }
+        (void)cudaSetDevice(device);
+        if (allocation != nullptr) { (void)cudaFree(allocation); }
+        arena.reset();
+    }
+
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return arena != nullptr ? arena->capacity() : allocated_bytes;
     }
 
     int device = 0;
     std::unique_ptr<DeviceArena> arena;
+    // Grow-on-demand buffer, used instead of the arena in dynamic mode.
+    bool dynamic          = false;
+    void* allocation      = nullptr;
+    std::size_t allocated_bytes = 0;
     std::size_t active_bytes     = 0;
     std::size_t active_alignment = 1;
     std::size_t peak_bytes       = 0;
@@ -58,7 +70,30 @@ void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
         throw std::invalid_argument("unsupported transient region alignment");
     }
 
-    if (impl_->arena == nullptr || bytes > impl_->arena->capacity()) {
+    if (impl_->dynamic) {
+        if (bytes > impl_->allocated_bytes) {
+            CUDA_CHECK(cudaSetDevice(impl_->device));
+            // Release the old buffer first: growth must fit the new size alone, not old + new.
+            // A failed growth leaves no buffer; the next, smaller activation reallocates.
+            if (impl_->allocation != nullptr) {
+                (void)cudaFree(impl_->allocation);
+                impl_->allocation      = nullptr;
+                impl_->allocated_bytes = 0;
+            }
+            void* grown              = nullptr;
+            const cudaError_t status = cudaMalloc(&grown, bytes);
+            if (status != cudaSuccess) {
+                // Request-scoped: the caller reports this to the requesting client only. Device
+                // memory exhaustion must not take down the shared execution unit.
+                (void)cudaGetLastError();
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   std::string("request transient allocation failed: ") +
+                                       cudaGetErrorString(status));
+            }
+            impl_->allocation      = grown;
+            impl_->allocated_bytes = bytes;
+        }
+    } else if (impl_->arena == nullptr || bytes > impl_->arena->capacity()) {
         throw std::invalid_argument("request transient exceeds its frozen startup capacity");
     }
 
@@ -74,13 +109,14 @@ void RequestMemory::deactivate() noexcept {
 
 TransientRegion RequestMemory::region() const noexcept {
     if (impl_->active_bytes == 0) { return {}; }
-    return {static_cast<std::byte*>(impl_->arena->base()), impl_->active_bytes,
-            impl_->active_alignment};
+    std::byte* base = static_cast<std::byte*>(impl_->arena != nullptr ? impl_->arena->base()
+                                                                     : impl_->allocation);
+    return {base, impl_->active_bytes, impl_->active_alignment};
 }
 
 ArenaMemorySummary RequestMemory::summary() const noexcept {
     return ArenaMemorySummary{
-        impl_->arena != nullptr ? impl_->arena->capacity() : 0,
+        impl_->capacity(),
         impl_->active_bytes,
         impl_->peak_bytes,
     };

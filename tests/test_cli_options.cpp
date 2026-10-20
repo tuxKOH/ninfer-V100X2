@@ -109,18 +109,40 @@ void check_documented() {
 }
 
 void check_vision_budget() {
-    check(parse_cli(base()).vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
+    check(parse_cli(base()).vision_max_tokens == ninfer::kDefaultVisionTokenBudget,
           "CLI Vision token budget default changed");
     check(parse_cli(with({"--vision", "--vision-max-tokens", "2048"})).vision_max_tokens == 2048,
           "CLI Vision token budget was not parsed");
     check(parse_cli(with({"--vision", "--vision-kv-swap"})).vision_kv_swap,
           "CLI did not parse --vision-kv-swap");
-    for (const std::string& invalid : {"0", "32769"}) {
+    // The budget has no compiled ceiling: a value above the old 32768 must pass, and the
+    // explicit no-limit spellings must resolve to the sentinel.
+    check(parse_cli(with({"--vision-max-tokens", "65536"})).vision_max_tokens == 65536,
+          "CLI rejected a Vision token budget above the former ceiling");
+    check(parse_cli(with({"--vision-max-tokens", "unlimited"})).vision_max_tokens ==
+              ninfer::kUnlimitedVisionTokens,
+          "CLI did not parse the unlimited Vision token budget");
+    check(parse_cli(with({"--vision-max-tokens", "none"})).vision_max_tokens ==
+              ninfer::kUnlimitedVisionTokens,
+          "CLI did not parse the no-limit Vision token budget");
+    check(parse_cli(with({"--vision-max-tokens", "0"})).vision_max_tokens ==
+              ninfer::kUnlimitedVisionTokens,
+          "CLI did not parse a zero Vision token budget as unlimited");
+    // Unlimited on the GPU encoder path cannot pre-reserve scratch, so it needs the swap path.
+    check(parse_cli(with({"--vision", "--vision-kv-swap", "--vision-max-tokens", "unlimited"}))
+              .vision_max_tokens == ninfer::kUnlimitedVisionTokens,
+          "CLI rejected unlimited Vision with --vision-kv-swap");
+    bool unlimited_gpu_rejected = false;
+    try {
+        (void)parse_cli(with({"--vision", "--vision-max-tokens", "unlimited"}));
+    } catch (const std::invalid_argument&) { unlimited_gpu_rejected = true; }
+    check(unlimited_gpu_rejected, "CLI accepted unlimited Vision without a dynamic path");
+    for (const std::string& invalid : {"-1", "abc"}) {
         bool rejected = false;
         try {
             (void)parse_cli(with({"--vision-max-tokens", invalid}));
         } catch (const std::invalid_argument&) { rejected = true; }
-        check(rejected, "CLI accepted an out-of-range Vision token budget");
+        check(rejected, "CLI accepted a malformed Vision token budget");
     }
 }
 

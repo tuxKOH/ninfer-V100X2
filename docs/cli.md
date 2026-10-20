@@ -61,10 +61,14 @@ GPU residency is frozen when the Engine starts:
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
 exclusive. The default speculative and Vision settings produce the smallest resident profile.
-`--vision-max-tokens N` independently bounds merged visual tokens per request (`1..32768`,
-default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
-fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
-context without promising to process images or videos beyond that separate budget.
+`--vision-max-tokens N` independently bounds merged visual tokens per request (default `32768`)
+and its startup Vision reservations; the prepared text-plus-media prompt still must fit
+`--max-context`. There is no compiled ceiling: a larger budget reserves more device memory and is
+refused at startup if it does not fit. `--vision-max-tokens unlimited` (also `none` or `0`)
+removes the bound, leaving `--max-context` as the only limit, and allocates the request transient
+on demand, which requires `--vision-kv-swap` or `--vision-device cpu`. On memory-constrained GPUs
+a smaller visual budget allows a larger text context without promising to process images or
+videos beyond that separate budget.
 `--vision-device cpu` runs the encoder on host threads instead: no Vision weights or scratch are
 uploaded, and only the merged embeddings reach the device. `--vision-kv-swap` keeps GPU Vision but
 reserves no startup scratch: each image's encode borrows the device memory by copying this rank's
@@ -204,7 +208,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--shared-prefix-dir DIR` | persist one image per distinct shared prefix and load the whole directory at startup (capped at 24 images) | unset |
 | `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to disk; the directory is reloaded at startup (metadata sidecars) | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations (`0` = `--kv-park-bytes`) | `0` |
-| `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
+| `--vision-max-tokens N\|unlimited` | merged visual tokens per prompt and its startup reservations; `unlimited`/`none`/`0` removes the limit (needs `--vision-kv-swap` or `--vision-device cpu`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |

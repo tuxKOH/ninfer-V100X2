@@ -646,12 +646,18 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
-        if (options.vision_max_tokens == 0 ||
-            options.vision_max_tokens > kMaximumVisionTokenBudget) {
-            throw std::invalid_argument("vision_max_tokens must be in [1,32768]");
-        }
+        // Visual tokens are text tokens, so the context ceiling bounds them. Unlimited uses a
+        // second, derived bound: every prepared patch payload is live at once, and the cache
+        // cannot satisfy a request whose own payloads exceed the live-byte account (it would
+        // wait forever for memory it holds itself). Sizing the aggregate budget from that
+        // account keeps the worst case satisfiable without any compiled token count.
+        const std::uint64_t live_vision_tokens =
+            options.media_live_bytes /
+            (kPreparedVisionPatchFeatures * sizeof(std::uint16_t) * kRawPatchesPerVisionToken);
         const std::uint64_t vision_tokens =
-            std::min(options.max_context, options.vision_max_tokens);
+            options.vision_max_tokens == kUnlimitedVisionTokens
+                ? std::min<std::uint64_t>(options.max_context, live_vision_tokens)
+                : std::min(options.max_context, options.vision_max_tokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {

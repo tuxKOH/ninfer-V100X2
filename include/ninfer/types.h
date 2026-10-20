@@ -23,7 +23,14 @@ inline constexpr std::uint32_t kMaximumConcurrency = 8;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
-inline constexpr std::uint32_t kMaximumVisionTokenBudget = 32768;
+// Default aggregate merged visual tokens per prompt. The budget itself is an option with no
+// compiled upper bound; `kUnlimitedVisionTokens` disables the budget check and sizes the Vision
+// tokens by the context ceiling instead.
+inline constexpr std::uint32_t kDefaultVisionTokenBudget = 32768;
+inline constexpr std::uint32_t kUnlimitedVisionTokens    = 0;
+// Marks a sequence plan whose request transient is allocated on demand rather than frozen at
+// startup; used by the unlimited Vision budget, where the worst case is the whole context.
+inline constexpr std::size_t kDynamicRequestTransientBytes = static_cast<std::size_t>(-1);
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -163,9 +170,12 @@ struct EngineOptions {
     // memory, runs the encoder on host threads, and only copies the merged embeddings to the
     // device, which frees the vision weight and scratch reservations at the cost of CPU speed.
     VisionDevice vision_device             = VisionDevice::Gpu;
-    // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
-    // use min(max_context, vision_max_tokens), independent of the text context ceiling.
-    std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
+    // Aggregate merged visual tokens per prompt. The value is not capped: a positive budget sizes
+    // the startup Vision scratch and request transient; `kUnlimitedVisionTokens` (0) disables the
+    // budget check, sizes the encoder limits by max_context, and allocates the request transient
+    // on demand. Unlimited requires a CPU Vision encoder or `vision_kv_swap`, since neither
+    // allocation can be pre-reserved.
+    std::uint32_t vision_max_tokens         = kDefaultVisionTokenBudget;
     // GPU Vision normally carries its full encode scratch in the startup workspace reservation.
     // With this set, that reservation is skipped (the memory goes to KV/runtime capacity
     // instead) and each image's encode allocates its scratch on demand. To make room, the
@@ -510,6 +520,10 @@ enum class PrefixReusePath : std::uint8_t {
     // back. Reported only when it is materialized; from the model's point of view it resumes
     // exactly like AppendAtFrontier at the parked frontier.
     RestoreParkedKv,
+    // The reusable prefix lives in another lane's allocation and is reference-counted into this
+    // lane instead of being copied or re-prefilled. The shared pages are copied on write where
+    // the two continuations diverge.
+    ShareLanePrefix,
 };
 
 struct GenerationResult {

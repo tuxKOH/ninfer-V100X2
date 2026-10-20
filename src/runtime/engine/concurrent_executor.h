@@ -841,6 +841,9 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            // A plan that borrows another lane's prefix cannot survive evicting that lane; wait
+            // for capacity instead.
+            if (plan.summary().protected_lane != kNoProtectedLane) { continue; }
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected = LaneChoice{
@@ -885,18 +888,26 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
+            const std::uint32_t protected_lane =
+                request->lane_plans[lane]->summary().protected_lane;
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
                  !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
                  ++retained_lane) {
-                if (retained_lane != lane && slots_[retained_lane] == nullptr &&
+                if (retained_lane != lane && retained_lane != protected_lane &&
+                    slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+                // Shared prefixes make the reclaim estimate order-dependent (evicting a source
+                // can leave its borrowed pages mapped until their holder is replaced). Retry the
+                // request rather than treating a conservative plan as an engine fault; the
+                // evictions already performed are parked states, and the next pass sees the
+                // updated pool.
+                return AdmissionProgress::ControlProgress;
             }
         }
 
@@ -934,8 +945,21 @@ private:
 
             TransientRegion transient;
             if (needs_prefill) {
-                instance_.request_memory.activate(summary.transient_bytes,
-                                                  summary.transient_alignment);
+                try {
+                    instance_.request_memory.activate(summary.transient_bytes,
+                                                      summary.transient_alignment);
+                } catch (...) {
+                    // The transient is sized per request when the Vision budget is unlimited. A
+                    // request whose output buffer does not fit fails on its own; it must not reach
+                    // the engine-scope handler below, which stops the worker.
+                    const std::exception_ptr error = std::current_exception();
+                    instance_.request_memory.deactivate();
+                    slots_[lane].reset();
+                    invalidate_lane_plans(lane);
+                    complete_error(request, error);
+                    publish_runtime_stats();
+                    return AdmissionProgress::ControlProgress;
+                }
                 prefill_lane_ = lane;
                 transient     = instance_.request_memory.region();
             }

@@ -634,7 +634,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // swap mode likewise reserves none: each encode allocates its scratch on demand after
         // evicting resident runtime state to host memory, leaving this budget to KV capacity.
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
-        const std::uint32_t merged = plan.vision_max_tokens;
+        // Unlimited is rejected for this path: the workspace cannot be pre-reserved.
+        const std::uint32_t merged = std::min(plan.capacity, plan.vision_max_tokens);
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
             merged, std::min(merged, kFrontendSegmentLimit));
     }
@@ -714,9 +715,13 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
-    if (options.vision_max_tokens == 0 ||
-        options.vision_max_tokens > kMaximumVisionTokenBudget) {
-        throw std::invalid_argument("vision_max_tokens must be in [1,32768]");
+    // The budget is a plain option with no compiled ceiling. Unlimited (0) cannot pre-reserve
+    // either the encoder scratch or the merged-output transient, so it needs a path that
+    // allocates on demand.
+    if (options.enable_vision && options.vision_max_tokens == kUnlimitedVisionTokens &&
+        options.vision_device != VisionDevice::Cpu && !options.vision_kv_swap) {
+        throw std::invalid_argument(
+            "an unlimited vision_max_tokens requires vision_kv_swap or a CPU Vision encoder");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = options.ram_kv.gpu_tokens != 0
@@ -856,8 +861,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
-        impl->request_transient_capacity_bytes =
-            schedule::VisionContext::output_transient_bytes(impl->vision_max_tokens);
+        if (impl->vision_max_tokens == kUnlimitedVisionTokens) {
+            // Sized per request by the largest item's merged output, allocated on first use.
+            impl->request_transient_capacity_bytes = kDynamicRequestTransientBytes;
+        } else {
+            impl->request_transient_capacity_bytes = schedule::VisionContext::output_transient_bytes(
+                std::min(inputs.capacity, impl->vision_max_tokens));
+        }
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
@@ -933,10 +943,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
     }
 
+    // A dynamic transient reserves nothing at startup; it is allocated on first use and counts
+    // against the device only for the requests that need it.
+    const std::size_t transient_reservation =
+        impl->request_transient_capacity_bytes == kDynamicRequestTransientBytes
+            ? 0
+            : impl->request_transient_capacity_bytes;
     impl->device_reservation_bytes = checked_add(
         checked_add(
             checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-            impl->request_transient_capacity_bytes, "request transient reservation"),
+            transient_reservation, "request transient reservation"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }
@@ -951,7 +967,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
-        .vision_max_tokens   = std::min(options.max_context, options.vision_max_tokens),
+        // Raw option: 0 means unlimited and is resolved at each reservation site.
+        .vision_max_tokens   = options.vision_max_tokens,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,

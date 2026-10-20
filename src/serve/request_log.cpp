@@ -115,6 +115,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_response_checkpoint";
     case ninfer::PrefixReusePath::RestoreParkedKv:
         return "restore_parked_kv";
+    case ninfer::PrefixReusePath::ShareLanePrefix:
+        return "share_lane_prefix";
     }
     return "unknown";
 }
@@ -509,7 +511,11 @@ std::string format_server_start_json(
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},
           {"vision_device", options.vision_device == VisionDevice::Cpu ? "cpu" : "gpu"},
-          {"vision_max_tokens", std::min(options.max_context, options.vision_max_tokens)},
+          // Unlimited resolves to the context ceiling, which is the hard bound (visual tokens
+          // are text tokens).
+          {"vision_max_tokens", options.vision_max_tokens == kUnlimitedVisionTokens
+                                    ? options.max_context
+                                    : std::min(options.max_context, options.vision_max_tokens)},
           {"vision_kv_swap", options.vision_kv_swap},
           {"message_boundary_checkpoints", options.message_boundary_checkpoints},
           {"boundary_history", options.boundary_history},

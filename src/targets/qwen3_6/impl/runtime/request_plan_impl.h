@@ -412,6 +412,82 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    // Cross-lane page sharing. Two branches of one conversation alternate on separate lanes;
+    // the lane that arrives second borrows the pages of the prefix they share instead of
+    // re-prefilling or copying it. Only pinned boundaries are offered (the point where branches
+    // fork), and the borrowing lane copies on write at the divergence.
+    if (base.allow_prefix_reuse && prompt.identity.reusable &&
+        speculative_backend != SpeculativeBackend::DFlash && ram_kv.gpu_tokens == 0 &&
+        max_concurrency > 1 && (!sequence.retained || !sequence.kv)) {
+        const auto snapshot_pages = [](std::uint32_t tokens) -> std::uint32_t {
+            return tokens == 0 ? 0U
+                               : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+        };
+        std::uint32_t best_frontier = 0;
+        std::uint32_t best_lane     = 0;
+        SharedPrefixSlot best_slot  = SharedPrefixSlot::None;
+        const auto consider = [&](std::uint32_t other, const HostCheckpoint& pinned,
+                                  SharedPrefixSlot slot) {
+            if (pinned.frontier == 0 || pinned.frontier <= best_frontier ||
+                pinned.frontier > prompt.token_ids.size()) {
+                return;
+            }
+            const SequenceState& source = sequences[other];
+            if (!source.retained || !source.kv || pinned.frontier > source.text_kv_valid) { return; }
+            if (!qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
+                                                 pinned.frontier)) {
+                return;
+            }
+            const bool own = !pinned.ledger.empty();
+            if (own && !qwen3_6::detail::prefix_matches(prompt, pinned.ledger, pinned.identity,
+                                                        pinned.frontier)) {
+                return;
+            }
+            if (speculative_backend == SpeculativeBackend::Mtp &&
+                source.mtp_kv_valid < pinned.frontier - 1) {
+                return;
+            }
+            best_frontier = pinned.frontier;
+            best_lane     = other;
+            best_slot     = slot;
+        };
+        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+            if (other == lane) { continue; }
+            const SequenceState& source = sequences[other];
+            if (!source.retained || !source.kv) { continue; }
+            for (const HostCheckpoint& boundary : source.boundary_history) {
+                consider(other, boundary, SharedPrefixSlot::Message);
+            }
+            for (const HostCheckpoint& response : source.response_history) {
+                consider(other, response, SharedPrefixSlot::Response);
+            }
+            for (const HostCheckpoint& checkpoint : source.long_range_history) {
+                consider(other, checkpoint, SharedPrefixSlot::LongRange);
+            }
+            consider(other, source.resume_anchor, SharedPrefixSlot::Anchor);
+            consider(other, source.shared_prefix, SharedPrefixSlot::Leading);
+            consider(other, source.tools_prefix, SharedPrefixSlot::Tools);
+        }
+        if (best_frontier >= 2048) {
+            plan->reuse                   = ReusePath::ShareLanePrefix;
+            plan->reuse_base              = best_frontier;
+            plan->share_lane              = best_lane;
+            plan->share_slot              = best_slot;
+            plan->shared_text_kv_pages = snapshot_pages(best_frontier);
+            // Only the MTP backend has a KV plane at all; Text/None has no backend entitlement
+            // to borrow.
+            plan->shared_backend_kv_pages =
+                speculative_backend == SpeculativeBackend::Mtp &&
+                        plan->backend_kv_page_entitlement != 0
+                    ? snapshot_pages(best_frontier - 1)
+                    : 0;
+            plan->summary.protected_lane  = best_lane;
+            reuse_trace("share_lane lane=%u source=%u frontier=%u slot=%d pages=%u/%u", lane,
+                        best_lane, best_frontier, static_cast<int>(best_slot),
+                        plan->shared_text_kv_pages, plan->shared_backend_kv_pages);
+        }
+    }
+
     // A conversation whose KV was parked by an earlier eviction resumes from the host store. It
     // is matched by the same token-prefix identity the resident lane above is matched by, so
     // parking widens how many conversations can be resumed without widening what "the same
@@ -560,6 +636,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
+        const bool share_ready =
+            plan->reuse == ReusePath::ShareLanePrefix && decoder->mtp_cache() != nullptr &&
+            plan->reuse_base != 0 && plan->share_lane < max_concurrency &&
+            sequences[plan->share_lane].retained && sequences[plan->share_lane].kv &&
+            sequences[plan->share_lane].mtp_kv_valid >= plan->reuse_base - 1;
         bool checkpoint_fallback = false;
         if (plan->reuse == ReusePath::AppendAtFrontier && !append_ready &&
             decoder->mtp_cache() != nullptr) {
@@ -654,11 +735,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         reuse_trace(
             "mtp_gates reuse=%d base=%u append_ready=%d checkpoint_ready=%d parked_ready=%d "
-            "fallback=%d",
+            "share_ready=%d fallback=%d",
             static_cast<int>(plan->reuse), plan->reuse_base, append_ready ? 1 : 0,
-            checkpoint_ready ? 1 : 0, parked_ready ? 1 : 0, checkpoint_fallback ? 1 : 0);
+            checkpoint_ready ? 1 : 0, parked_ready ? 1 : 0, share_ready ? 1 : 0,
+            checkpoint_fallback ? 1 : 0);
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
-            !parked_ready && !checkpoint_fallback) {
+            !parked_ready && !share_ready && !checkpoint_fallback) {
             plan->reuse             = ReusePath::FullReset;
             plan->reuse_base        = 0;
             plan->parked_id         = 0;
@@ -667,6 +749,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             parked_entry            = nullptr;
             reuse_trace("mtp_gates demote=full_reset");
         }
+    }
+    // A later arbitration (a longer parked entry, an MTP demotion) may have replaced the sharing
+    // plan; the borrowed-prefix fields must not outlive it.
+    if (plan->reuse != ReusePath::ShareLanePrefix) {
+        plan->share_lane              = 0;
+        plan->share_slot              = SharedPrefixSlot::None;
+        plan->shared_text_kv_pages    = 0;
+        plan->shared_backend_kv_pages = 0;
+        plan->summary.protected_lane  = runtime::kNoProtectedLane;
     }
     reuse_trace("chosen reuse=%d base=%u index=%u parked=%llu action=%d",
                 static_cast<int>(plan->reuse), plan->reuse_base, plan->checkpoint_index,
@@ -770,9 +861,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (plan->reuse == ReusePath::RestoreParkedKv) {
-            // A restored lane resumes exactly as an appended one does, so it takes the same MTP
-            // bridge: a suffix to prefill, or an exact hit that samples from the parked hidden.
+        } else if (plan->reuse == ReusePath::RestoreParkedKv ||
+                   plan->reuse == ReusePath::ShareLanePrefix) {
+            // A restored or shared lane resumes exactly as an appended one does, so it takes the
+            // same MTP bridge: a suffix to prefill, or an exact hit sampling from the borrowed
+            // hidden.
             plan->prepare_mtp = true;
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix

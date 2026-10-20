@@ -84,6 +84,41 @@ int main() {
     failures += expect(empty.region().data == nullptr && empty.summary().capacity_bytes == 0,
                        "zero-capacity request memory exposed a device allocation");
 
+    // Dynamic mode (the unlimited Vision budget) grows on demand instead of refusing sizes it
+    // did not reserve at startup. Growth must keep the region valid and the summary truthful.
+    ninfer::runtime::RequestMemory dynamic(device, ninfer::kDynamicRequestTransientBytes);
+    failures += expect(dynamic.summary().capacity_bytes == 0,
+                       "dynamic request memory reserved capacity at construction");
+    dynamic.activate(1 << 20, 256);
+    const void* small = dynamic.region().data;
+    failures += expect(small != nullptr && dynamic.region().size == (1U << 20) &&
+                           dynamic.summary().capacity_bytes >= (1U << 20) &&
+                           dynamic.summary().used_bytes == (1U << 20),
+                       "dynamic request memory did not allocate on first activation");
+    dynamic.activate(2 << 20, 256);
+    failures += expect(dynamic.region().data != nullptr && dynamic.region().size == (2U << 20) &&
+                           dynamic.summary().capacity_bytes >= (2U << 20) &&
+                           dynamic.summary().peak_used_bytes == (2U << 20),
+                       "dynamic request memory did not grow");
+    dynamic.deactivate();
+    dynamic.activate(1 << 20, 256);
+    failures += expect(dynamic.region().data != nullptr && dynamic.region().size == (1U << 20) &&
+                           dynamic.summary().capacity_bytes >= (2U << 20),
+                       "dynamic request memory did not reuse a smaller activation");
+
+    // A growth the device cannot satisfy must be a request-scoped exception, not an abort, and
+    // the object must remain usable for later, smaller activations.
+    bool rejected = false;
+    try {
+        dynamic.activate(std::size_t{1} << 50, 256);
+    } catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::Unavailable;
+    }
+    failures += expect(rejected, "an impossible dynamic activation did not throw RequestError");
+    dynamic.activate(1 << 20, 256);
+    failures += expect(dynamic.region().data != nullptr && dynamic.region().size == (1U << 20),
+                       "dynamic request memory did not recover after a failed growth");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
